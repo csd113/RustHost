@@ -22,3 +22,4 @@ target
 dev-check-strict.sh
 .DS_STORE
 clippy_reports
+src/.DS_Store

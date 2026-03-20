@@ -13,6 +13,24 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "Zlib",
     "Unicode-3.0",
+    # BSD family — pulled in by cryptography crates in the Arti/dalek stack
+    # (curve25519-dalek, ed25519-dalek, x25519-dalek, subtle, coarsetime)
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # ISC — pulled in by inotify, inotify-sys, rdrand (Linux file-watch / RNG)
+    "ISC",
+    # CC0-1.0 — pulled in by notify (file-system watcher used by arti-client)
+    "CC0-1.0",
+    # MPL-2.0 — pulled in by option-ext (dirs-sys dependency of arti-client)
+    "MPL-2.0",
+    # LGPL-3.0-or-later — pulled in by priority-queue (arti circuit scheduler)
+    # priority-queue is dual-licensed LGPL-3.0-or-later OR MPL-2.0; cargo-deny
+    # requires both sides of an OR expression to be in the allow list.
+    "LGPL-3.0-or-later",
+    # BSL-1.0 (Boost) — pulled in by xxhash-rust (arti hashing utilities)
+    "BSL-1.0",
+    # Unlicense — pulled in by async_executors (arti async runtime abstraction)
+    "Unlicense",
 ]
 confidence-threshold = 0.8
 
@@ -23,8 +41,42 @@ deny = []
 skip = [
     # crossterm 0.27 still pulls mio 0.8.x; tokio requires mio 1.x
     { name = "mio" },
-    # Various crates in the tokio/crossterm tree pin different windows-sys generations
+    # Various crates in the tokio/crossterm/arti tree pin different windows-sys generations
     { name = "windows-sys" },
+    # Arti 0.40 dependency tree spans multiple generations of these crates;
+    # none of the duplicates are under our direct control.
+    { name = "atomic" },
+    { name = "bitflags" },
+    { name = "darling" },
+    { name = "darling_core" },
+    { name = "darling_macro" },
+    { name = "getrandom" },
+    { name = "itertools" },
+    { name = "r-efi" },
+    { name = "rand" },
+    { name = "rand_chacha" },
+    { name = "rand_core" },
+    { name = "serde_spanned" },
+    { name = "strsim" },
+    { name = "syn" },
+    { name = "thiserror" },
+    { name = "thiserror-impl" },
+    { name = "toml" },
+    { name = "toml_datetime" },
+    { name = "toml_edit" },
+    { name = "windows-core" },
+    { name = "windows-link" },
+    { name = "windows-result" },
+    { name = "windows-strings" },
+    { name = "windows-targets" },
+    { name = "windows_aarch64_gnullvm" },
+    { name = "windows_aarch64_msvc" },
+    { name = "windows_i686_gnu" },
+    { name = "windows_i686_msvc" },
+    { name = "windows_x86_64_gnu" },
+    { name = "windows_x86_64_gnullvm" },
+    { name = "windows_x86_64_msvc" },
+    { name = "winnow" },
 ]
 
 # ─── Advisories ───────────────────────────────────────────────────────────────
@@ -32,6 +84,30 @@ skip = [
 # Security advisory checks are now controlled via `[advisories]` alone.
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = [
+    # rsa 0.9.x — Marvin attack: timing side-channel on decryption
+    # (RUSTSEC-2023-0071, https://rustsec.org/advisories/RUSTSEC-2023-0071).
+    #
+    # No patched release of the `rsa` crate exists.  `rsa` is pulled in
+    # transitively by `arti-client` for parsing X.509 certificates in Tor
+    # directory consensus documents — it is used only for RSA *signature
+    # verification*, never for decryption.  The Marvin attack requires an
+    # adversary to make thousands of adaptive chosen-ciphertext queries and
+    # measure decryption timing; that threat model does not apply here.
+    #
+    # Revisit when arti upgrades past rsa 0.9.x or a fixed version ships.
+    { id = "RUSTSEC-2023-0071", reason = "rsa used only for signature verification in arti-client, not decryption; no fixed version available" },
+
+    # bincode 2.0.1 — unmaintained (RUSTSEC-2025-0141).
+    # Pulled in transitively by typed-index-collections → tor-netdir → arti-client.
+    # Not a direct dependency; no action we can take until arti upgrades.
+    { id = "RUSTSEC-2025-0141", reason = "transitive dep via arti-client/tor-netdir; no direct upgrade path available" },
+
+    # paste 1.0.15 — unmaintained (RUSTSEC-2024-0436).
+    # Pulled in transitively by tor-rtcompat → arti-client.
+    # Not a direct dependency; no action we can take until arti upgrades.
+    { id = "RUSTSEC-2024-0436", reason = "transitive dep via arti-client/tor-rtcompat; no direct upgrade path available" },
+]
 
 # ─── Sources ──────────────────────────────────────────────────────────────────
 [sources]

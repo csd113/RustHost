@@ -55,7 +55,6 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
 
     let tor_str = match &state.tor_status {
         TorStatus::Disabled => dim("DISABLED"),
-        TorStatus::NotFound => red("NOT FOUND — install Tor (see log for instructions)"),
         TorStatus::Starting => yellow("STARTING — polling for .onion address…"),
         TorStatus::Ready => green("READY"),
         TorStatus::Failed(None) => red("FAILED — see log for details"),
@@ -70,10 +69,9 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
     let _ = writeln!(out, "{}\r", bold("Endpoints"));
     let _ = writeln!(out, "  Local : http://localhost:{}\r", state.actual_port);
 
-    let onion_str = state.onion_address.as_ref().map_or_else(
+    let onion_str = state.onion_address.as_deref().map_or_else(
         || match &state.tor_status {
             TorStatus::Disabled => dim("(disabled)"),
-            TorStatus::NotFound => dim("(tor not installed)"),
             TorStatus::Starting => dim("(bootstrapping…)"),
             TorStatus::Ready => dim("(reading…)"),
             TorStatus::Failed(_) => dim("(unavailable)"),

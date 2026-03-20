@@ -72,10 +72,9 @@ fn first_run_setup() -> Result<()> {
     println!("  Drop your site files into:  ./rusthost-data/site/");
     println!("  Then run RustHost again to go live.");
     println!();
-    println!("  Tor onion service will be configured automatically on next run.");
-    println!("  Install Tor if you haven't already:");
-    println!("    macOS:  brew install tor");
-    println!("    Linux:  sudo apt-get install tor");
+    println!("  Tor onion service is built-in — no external install required.");
+    println!("  On first run, Arti will download ~2 MB of directory data (~30 s).");
+    println!("  Your .onion address will be shown in the dashboard once ready.");
     println!();
 
     Ok(())
@@ -132,8 +131,8 @@ async fn normal_run() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // 9. Start Tor (if enabled).
-    //    tor::init() spawns std threads and returns immediately — never touches
-    //    the async executor, matching the RustChan pattern.
+    //    tor::init() spawns a Tokio task and returns immediately — never blocks
+    //    the async executor.
     if config.tor.enabled {
         let bind_port = state.read().await.actual_port;
         tor::init(data_dir(), bind_port, Arc::clone(&state));
@@ -154,7 +153,7 @@ async fn normal_run() -> Result<()> {
     // 13. Graceful shutdown.
     log::info!("Shutting down…");
     let _ = shutdown_tx.send(true);
-    // Kill the Tor subprocess before the process exits.
+    // Drop the Arti TorClient — closes all Tor circuits cleanly.
     tor::kill();
     tokio::time::sleep(Duration::from_millis(300)).await;
     console::cleanup();
