@@ -1,0 +1,37 @@
+[package]
+name        = "rusthost"
+version     = "0.1.0"
+edition     = "2021"
+rust-version = "1.85"
+description = "Single-binary, zero-setup static site hosting appliance with Tor support"
+license     = "MIT"
+authors     = []
+
+[[bin]]
+name = "rusthost"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime — drives the server, console, and all I/O
+tokio = { version = "1", features = ["full"] }
+
+# Configuration — TOML parsing and typed deserialization
+serde  = { version = "1", features = ["derive"] }
+toml   = "0.8"
+
+# Logging — standard facade used by all modules
+log = "0.4"
+
+# Terminal — cross-platform raw mode, cursor control, key events
+crossterm = "0.27"
+
+# Timestamps — used in log formatting
+chrono = { version = "0.4", features = ["clock"] }
+
+# Signal handling — catches SIGINT / SIGTERM for graceful shutdown
+ctrlc = "3"
+
+[profile.release]
+opt-level = 3
+lto        = true
+strip      = true

@@ -1,0 +1,39 @@
+# cargo-deny configuration for rusthost
+# Run: cargo deny check
+# Schema: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+# ─── Licenses ─────────────────────────────────────────────────────────────────
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+# ─── Bans ─────────────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"
+deny = []
+skip = [
+    # crossterm 0.27 still pulls mio 0.8.x; tokio requires mio 1.x
+    { name = "mio" },
+    # Various crates in the tokio/crossterm tree pin different windows-sys generations
+    { name = "windows-sys" },
+]
+
+# ─── Advisories ───────────────────────────────────────────────────────────────
+# The `vulnerability` key was removed in cargo-deny 0.14.
+# Security advisory checks are now controlled via `[advisories]` alone.
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# ─── Sources ──────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "warn"
+unknown-git      = "warn"
