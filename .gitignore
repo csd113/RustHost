@@ -21,3 +21,4 @@ target
 #.idea/
 dev-check-strict.sh
 .DS_STORE
+clippy_reports
