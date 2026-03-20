@@ -30,9 +30,7 @@ pub type SharedMetrics = Arc<Metrics>;
 pub enum TorStatus {
     /// `[tor] enabled = false` in config.
     Disabled,
-    /// The `tor` binary was not found in any of the search paths.
-    NotFound,
-    /// Tor process spawned; polling for the `hostname` file.
+    /// Tor bootstrapping; waiting to connect to the network.
     Starting,
     /// `hostname` file read; `.onion` address available in `onion_address`.
     Ready,

@@ -2,18 +2,49 @@
 name        = "rusthost"
 version     = "0.1.0"
 edition     = "2021"
-rust-version = "1.85"
+# Bumped from 1.86 → 1.90 to match the highest MSRV in the transitive dep tree:
+#   arti-client 0.40 and most tor-* crates require 1.89
+#   typed-index-collections 3.5 (via tor-netdir) requires 1.90
+rust-version = "1.90"
 description = "Single-binary, zero-setup static site hosting appliance with Tor support"
 license     = "MIT"
 authors     = []
 
 [[bin]]
-name = "rusthost"
+name = "rusthost-cli"
 path = "src/main.rs"
 
 [dependencies]
 # Async runtime — drives the server, console, and all I/O
 tokio = { version = "1", features = ["full"] }
+
+# ─── Arti (in-process Tor) ────────────────────────────────────────────────────
+#
+# arti-client   — the high-level Tor client API (bootstrap, launch onion service)
+#   tokio             — use Tokio as the async runtime (default, required)
+#   native-tls        — TLS backend for connecting to Tor relays (default)
+#   onion-service-service — enables hosting (serving) onion services
+#
+# tor-hsservice — lower-level onion service types:
+#   handle_rend_requests, OnionServiceConfigBuilder, StreamRequest
+#
+# futures       — StreamExt trait for iterating over the stream of StreamRequests
+
+arti-client = { version = "0.40", features = [
+    "tokio",
+    "native-tls",
+    "onion-service-service",
+] }
+tor-hsservice = { version = "0.40" }
+# tor-cell: needed to construct the Connected message passed to StreamRequest::accept()
+tor-cell = { version = "0.40" }
+futures = "0.3"
+
+# Onion-address encoding (used by the tor module to format HsId → ${base32}.onion)
+# sha3: provides SHA3-256 for the v3 address checksum
+# data-encoding: provides RFC 4648 base32 (no-padding, uppercase/lowercase)
+sha3 = "0.10"
+data-encoding = "2"
 
 # Configuration — TOML parsing and typed deserialization
 serde  = { version = "1", features = ["derive"] }

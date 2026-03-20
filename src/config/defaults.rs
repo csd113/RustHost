@@ -49,16 +49,16 @@ auto_reload = false
 
 # Enable Tor onion service.
 #
-# When true, RustHost searches for the `tor` binary at startup and:
-#   1. Creates tor_data/ and tor_hidden_service/ under rusthost-data/
-#   2. Writes a torrc with SocksPort 0 (no port conflict with system Tor)
-#   3. Spawns `tor` as a subprocess
-#   4. Polls for the hostname file and displays your .onion address
+# When true, RustHost uses the embedded Arti Tor client — no external binary
+# or installation required. On first run, Arti downloads ~2 MB of directory
+# data (~30 s). Subsequent runs reuse the cached consensus and start fast.
 #
-# Install Tor first if you haven't already:
-#   macOS:  brew install tor
-#   Linux:  sudo apt-get install tor
-#   Other:  https://www.torproject.org/download/tor/
+# Arti stores its state and cache under:
+#   rusthost-data/arti_state/   — service keypair (determines your .onion address)
+#   rusthost-data/arti_cache/   — consensus cache (speeds up future startups)
+#
+# To rotate your .onion address, delete rusthost-data/arti_state/ before
+# starting RustHost. The new address will be shown in the dashboard.
 enabled = true
 
 # ─── [logging] ────────────────────────────────────────────────────────────────
