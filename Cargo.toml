@@ -10,38 +10,41 @@ description = "Single-binary, zero-setup static site hosting appliance with Tor 
 license     = "MIT"
 authors     = []
 
+[lib]
+name = "rusthost"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rusthost-cli"
 path = "src/main.rs"
 
-[dependencies]
-# Async runtime — drives the server, console, and all I/O
-# 3.6 — Explicit feature list instead of "full"; removes unused `process` and
-#        `io-std` components, reducing binary size and compile time.
-#        Note: open_browser uses std::process::Command (stdlib), not the Tokio
-#        process feature, so dropping `process` here is safe.
-tokio = { version = "1", features = [
-    "rt-multi-thread", # multi-threaded work-stealing executor
-    "net",             # TcpListener / TcpStream
-    "io-util",         # AsyncBufReadExt, AsyncWriteExt, copy
-    "fs",              # tokio::fs::File, metadata
-    "sync",            # Mutex, RwLock, Semaphore, oneshot, watch, mpsc
-    "time",            # interval, sleep, timeout
-    "macros",          # #[tokio::main], tokio::select!
-    "signal",          # SIGINT / SIGTERM (used by ctrlc integration)
-] }
+# ─── Lint configuration ───────────────────────────────────────────────────────
+#
+# clippy::all     — every lint in the default set (correctness + style + perf)
+# clippy::pedantic — stricter style + API lints; individual allows used where
+#                    the rule conflicts with the module's documented design
+#                    (e.g. too_many_arguments for the HTTP write_* stack which
+#                    must mirror the HTTP/1.1 wire format).
+[lints.rust]
+unsafe_code = "forbid"
 
-# ─── Arti (in-process Tor) ────────────────────────────────────────────────────
-#
-# arti-client   — the high-level Tor client API (bootstrap, launch onion service)
-#   tokio             — use Tokio as the async runtime (default, required)
-#   native-tls        — TLS backend for connecting to Tor relays (default)
-#   onion-service-service — enables hosting (serving) onion services
-#
-# tor-hsservice — lower-level onion service types:
-#   handle_rend_requests, OnionServiceConfigBuilder, StreamRequest
-#
-# futures       — StreamExt trait for iterating over the stream of StreamRequests
+[lints.clippy]
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "deny",  priority = -1 }
+# nursery lints warn but do not gate CI; they surface improvement candidates.
+nursery  = { level = "warn",  priority = -1 }
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "fs",
+    "sync",
+    "time",
+    "macros",
+    "signal",
+] }
 
 arti-client = { version = "0.40", features = [
     "tokio",
@@ -49,36 +52,23 @@ arti-client = { version = "0.40", features = [
     "onion-service-service",
 ] }
 tor-hsservice = { version = "0.40" }
-# tor-cell: needed to construct the Connected message passed to StreamRequest::accept()
-tor-cell = { version = "0.40" }
-futures = "0.3"
+tor-cell      = { version = "0.40" }
+futures       = "0.3"
 
-# Onion-address encoding (used by the tor module to format HsId → ${base32}.onion)
-# sha3: provides SHA3-256 for the v3 address checksum
-# data-encoding: provides RFC 4648 base32 (no-padding, uppercase/lowercase)
-sha3 = "0.10"
+sha3         = "0.10"
 data-encoding = "2"
+thiserror    = "1"
+serde        = { version = "1", features = ["derive"] }
+toml         = "0.8"
+log          = "0.4"
+crossterm    = "0.27"
+chrono       = { version = "0.4", features = ["clock"] }
+# OS error codes used in the accept-loop backoff to distinguish EMFILE/ENFILE
+# (resource exhaustion → log error) from transient errors (log debug).
+libc         = "0.2"
 
-# Typed error enum — derives Display + Error for AppError variants
-thiserror = "1"
-
-# Configuration — TOML parsing and typed deserialization
-serde  = { version = "1", features = ["derive"] }
-toml   = "0.8"
-
-# Logging — standard facade used by all modules
-log = "0.4"
-
-# Terminal — cross-platform raw mode, cursor control, key events
-crossterm = "0.27"
-
-# Timestamps — used in log formatting
-chrono = { version = "0.4", features = ["clock"] }
-
-# Signal handling — Ctrl-C and SIGTERM handled via tokio::signal (4.7)
-# ctrlc crate removed: tokio's built-in signal support (feature "signal", already
-# in the explicit feature list) eliminates the threading conflict between the ctrlc
-# crate's OS-level signal handler and Tokio's internal signal infrastructure.
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

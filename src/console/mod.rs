@@ -54,6 +54,11 @@ static RAW_MODE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// reads from this channel to dispatch events.
 ///
 /// Note: not `async` — all awaits live inside the spawned tasks.
+///
+/// # Errors
+///
+/// Returns [`AppError::Console`] if the terminal cannot be put into raw mode
+/// or the alternate screen cannot be entered.
 pub fn start(
     config: Arc<Config>,
     state: SharedState,

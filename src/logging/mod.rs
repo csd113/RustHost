@@ -134,6 +134,12 @@ pub fn flush() {
 ///
 /// Opens the log file in append mode (creating parent dirs as needed),
 /// registers the logger, and initialises the ring buffer.
+///
+/// # Errors
+///
+/// Returns [`AppError::Io`] if the log file's parent directory cannot be
+/// created, or [`AppError::LogInit`] if the logger is already initialised or
+/// cannot be registered with the `log` facade.
 pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
     LOG_BUFFER.get_or_init(|| Mutex::new(VecDeque::with_capacity(1_000)));
 

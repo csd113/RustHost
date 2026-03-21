@@ -10,9 +10,11 @@
 ///
 /// # Examples
 /// ```
+/// use rusthost::server::mime;
 /// assert_eq!(mime::for_extension("html"), "text/html; charset=utf-8");
 /// assert_eq!(mime::for_extension("xyz"),  "application/octet-stream");
 /// ```
+#[must_use]
 pub fn for_extension(ext: &str) -> &'static str {
     // 3.4 — Normalise to lowercase in a fixed stack buffer to avoid a heap
     // allocation on every served file request. Extensions longer than 16 bytes

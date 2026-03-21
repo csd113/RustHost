@@ -89,6 +89,23 @@ pub struct ServerConfig {
     pub auto_port_fallback: bool,
     pub open_browser_on_start: bool,
     pub max_connections: u32,
+
+    /// Value of the `Content-Security-Policy` header sent with every HTML
+    /// response (task 5.3).  The default `"default-src 'self'"` restricts all
+    /// content to the same origin.
+    ///
+    /// Operators serving CDN fonts, analytics scripts, or other third-party
+    /// resources can relax this without touching source code, e.g.:
+    ///
+    /// ```toml
+    /// [server]
+    /// content_security_policy = "default-src 'self'; script-src 'self' cdn.example.com"
+    /// ```
+    ///
+    /// **Tor note:** `Referrer-Policy: no-referrer` is always sent regardless
+    /// of this setting, preventing the `.onion` URL from leaking to any
+    /// third-party origin referenced in served HTML.
+    pub content_security_policy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +183,7 @@ impl Default for Config {
                 auto_port_fallback: true,
                 open_browser_on_start: false,
                 max_connections: 256,
+                content_security_policy: "default-src 'self'".into(),
             },
             site: SiteConfig {
                 directory: "site".into(),

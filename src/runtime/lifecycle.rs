@@ -7,6 +7,12 @@
 //!    instructions, and exits cleanly.
 //! 2. **Normal run** — loads config, starts every subsystem, enters the
 //!    event dispatch loop, then shuts down gracefully.
+//!
+//! ## CLI override support (5.5)
+//!
+//! [`CliArgs`] carries optional path overrides from `--config` and `--data-dir`.
+//! When absent the original defaults (relative to `current_exe()`) are used,
+//! preserving backward compatibility for zero-argument invocations.
 
 use std::{
     path::{Path, PathBuf},
@@ -26,29 +32,54 @@ use crate::{
     server, tor, AppError, Result,
 };
 
-// ─── Entry point ─────────────────────────────────────────────────────────────
-//
-// 4.4 — `data_dir()` and `settings_path()` are no longer free functions.
-// The data directory is computed exactly once at the top of `run()` and
-// threaded through every call that needs it as an explicit parameter.
-// This removes the hidden `current_exe()` dependency from all internal
-// functions and makes the path injectable (e.g. a tmp dir in tests).
+// ─── Public types ─────────────────────────────────────────────────────────────
 
-pub async fn run() -> Result<()> {
-    // 4.4 — single source of truth; computed here, nowhere else.
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    let data_dir = exe
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("rusthost-data");
-    let settings_path = data_dir.join("settings.toml");
+/// CLI-supplied path overrides.  Both fields default to `None`, which causes
+/// [`run`] to fall back to the standard paths relative to `current_exe()`.
+#[derive(Debug, Default)]
+pub struct CliArgs {
+    /// Explicit path to `settings.toml`; overrides the default derived from
+    /// `data_dir`.
+    pub config_path: Option<PathBuf>,
+    /// Explicit data-directory root; overrides `<exe-dir>/rusthost-data/`.
+    pub data_dir: Option<PathBuf>,
+}
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
+/// Entry point for the `rusthost-cli` binary.
+///
+/// Computes the data-directory and settings path (honouring any overrides in
+/// `args`), then either performs first-run setup or starts the full server.
+///
+/// # Errors
+///
+/// Returns an [`AppError`] if the config cannot be loaded, logging cannot be
+/// initialised, or any other fatal startup condition occurs.
+/// Path overrides are supplied via [`CliArgs`].
+pub async fn run(args: CliArgs) -> Result<()> {
+    // 4.4 + 5.5 — data_dir is computed exactly once and threaded everywhere.
+    // A CLI override takes precedence; the default is relative to current_exe().
+    let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
+
+    let settings_path = args
+        .config_path
+        .unwrap_or_else(|| data_dir.join("settings.toml"));
 
     if settings_path.exists() {
-        normal_run(data_dir).await?;
+        normal_run(data_dir, &settings_path).await?;
     } else {
         first_run_setup(&data_dir, &settings_path)?;
     }
     Ok(())
+}
+
+/// Compute the default data directory (`<exe-dir>/rusthost-data/`).
+fn default_data_dir() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    exe.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("rusthost-data")
 }
 
 // ─── First Run ───────────────────────────────────────────────────────────────
@@ -81,11 +112,9 @@ fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
 
 // ─── Normal Run ──────────────────────────────────────────────────────────────
 
-async fn normal_run(data_dir: PathBuf) -> Result<()> {
-    let settings_path = data_dir.join("settings.toml");
-
+async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
     // 1. Load and validate config.
-    let config = Arc::new(config::loader::load(&settings_path)?);
+    let config = Arc::new(config::loader::load(settings_path)?);
 
     // 2. Initialise logging.
     logging::init(&config.logging, &data_dir)?;
@@ -185,10 +214,6 @@ async fn normal_run(data_dir: PathBuf) -> Result<()> {
     }
 
     // 11. Event dispatch loop.
-    // 4.7 — tokio::signal::ctrl_c() replaces the ctrlc crate. The signal
-    //        future is passed into event_loop and used directly in select!,
-    //        eliminating the threading conflict between the ctrlc crate's
-    //        OS-level handler and Tokio's internal signal infrastructure.
     event_loop(key_rx, &config, &state, &metrics, data_dir).await?;
 
     // 12. Graceful shutdown.
@@ -196,10 +221,8 @@ async fn normal_run(data_dir: PathBuf) -> Result<()> {
     let _ = shutdown_tx.send(true);
 
     // 2.10 — wait for the HTTP server to drain in-flight connections (max 5 s).
-    // tor::kill() has been removed — Tor exits when its task detects shutdown_rx.
     let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
 
-    // 2.11 — write the final log entry, flush to disk, then restore the terminal.
     log::info!("RustHost shut down cleanly.");
     logging::flush();
     console::cleanup();
@@ -217,7 +240,7 @@ fn spawn_server(
     metrics: &SharedMetrics,
     shutdown: &watch::Receiver<bool>,
     port_tx: oneshot::Sender<u16>,
-    data_dir: PathBuf, // 3.1/4.4 — caller owns data_dir; no current_exe() here
+    data_dir: PathBuf,
 ) -> tokio::task::JoinHandle<()> {
     let cfg = Arc::clone(config);
     let st = Arc::clone(state);
@@ -255,7 +278,7 @@ async fn event_loop(
     config: &Arc<Config>,
     state: &SharedState,
     metrics: &SharedMetrics,
-    data_dir: PathBuf, // 3.1/4.4 — pre-computed by normal_run; not recomputed per event
+    data_dir: PathBuf,
 ) -> Result<()> {
     // 2.8 — mutable so we can set to None when the channel closes.
     let mut key_rx = key_rx;
@@ -268,12 +291,10 @@ async fn event_loop(
     loop {
         // Build a future that yields the next key, or pends forever once the
         // channel closes (avoids repeated None-match after input task death).
-        // When the channel closes we log once and park this arm (2.8).
         let key_fut = async {
             if let Some(rx) = key_rx.as_mut() {
                 rx.recv().await
             } else {
-                // Channel already closed — pend forever so ctrl_c can still fire.
                 std::future::pending().await
             }
         };
@@ -286,7 +307,7 @@ async fn event_loop(
                         config,
                         Arc::clone(state),
                         Arc::clone(metrics),
-                        data_dir.clone(), // 3.1 — cheap PathBuf clone, no syscall
+                        data_dir.clone(),
                     ).await?;
                     if quit { break; }
                 } else {
@@ -295,7 +316,7 @@ async fn event_loop(
                         "Console input task exited — keyboard input disabled. \
                          Use Ctrl-C to quit."
                     );
-                    key_rx = None; // suppress repeated warnings on next select! iteration
+                    key_rx = None;
                 }
             }
             // 4.7 — Ctrl-C handled directly through Tokio's signal machinery.
@@ -309,9 +330,6 @@ async fn event_loop(
     }
     Ok(())
 }
-
-// open_browser removed from this file — canonical definition is in
-// crate::runtime (src/runtime/mod.rs), called via super::open_browser (fix 2.4).
 
 // ─── Placeholder HTML ────────────────────────────────────────────────────────
 

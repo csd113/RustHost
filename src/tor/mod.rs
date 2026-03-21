@@ -238,9 +238,14 @@ async fn proxy_stream(
 
 /// Encode an `HsId` (ed25519 public key) as a v3 `.onion` domain name.
 ///
-/// `arti-client 0.40` exposes `HsId` via `DisplayRedacted` (from the `safelog`
-/// crate) rather than `std::fmt::Display`, so we cannot use `format!("{}", …)`
-/// directly.  We implement the encoding ourselves using the spec:
+/// Delegates to [`onion_address_from_pubkey`] which is separately unit-tested.
+fn hsid_to_onion_address(hsid: HsId) -> String {
+    onion_address_from_pubkey(hsid.as_ref())
+}
+
+/// Encode a raw 32-byte ed25519 public key as a v3 `.onion` domain name.
+///
+/// Implements the encoding defined in the Tor Rendezvous Specification:
 ///
 /// ```text
 /// onion_address = base32(PUBKEY | CHECKSUM | VERSION) + ".onion"
@@ -248,11 +253,15 @@ async fn proxy_stream(
 /// VERSION       = 0x03
 /// ```
 ///
-/// `HsId: AsRef<[u8; 32]>` is stable across arti 0.40+.
-fn hsid_to_onion_address(hsid: HsId) -> String {
+/// The output is always exactly 62 characters: 56 lowercase base32 characters
+/// followed by `".onion"`.
+///
+/// Separated from [`hsid_to_onion_address`] so that tests can supply an
+/// arbitrary 32-byte key without constructing an `HsId`.
+#[must_use]
+pub(crate) fn onion_address_from_pubkey(pubkey: &[u8; 32]) -> String {
     use sha3::{Digest, Sha3_256};
 
-    let pubkey: &[u8; 32] = hsid.as_ref();
     let version: u8 = 3;
 
     // CHECKSUM = SHA3-256(".onion checksum" || PUBKEY || VERSION) truncated to 2 bytes
@@ -267,14 +276,13 @@ fn hsid_to_onion_address(hsid: HsId) -> String {
     address_bytes[..32].copy_from_slice(pubkey);
     // Consume the first two checksum bytes via an iterator — clippy cannot
     // prove at compile time that a GenericArray has >= 2 elements, so direct
-    // indexing (hash[0], hash[1]) triggers `indexing_slicing`.  SHA3-256
-    // always produces 32 bytes, so next() will never return None here.
+    // indexing triggers `indexing_slicing`.  SHA3-256 always produces 32 bytes.
     let mut hash_iter = hash.iter().copied();
     address_bytes[32] = hash_iter.next().unwrap_or(0);
     address_bytes[33] = hash_iter.next().unwrap_or(0);
     address_bytes[34] = version;
 
-    // RFC 4648 base32, no padding, lowercase  →  56 characters
+    // RFC 4648 base32, no padding, lowercase → 56 characters
     let encoded = data_encoding::BASE32_NOPAD
         .encode(&address_bytes)
         .to_ascii_lowercase();
@@ -283,6 +291,9 @@ fn hsid_to_onion_address(hsid: HsId) -> String {
 }
 
 // ─── State helpers ────────────────────────────────────────────────────────────
+//
+// These must appear BEFORE the #[cfg(test)] module; items after a test module
+// trigger the `clippy::items_after_test_module` lint.
 
 async fn set_status(state: &SharedState, status: TorStatus) {
     state.write().await.tor_status = status;
@@ -292,4 +303,84 @@ async fn set_onion(state: &SharedState, addr: String) {
     let mut s = state.write().await;
     s.tor_status = TorStatus::Ready;
     s.onion_address = Some(addr);
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::onion_address_from_pubkey;
+
+    /// Compute the expected onion address for a given 32-byte key using the
+    /// same algorithm as `onion_address_from_pubkey`, acting as an independent
+    /// reference implementation to cross-check the production code.
+    fn reference_onion(pubkey: &[u8; 32]) -> String {
+        use data_encoding::BASE32_NOPAD;
+        use sha3::{Digest, Sha3_256};
+
+        let version: u8 = 3;
+        let mut hasher = Sha3_256::new();
+        hasher.update(b".onion checksum");
+        hasher.update(pubkey);
+        hasher.update([version]);
+        let hash = hasher.finalize();
+
+        let mut bytes = [0u8; 35];
+        bytes[..32].copy_from_slice(pubkey);
+        // Use iterator instead of direct indexing to avoid clippy::indexing_slicing.
+        // SHA3-256 always produces 32 bytes, so next() will never return None.
+        let mut it = hash.iter().copied();
+        bytes[32] = it.next().unwrap_or(0);
+        bytes[33] = it.next().unwrap_or(0);
+        bytes[34] = version;
+
+        format!("{}.onion", BASE32_NOPAD.encode(&bytes).to_ascii_lowercase())
+    }
+
+    #[test]
+    fn hsid_to_onion_address_all_zeros_vector() {
+        // Fixed 32-byte test vector: all zeros.
+        // The expected value is derived from the reference implementation above.
+        let pubkey = [0u8; 32];
+        let expected = reference_onion(&pubkey);
+        let actual = onion_address_from_pubkey(&pubkey);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hsid_to_onion_address_format_is_correct() {
+        let pubkey = [0u8; 32];
+        let addr = onion_address_from_pubkey(&pubkey);
+        // A v3 onion address is always 56 base32 chars + ".onion" = 62 chars.
+        assert_eq!(addr.len(), 62, "unexpected length: {addr:?}");
+        // Use strip_suffix to avoid clippy::case_sensitive_file_extension_comparison.
+        assert!(
+            addr.strip_suffix(".onion").is_some(),
+            "must end with .onion: {addr:?}"
+        );
+        let host = addr.strip_suffix(".onion").unwrap_or(&addr);
+        assert!(
+            host.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()),
+            "host contains non-base32 characters: {host:?}"
+        );
+    }
+
+    #[test]
+    fn hsid_to_onion_address_is_deterministic() {
+        // Calling the function twice with the same key must produce the same
+        // output — the address must be derivable from the public key alone.
+        let pubkey = [0x42u8; 32];
+        assert_eq!(
+            onion_address_from_pubkey(&pubkey),
+            onion_address_from_pubkey(&pubkey)
+        );
+    }
+
+    #[test]
+    fn hsid_to_onion_address_different_keys_produce_different_addresses() {
+        let a = onion_address_from_pubkey(&[0u8; 32]);
+        let b = onion_address_from_pubkey(&[1u8; 32]);
+        assert_ne!(a, b, "different keys must produce different addresses");
+    }
 }

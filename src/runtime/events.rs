@@ -20,6 +20,16 @@ pub enum KeyEvent {
     Other,
 }
 
+/// Dispatch a single key event, mutating shared state as needed.
+///
+/// Returns `true` when the event is [`KeyEvent::Quit`] (the caller should
+/// begin graceful shutdown), or `false` for all other events.
+///
+/// # Errors
+///
+/// Returns [`AppError`] if a site rescan (`KeyEvent::Reload`) fails to spawn
+/// a blocking task or if a browser-open (`KeyEvent::Open`) returns an I/O
+/// error.
 pub async fn handle(
     event: KeyEvent,
     config: &Config,

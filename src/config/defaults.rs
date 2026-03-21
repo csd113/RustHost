@@ -31,6 +31,13 @@ open_browser_on_start = false
 # at the OS TCP backlog level rather than spawning unbounded tasks.
 max_connections = 256
 
+# Content-Security-Policy value sent with every HTML response.
+# The default restricts all content to the same origin.
+# Relax this if you serve fonts, analytics scripts, or other third-party
+# resources from a CDN, for example:
+#   content_security_policy = "default-src 'self'; script-src 'self' cdn.example.com"
+content_security_policy = "default-src 'self'"
+
 # ─── [site] ───────────────────────────────────────────────────────────────────
 
 [site]
@@ -102,6 +109,13 @@ show_timestamps = false
 instance_name = "RustHost"
 "#;
 
+/// Write the default `settings.toml` to `path`, creating parent directories
+/// as needed.
+///
+/// # Errors
+///
+/// Returns [`crate::AppError::Io`] if the parent directory cannot be created
+/// or the file cannot be written.
 pub fn write_default_config(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

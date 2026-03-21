@@ -40,6 +40,16 @@ use crate::{
 /// Binds the port (with optional fallback), updates `SharedState.actual_port`,
 /// sends the bound port through `port_tx` so Tor can start without a sleep,
 /// then accepts connections until the shutdown watch fires.
+///
+/// ## Accept-loop observability (task 5.4)
+///
+/// Accept errors use exponential backoff (1 ms → 1 s) to prevent log storms
+/// under persistent failures such as `EMFILE`.  Error severity is split:
+///
+/// - **`EMFILE` / `ENFILE`** (file-descriptor exhaustion) → logged at `error`;
+///   these require operator intervention.
+/// - **Transient errors** (`ECONNRESET`, `ECONNABORTED`, etc.) → logged at
+///   `debug`; they are expected under normal traffic and resolve automatically.
 pub async fn run(
     config: Arc<Config>,
     state: SharedState,
@@ -52,6 +62,9 @@ pub async fn run(
     // 4.2 — config.server.port is NonZeroU16; .get() produces the u16 value.
     let base_port = config.server.port.get();
     let fallback = config.server.auto_port_fallback;
+    // `u32 as usize`: usize ≥ 32 bits on every target Rust supports, so this
+    // conversion is lossless.  The allow suppresses clippy::cast_possible_truncation.
+    #[allow(clippy::cast_possible_truncation)]
     let max_conns = config.server.max_connections as usize;
 
     let (listener, bound_port) = match bind_with_fallback(bind_addr, base_port, fallback) {
@@ -75,7 +88,6 @@ pub async fn run(
     }
 
     // Signal the bound port to lifecycle so Tor can start immediately.
-    // If the receiver has already gone away, we continue serving anyway.
     let _ = port_tx.send(bound_port);
 
     log::info!("HTTP server listening on {bind_addr}:{bound_port}");
@@ -94,20 +106,30 @@ pub async fn run(
             return;
         }
     };
-    // 3.2 — Arc<str>: per-connection clone is an atomic refcount bump, not a
-    //        String heap allocation.
+    // 3.2 — Arc<str>: per-connection clone is an atomic refcount bump.
     let index_file: Arc<str> = Arc::from(config.site.index_file.as_str());
+    // 5.3 — Content-Security-Policy forwarded to every handler so it can be
+    //        emitted on HTML responses without a global static.
+    let csp_header: Arc<str> = Arc::from(config.server.content_security_policy.as_str());
     let dir_list = config.site.enable_directory_listing;
 
     let semaphore = Arc::new(Semaphore::new(max_conns));
     // 2.10 — JoinSet tracks in-flight handler tasks so shutdown can drain them.
     let mut join_set: JoinSet<()> = JoinSet::new();
 
+    // 5.4 — Exponential backoff on accept errors.
+    // Starts at 1 ms, doubles on each consecutive error, caps at 1 s.
+    // Reset to 1 ms after the next successful accept.
+    let mut backoff_ms: u64 = 1;
+
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, peer)) => {
+                        // 5.4 — reset backoff after a successful accept.
+                        backoff_ms = 1;
+
                         log::debug!("Connection from {peer}");
                         let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
                             break; // semaphore closed — shutting down
@@ -121,16 +143,34 @@ pub async fn run(
                         let site = Arc::clone(&canonical_root);
                         let idx  = Arc::clone(&index_file);
                         let met  = Arc::clone(&metrics);
+                        let csp  = Arc::clone(&csp_header);
                         join_set.spawn(async move {
                             let _permit = permit;
                             if let Err(e) = handler::handle(
-                                stream, site, idx, dir_list, met
+                                stream, site, idx, dir_list, met, csp,
                             ).await {
                                 log::debug!("Handler error: {e}");
                             }
                         });
                     }
-                    Err(e) => log::warn!("Accept error: {e}"),
+                    Err(e) => {
+                        // 5.4 — differentiate error severity.
+                        if is_fd_exhaustion(&e) {
+                            log::error!(
+                                "Accept error — file-descriptor limit reached \
+                                 (EMFILE/ENFILE): {e}. Reduce max_connections or \
+                                 raise the OS ulimit."
+                            );
+                        } else {
+                            log::debug!("Accept error (transient): {e}");
+                        }
+
+                        // 5.4 — exponential backoff: prevents log storms under
+                        // persistent errors such as EMFILE (thousands of errors
+                        // per second in a tight loop become at most one per 1 s).
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = backoff_ms.saturating_mul(2).min(1_000);
+                    }
                 }
             }
 
@@ -143,8 +183,7 @@ pub async fn run(
     state.write().await.server_running = false;
     log::info!("HTTP server stopped accepting; draining in-flight connections…");
 
-    // 2.10 — wait up to 5 seconds for in-flight handlers to complete so
-    // responses that were already being written are not truncated mid-stream.
+    // 2.10 — wait up to 5 seconds for in-flight handlers to complete.
     let drain = async { while join_set.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
     log::info!("HTTP server drained.");
@@ -171,8 +210,6 @@ fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpLis
                 // Try the next port.
             }
             Err(source) => {
-                // 4.1 — use the structured ServerBind variant so callers can
-                //        match on the port number and source error separately.
                 return Err(AppError::ServerBind {
                     port: try_port,
                     source,
@@ -194,6 +231,27 @@ fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpLis
     })
 }
 
+/// Return `true` when `e` represents file-descriptor exhaustion (`EMFILE` or
+/// `ENFILE`) on Unix platforms.
+///
+/// On non-Unix targets (Windows) where these error codes have no equivalent,
+/// always returns `false`.
+fn is_fd_exhaustion(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        // EMFILE (24): too many open files for the process.
+        // ENFILE (23): too many open files system-wide.
+        // Both values are specified by POSIX and identical on Linux, macOS,
+        // FreeBSD, and other POSIX-conformant systems.
+        matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 // ─── Site scanner ─────────────────────────────────────────────────────────────
 
 /// Recursively count files and total bytes in `site_root` (BFS traversal).
@@ -201,8 +259,16 @@ fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpLis
 /// Returns `Err` if any `read_dir` call fails so callers can log a warning
 /// instead of silently reporting zeros.
 ///
-/// **Must be called from a blocking context** (e.g. `tokio::task::spawn_blocking`)
-/// because `std::fs::read_dir` is a blocking syscall.
+/// # Errors
+///
+/// Returns [`AppError::Io`] if any directory in the tree cannot be read.
+///
+/// # Panics
+///
+/// Does not panic.  **Must be called from a blocking context** (e.g.
+/// `tokio::task::spawn_blocking`) because `std::fs::read_dir` is a blocking
+/// syscall.
+#[must_use = "the file count and byte total are used to populate the dashboard"]
 pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
     let mut count = 0u32;
     let mut bytes = 0u64;
@@ -212,7 +278,6 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
 
     while let Some(dir) = queue.pop_front() {
         let entries = std::fs::read_dir(&dir).map_err(|e| {
-            // Preserve path context in the error while mapping to AppError::Io.
             AppError::Io(std::io::Error::new(
                 e.kind(),
                 format!("Cannot read directory {}: {e}", dir.display()),
