@@ -49,7 +49,20 @@ pub async fn handle(
 
         KeyEvent::Reload => {
             let site_root = data_dir.join(&config.site.directory);
-            let (count, bytes) = server::scan_site(&site_root);
+            // 2.2 — scan_site now returns Result and must run on a blocking
+            // thread (read_dir is not async-safe).
+            let (count, bytes) =
+                match tokio::task::spawn_blocking(move || server::scan_site(&site_root)).await {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(e)) => {
+                        log::warn!("Site rescan failed: {e}");
+                        return Ok(false);
+                    }
+                    Err(e) => {
+                        log::warn!("Site rescan task panicked: {e}");
+                        return Ok(false);
+                    }
+                };
             {
                 let mut s = state.write().await;
                 s.site_file_count = count;
@@ -64,7 +77,8 @@ pub async fn handle(
 
         KeyEvent::Open => {
             let port = state.read().await.actual_port;
-            open_browser(&format!("http://localhost:{port}"));
+            // 2.4 — use the canonical definition in crate::runtime
+            super::open_browser(&format!("http://localhost:{port}"));
         }
 
         KeyEvent::Other => {
@@ -77,12 +91,4 @@ pub async fn handle(
 
     Ok(false)
 }
-
-fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer").arg(url).spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-}
+// open_browser removed — canonical definition lives in crate::runtime (mod.rs) (fix 2.4)

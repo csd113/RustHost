@@ -27,6 +27,10 @@ auto_port_fallback = true
 # Open the system default browser at http://localhost:<port> on startup.
 open_browser_on_start = false
 
+# Maximum number of concurrent HTTP connections. Excess connections queue
+# at the OS TCP backlog level rather than spawning unbounded tasks.
+max_connections = 256
+
 # ─── [site] ───────────────────────────────────────────────────────────────────
 
 [site]
@@ -39,9 +43,6 @@ index_file = "index.html"
 
 # Return an HTML file listing for directory requests instead of index_file.
 enable_directory_listing = false
-
-# Watch the site directory for changes and update console stats automatically.
-auto_reload = false
 
 # ─── [tor] ────────────────────────────────────────────────────────────────────
 

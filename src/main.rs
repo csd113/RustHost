@@ -18,10 +18,16 @@ pub type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::
 
 #[tokio::main]
 async fn main() {
+    // Register a panic hook so the terminal is always restored, even when a
+    // panic fires on an async executor thread.
+    std::panic::set_hook(Box::new(|info| {
+        console::cleanup();
+        eprintln!("\nPanic: {info}");
+    }));
+
     if let Err(err) = runtime::lifecycle::run().await {
         // Best-effort terminal restore in case we crashed inside the console.
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+        console::cleanup();
         eprintln!("\nFatal error: {err}");
         std::process::exit(1);
     }

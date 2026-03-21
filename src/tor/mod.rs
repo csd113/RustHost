@@ -37,7 +37,7 @@ use std::path::PathBuf;
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::TorClient;
 use futures::StreamExt;
-use tokio::net::TcpStream;
+use tokio::{net::TcpStream, sync::watch};
 use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{config::OnionServiceConfigBuilder, handle_rend_requests, HsId, StreamRequest};
 
@@ -50,23 +50,26 @@ use crate::runtime::state::{SharedState, TorStatus};
 /// Spawns a Tokio task and returns immediately.  Tor status and the onion
 /// address are written into `state` as things progress, exactly as before.
 ///
-/// The signature is intentionally identical to the old subprocess version
-/// so `lifecycle.rs` requires zero changes.
-pub fn init(data_dir: PathBuf, bind_port: u16, state: SharedState) {
+/// `shutdown` is a watch channel whose `true` value triggers a clean exit
+/// from the stream-request loop (fix 2.10).
+pub fn init(
+    data_dir: PathBuf,
+    bind_port: u16,
+    state: SharedState,
+    shutdown: watch::Receiver<bool>,
+) {
     tokio::spawn(async move {
-        if let Err(e) = run(data_dir, bind_port, state.clone()).await {
+        if let Err(e) = run(data_dir, bind_port, state.clone(), shutdown).await {
             log::error!("Tor: fatal error: {e}");
-            set_status(&state, TorStatus::Failed(None)).await;
+            set_status(&state, TorStatus::Failed(e.to_string())).await;
         }
     });
 }
 
-/// No-op on shutdown.
-///
-/// The `TorClient` is owned by the Tokio task spawned in `init()` and is
-/// dropped — closing all Tor circuits — when that task exits as part of the
-/// normal Tokio runtime shutdown.  Nothing needs to be done explicitly here.
-pub const fn kill() {}
+// `kill()` has been removed (fix 2.10): the `TorClient` is owned by the task
+// spawned in `init()` and is dropped when that task exits, which closes all
+// Tor circuits cleanly.  Graceful shutdown is now signalled through the
+// `shutdown` watch channel passed to `init()`.
 
 // ─── Core async logic ─────────────────────────────────────────────────────────
 
@@ -74,6 +77,7 @@ async fn run(
     data_dir: PathBuf,
     bind_port: u16,
     state: SharedState,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     set_status(&state, TorStatus::Starting).await;
 
@@ -158,17 +162,50 @@ async fn run(
     // each other.  Dropping the task naturally closes the Tor circuit.
     let mut stream_requests = handle_rend_requests(rend_requests);
 
-    while let Some(stream_req) = stream_requests.next().await {
-        let local_addr = format!("127.0.0.1:{bind_port}");
-        tokio::spawn(async move {
-            if let Err(e) = proxy_stream(stream_req, &local_addr).await {
-                // Downgraded to debug — normal on abrupt disconnects.
-                log::debug!("Tor: stream closed: {e}");
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
+
+    // 2.10 — use select! so a shutdown signal can break the accept loop cleanly,
+    // instead of blocking indefinitely in stream_requests.next().
+    loop {
+        tokio::select! {
+            next = stream_requests.next() => {
+                if let Some(stream_req) = next {
+                    let local_addr = format!("127.0.0.1:{bind_port}");
+                    let Ok(permit) = std::sync::Arc::clone(&semaphore).acquire_owned().await else {
+                        break; // semaphore closed
+                    };
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        if let Err(e) = proxy_stream(stream_req, &local_addr).await {
+                            // Downgraded to debug — normal on abrupt disconnects.
+                            log::debug!("Tor: stream closed: {e}");
+                        }
+                    });
+                } else {
+                    // The onion service stream ended unexpectedly (Tor network
+                    // disruption, Arti internal error, resource exhaustion).
+                    // Flip the dashboard to Failed so the operator sees a clear
+                    // signal rather than a permanently green READY badge.
+                    log::warn!(
+                        "Tor: stream_requests stream ended — onion service is no longer active"
+                    );
+                    // 2.9 — use Failed(String) with a human-readable reason
+                    set_status(&state, TorStatus::Failed("stream ended".into())).await;
+                    state.write().await.onion_address = None;
+                    return Ok(());
+                }
             }
-        });
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    log::info!("Tor: shutdown signal received — stopping stream loop");
+                    break;
+                }
+            }
+        }
     }
 
-    log::warn!("Tor: stream_requests stream ended — onion service is no longer active");
+    // Clean shutdown: clear the displayed onion address.
+    state.write().await.onion_address = None;
     Ok(())
 }
 

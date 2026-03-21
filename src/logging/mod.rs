@@ -95,6 +95,15 @@ impl Log for RustHostLogger {
     }
 }
 
+/// Flush all buffered log entries to the log file.
+///
+/// Invokes `RustHostLogger::flush()`, which acquires the file mutex and calls
+/// `File::flush()`. Call this once during shutdown, after the final log entry
+/// has been written, to guarantee no lines are lost in the OS page cache.
+pub fn flush() {
+    log::logger().flush();
+}
+
 // ─── Init ────────────────────────────────────────────────────────────────────
 
 /// Initialise the global logger. Must be called once before any `log!` macro.

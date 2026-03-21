@@ -8,6 +8,7 @@ pub mod loader;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
     pub site: SiteConfig,
@@ -18,19 +19,25 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub port: u16,
     pub bind: String,
     pub auto_port_fallback: bool,
     pub open_browser_on_start: bool,
+    pub max_connections: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SiteConfig {
     pub directory: String,
     pub index_file: String,
     pub enable_directory_listing: bool,
-    pub auto_reload: bool,
+    // `auto_reload` has been removed: the field was advertised in the default
+    // config but never implemented. Old config files containing `auto_reload`
+    // will now be rejected at startup with a clear "unknown field" error,
+    // prompting the operator to remove the obsolete key (fix 2.6).
 }
 
 /// Controls Tor integration.
@@ -39,6 +46,7 @@ pub struct SiteConfig {
 /// automatically from the binary's data directory — no user configuration
 /// needed. The only knob is whether Tor is enabled at all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TorConfig {
     /// Master on/off switch. When `false`, Tor is never started and the
     /// onion address section of the dashboard is hidden.
@@ -46,6 +54,7 @@ pub struct TorConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     pub enabled: bool,
     pub level: String,
@@ -53,6 +62,7 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConsoleConfig {
     pub interactive: bool,
     pub refresh_rate_ms: u64,
@@ -60,6 +70,7 @@ pub struct ConsoleConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IdentityConfig {
     pub instance_name: String,
 }
@@ -72,12 +83,12 @@ impl Default for Config {
                 bind: "127.0.0.1".into(),
                 auto_port_fallback: true,
                 open_browser_on_start: false,
+                max_connections: 256,
             },
             site: SiteConfig {
                 directory: "site".into(),
                 index_file: "index.html".into(),
                 enable_directory_listing: false,
-                auto_reload: false,
             },
             tor: TorConfig { enabled: true },
             logging: LoggingConfig {

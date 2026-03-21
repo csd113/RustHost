@@ -34,8 +34,9 @@ pub enum TorStatus {
     Starting,
     /// `hostname` file read; `.onion` address available in `onion_address`.
     Ready,
-    /// Process exited with an error, or hostname polling timed out.
-    Failed(Option<i32>),
+    /// Tor failed; the inner `String` is a brief human-readable reason
+    /// (e.g. `"bootstrap failed"`, `"stream ended"`) shown in the dashboard.
+    Failed(String),
 }
 
 /// Which screen the console is currently showing.

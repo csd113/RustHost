@@ -57,10 +57,7 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
         TorStatus::Disabled => dim("DISABLED"),
         TorStatus::Starting => yellow("STARTING — polling for .onion address…"),
         TorStatus::Ready => green("READY"),
-        TorStatus::Failed(None) => red("FAILED — see log for details"),
-        TorStatus::Failed(Some(code)) => {
-            red(&format!("FAILED (exit {code}) — see log for details"))
-        }
+        TorStatus::Failed(reason) => red(&format!("FAILED ({reason}) — see log for details")),
     };
     let _ = writeln!(out, "  Tor          : {tor_str}\r");
     out.push_str("\r\n");
@@ -173,14 +170,11 @@ pub fn render_help() -> String {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn strip_timestamp(line: &str) -> &str {
-    let mut count = 0usize;
-    for (i, b) in line.bytes().enumerate() {
-        if b == b']' {
-            count = count.saturating_add(1);
-            if count == 2 {
-                return line[i.saturating_add(1)..].trim_start();
-            }
-        }
-    }
-    line
+    // Split on ']', skip the first two tokens ([level] and [timestamp]),
+    // return the remainder trimmed. Uses splitn so we stop after the third
+    // piece and never slice at a non-character boundary.
+    let mut parts = line.splitn(3, ']');
+    parts.next(); // consume "[level"
+    parts.next(); // consume "[timestamp"
+    parts.next().map_or(line, str::trim_start)
 }

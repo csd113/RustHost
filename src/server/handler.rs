@@ -13,8 +13,9 @@
 use std::{fmt::Write as _, path::Path};
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
+    time::timeout,
 };
 
 use super::{fallback, mime};
@@ -24,41 +25,71 @@ use crate::{runtime::state::SharedMetrics, Result};
 
 /// Handle one HTTP connection to completion.
 pub async fn handle(
-    mut stream: TcpStream,
-    site_root: &Path,
+    stream: TcpStream,
+    canonical_root: &Path, // 2.3 — pre-canonicalized by server::run
     index_file: &str,
     dir_listing: bool,
     metrics: SharedMetrics,
 ) -> Result<()> {
-    let request = read_request(&mut stream).await?;
+    // 2.1 — wrap in BufReader so read_request uses read_line (one syscall per
+    // line) rather than reading one byte at a time (up to 8192 syscalls).
+    let mut reader = BufReader::new(stream);
 
-    let Some(raw_path) = parse_path(&request) else {
+    // 1.5 — Wrap read_request in a 30-second timeout to prevent slow-loris DoS.
+    let request = match timeout(
+        std::time::Duration::from_secs(30),
+        read_request(&mut reader),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(_elapsed) => {
+            // Client held the connection open without completing a request.
+            log::debug!("Request timeout — sending 408");
+            // Recover the stream from the reader for writing.
+            let mut stream = reader.into_inner();
+            write_response(
+                &mut stream,
+                408,
+                "Request Timeout",
+                "text/plain",
+                b"Request Timeout",
+                false,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    // Recover the TcpStream from the BufReader for writing the response.
+    let mut stream = reader.into_inner();
+
+    // 1.4 — parse_path now returns (method, path) so we can suppress the body
+    // on HEAD responses.
+    let Some((method, raw_path)) = parse_path(&request) else {
         write_response(
             &mut stream,
             400,
             "Bad Request",
             "text/plain",
             b"Bad Request",
+            false,
         )
         .await?;
         metrics.add_error();
         return Ok(());
     };
 
+    let is_head = method == "HEAD";
+
     // Strip query string / fragment then percent-decode.
     let path_only = raw_path.split('?').next().unwrap_or("/");
     let decoded = percent_decode(path_only);
 
-    match resolve_path(site_root, &decoded, index_file, dir_listing) {
+    match resolve_path(canonical_root, &decoded, index_file, dir_listing) {
         Resolved::File(abs_path) => {
-            if let Ok(bytes) = tokio::fs::read(&abs_path).await {
-                let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                write_response(&mut stream, 200, "OK", mime::for_extension(ext), &bytes).await?;
-                metrics.add_request();
-            } else {
-                write_response(&mut stream, 404, "Not Found", "text/plain", b"Not Found").await?;
-                metrics.add_error();
-            }
+            serve_file(&mut stream, &abs_path, is_head, &metrics).await?;
         }
 
         Resolved::Fallback => {
@@ -68,13 +99,22 @@ pub async fn handle(
                 "OK",
                 "text/html; charset=utf-8",
                 fallback::NO_SITE_HTML.as_bytes(),
+                is_head,
             )
             .await?;
             metrics.add_request();
         }
 
         Resolved::Forbidden => {
-            write_response(&mut stream, 403, "Forbidden", "text/plain", b"Forbidden").await?;
+            write_response(
+                &mut stream,
+                403,
+                "Forbidden",
+                "text/plain",
+                b"Forbidden",
+                false,
+            )
+            .await?;
             metrics.add_error();
         }
 
@@ -86,6 +126,7 @@ pub async fn handle(
                 "OK",
                 "text/html; charset=utf-8",
                 html.as_bytes(),
+                is_head,
             )
             .await?;
             metrics.add_request();
@@ -95,28 +136,90 @@ pub async fn handle(
     Ok(())
 }
 
+// ─── File serving ─────────────────────────────────────────────────────────────
+
+/// Open `abs_path`, send headers + streamed body (or headers only for HEAD).
+///
+/// Extracted from `handle()` to keep that function under the line-count lint
+/// threshold. All logic is unchanged from the inline version.
+async fn serve_file(
+    stream: &mut TcpStream,
+    abs_path: &std::path::Path,
+    is_head: bool,
+    metrics: &SharedMetrics,
+) -> Result<()> {
+    // 1.7 — Stream the file instead of reading it entirely into memory.
+    if let Ok(mut file) = tokio::fs::File::open(abs_path).await {
+        let file_len = match file.metadata().await {
+            Ok(m) => m.len(),
+            Err(e) => {
+                log::debug!("Failed to read file metadata: {e}");
+                write_response(
+                    stream,
+                    500,
+                    "Internal Server Error",
+                    "text/plain",
+                    b"Internal Server Error",
+                    false,
+                )
+                .await?;
+                metrics.add_error();
+                return Ok(());
+            }
+        };
+        let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let content_type = mime::for_extension(ext);
+        write_headers(stream, 200, "OK", content_type, file_len).await?;
+        if !is_head {
+            tokio::io::copy(&mut file, stream).await?;
+        }
+        stream.flush().await?;
+        metrics.add_request();
+    } else {
+        write_response(stream, 404, "Not Found", "text/plain", b"Not Found", false).await?;
+        metrics.add_error();
+    }
+    Ok(())
+}
+
 // ─── Request reading ─────────────────────────────────────────────────────────
 
-async fn read_request(stream: &mut TcpStream) -> Result<String> {
-    let mut buf = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
+/// Read HTTP request headers from a buffered stream, line by line.
+///
+/// Uses `read_line()` — a single system call per line regardless of how many
+/// bytes arrive — instead of the previous byte-at-a-time loop that issued up
+/// to 8 192 `read` syscalls per request (fix 2.1).
+///
+/// Stops at the blank line that terminates the HTTP header section
+/// (`\r\n` or bare `\n`). Enforces an 8 KiB total limit.
+async fn read_request(reader: &mut BufReader<TcpStream>) -> Result<String> {
+    let mut request = String::with_capacity(512);
+    let mut total = 0usize;
 
     loop {
-        stream.read_exact(&mut byte).await?;
-        buf.push(byte[0]);
-        if buf.ends_with(b"\r\n\r\n") {
-            break;
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await?;
+        if n == 0 {
+            return Err("Connection closed before headers were complete".into());
         }
-        if buf.len() > 8_192 {
+        total = total.saturating_add(n);
+        if total > 8_192 {
             return Err("Request header too large (> 8 KiB)".into());
+        }
+        request.push_str(&line);
+        // Both `\r\n` (CRLF, RFC 7230 §3) and bare `\n` terminate the headers.
+        if line == "\r\n" || line == "\n" {
+            break;
         }
     }
 
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(request)
 }
 
-/// Extract the URL path from `GET /path HTTP/1.1`.
-fn parse_path(request: &str) -> Option<&str> {
+/// Extract the method and URL path from `GET /path HTTP/1.1`.
+/// Returns `(method, path)` or `None` if the request line is malformed or
+/// the method is not GET/HEAD.
+fn parse_path(request: &str) -> Option<(&str, &str)> {
     let first = request.lines().next()?;
     let mut it = first.splitn(3, ' ');
     let method = it.next()?;
@@ -125,7 +228,8 @@ fn parse_path(request: &str) -> Option<&str> {
         return None;
     }
 
-    it.next()
+    let path = it.next()?;
+    Some((method, path))
 }
 
 // ─── Path resolution ─────────────────────────────────────────────────────────
@@ -137,13 +241,16 @@ enum Resolved {
     DirectoryListing(std::path::PathBuf),
 }
 
-fn resolve_path(site_root: &Path, url_path: &str, index_file: &str, dir_listing: bool) -> Resolved {
+fn resolve_path(
+    canonical_root: &Path,
+    url_path: &str,
+    index_file: &str,
+    dir_listing: bool,
+) -> Resolved {
+    // 2.3 — `canonical_root` is already resolved by `server::run`; no
+    // canonicalize() syscall needed here on every request.
     let relative = url_path.trim_start_matches('/');
-    let candidate = site_root.join(relative);
-
-    let Ok(canonical_root) = site_root.canonicalize() else {
-        return Resolved::Fallback;
-    };
+    let candidate = canonical_root.join(relative);
 
     let target = if candidate.is_dir() {
         let idx = candidate.join(index_file);
@@ -162,7 +269,7 @@ fn resolve_path(site_root: &Path, url_path: &str, index_file: &str, dir_listing:
         return Resolved::Fallback;
     };
 
-    if !canonical.starts_with(&canonical_root) {
+    if !canonical.starts_with(canonical_root) {
         return Resolved::Forbidden;
     }
 
@@ -171,24 +278,43 @@ fn resolve_path(site_root: &Path, url_path: &str, index_file: &str, dir_listing:
 
 // ─── Response writing ────────────────────────────────────────────────────────
 
+/// Write a complete HTTP response, optionally suppressing the body (for HEAD).
+///
+/// The `Content-Length` header always reflects the full body size, even when
+/// the body is suppressed, as required by RFC 7231 §4.3.2.
 async fn write_response(
     stream: &mut TcpStream,
     status: u16,
     reason: &str,
     content_type: &str,
     body: &[u8],
+    suppress_body: bool,
+) -> Result<()> {
+    write_headers(stream, status, reason, content_type, body.len() as u64).await?;
+    if !suppress_body {
+        stream.write_all(body).await?;
+    }
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Write only the response status line and headers, followed by the blank line.
+/// Used by the streaming file path (1.7) and internally by `write_response`.
+async fn write_headers(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    content_length: u64,
 ) -> Result<()> {
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
-         Content-Length: {}\r\n\
+         Content-Length: {content_length}\r\n\
          Connection: close\r\n\
-         \r\n",
-        body.len()
+         \r\n"
     );
     stream.write_all(header.as_bytes()).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
     Ok(())
 }
 
@@ -206,16 +332,25 @@ fn build_directory_listing(dir: &Path, url_path: &str) -> String {
 
         let base = url_path.trim_end_matches('/');
         for name in &names {
-            let _ = writeln!(items, "  <li><a href=\"{base}/{name}\">{name}</a></li>");
+            // 1.3 — Percent-encode the filename for the href attribute.
+            let encoded_name = percent_encode_path(name);
+            // 1.3 — HTML-entity-escape the filename for the visible link text.
+            let escaped_name = html_escape(name);
+            let _ = writeln!(
+                items,
+                "  <li><a href=\"{base}/{encoded_name}\">{escaped_name}</a></li>"
+            );
         }
     }
 
+    // 1.3 — Also escape url_path when used in page title / heading.
+    let escaped_path = html_escape(url_path);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Index of {url_path}</title>
+  <title>Index of {escaped_path}</title>
   <style>
     body {{ font-family: system-ui, sans-serif; max-width: 700px;
             margin: 2rem auto; padding: 0 1rem; }}
@@ -223,13 +358,48 @@ fn build_directory_listing(dir: &Path, url_path: &str) -> String {
   </style>
 </head>
 <body>
-  <h2>Index of {url_path}</h2>
+  <h2>Index of {escaped_path}</h2>
   <ul>
 {items}  </ul>
 </body>
 </html>
 "#
     )
+}
+
+/// HTML-entity-escape a string for safe insertion into HTML content or
+/// attribute values.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Percent-encode a filename component for safe use in a URL path segment.
+/// Encodes all bytes that are not unreserved URI characters (RFC 3986).
+fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            // Unreserved characters: ALPHA / DIGIT / "-" / "." / "_" / "~"
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            b => {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
 }
 
 // ─── Percent decoding ────────────────────────────────────────────────────────

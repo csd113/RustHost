@@ -10,7 +10,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::{
     config::{self, Config},
@@ -105,9 +105,22 @@ async fn normal_run() -> Result<()> {
     }
 
     // 5. Scan site directory for initial file stats.
+    // 2.2 — wrap in spawn_blocking; scan_site now returns Result.
     {
         let site_root = data_dir().join(&config.site.directory);
-        let (count, bytes) = server::scan_site(&site_root);
+        let scan_root = site_root.clone();
+        let (count, bytes) =
+            match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    log::warn!("Could not scan site directory on startup: {e}");
+                    (0, 0)
+                }
+                Err(e) => {
+                    log::warn!("Site scan task panicked on startup: {e}");
+                    (0, 0)
+                }
+            };
         let mut s = state.write().await;
         s.site_file_count = count;
         s.site_total_bytes = bytes;
@@ -123,19 +136,35 @@ async fn normal_run() -> Result<()> {
     })?;
 
     // 8. Start HTTP server task.
-    spawn_server(&config, &state, &metrics, &shutdown_rx);
+    let (port_tx, port_rx) = oneshot::channel::<u16>();
+    // 2.10 — keep the JoinHandle so we can await the server during shutdown drain.
+    let server_handle = spawn_server(&config, &state, &metrics, &shutdown_rx, port_tx);
 
-    // Wait for the server to bind so actual_port is populated before we pass
-    // it to Tor. 50 ms is enough for localhost; the auto-fallback logic inside
-    // server::run handles the real timing.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for the server to signal its bound port via the oneshot channel.
+    // A 10-second timeout ensures a bind failure doesn't block forever.
+    let bind_port = match tokio::time::timeout(Duration::from_secs(10), port_rx).await {
+        Ok(Ok(port)) => port,
+        Ok(Err(_)) => {
+            log::error!("Server port channel closed before sending — server failed to bind");
+            return Err("Server failed to bind".into());
+        }
+        Err(_) => {
+            log::error!("Timed out waiting for server to bind");
+            return Err("Server bind timeout".into());
+        }
+    };
 
     // 9. Start Tor (if enabled).
     //    tor::init() spawns a Tokio task and returns immediately — never blocks
     //    the async executor.
+    //    2.10 — pass shutdown_rx so Tor's stream loop exits on clean shutdown.
     if config.tor.enabled {
-        let bind_port = state.read().await.actual_port;
-        tor::init(data_dir(), bind_port, Arc::clone(&state));
+        tor::init(
+            data_dir(),
+            bind_port,
+            Arc::clone(&state),
+            shutdown_rx.clone(),
+        );
     }
 
     // 10. Start console UI.
@@ -144,7 +173,8 @@ async fn normal_run() -> Result<()> {
     // 11. Open browser (if configured).
     if config.server.open_browser_on_start {
         let port = state.read().await.actual_port;
-        open_browser(&format!("http://localhost:{port}"));
+        // 2.4 — use canonical open_browser from crate::runtime
+        super::open_browser(&format!("http://localhost:{port}"));
     }
 
     // 12. Event dispatch loop.
@@ -153,31 +183,38 @@ async fn normal_run() -> Result<()> {
     // 13. Graceful shutdown.
     log::info!("Shutting down…");
     let _ = shutdown_tx.send(true);
-    // Drop the Arti TorClient — closes all Tor circuits cleanly.
-    tor::kill();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 2.10 — wait for the HTTP server to drain in-flight connections (max 5 s).
+    // tor::kill() has been removed — Tor exits when its task detects shutdown_rx.
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+    // 2.11 — write the final log entry, flush to disk, then restore the terminal.
+    log::info!("RustHost shut down cleanly.");
+    logging::flush();
     console::cleanup();
-    log::info!("Goodbye.");
 
     Ok(())
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Spawn the HTTP server task and return its `JoinHandle` so the shutdown
+/// sequence can await the connection drain (fix 2.10).
 fn spawn_server(
     config: &Arc<Config>,
     state: &SharedState,
     metrics: &SharedMetrics,
     shutdown: &watch::Receiver<bool>,
-) {
+    port_tx: oneshot::Sender<u16>,
+) -> tokio::task::JoinHandle<()> {
     let cfg = Arc::clone(config);
     let st = Arc::clone(state);
     let met = Arc::clone(metrics);
     let data = data_dir();
     let shut = shutdown.clone();
     tokio::spawn(async move {
-        server::run(cfg, st, met, data, shut).await;
-    });
+        server::run(cfg, st, met, data, shut, port_tx).await;
+    })
 }
 
 async fn start_console(
@@ -208,23 +245,40 @@ async fn event_loop(
     metrics: &SharedMetrics,
     ctrlc_rx: &mut mpsc::Receiver<()>,
 ) -> Result<()> {
+    // 2.8 — mutable so we can set to None when the channel closes.
     let mut key_rx = key_rx;
     loop {
+        // Build a future that yields the next key, or pends forever once the
+        // channel closes (avoids repeated None-match after input task death).
+        // When the channel closes we log once and park this arm (2.8).
+        let key_fut = async {
+            if let Some(rx) = key_rx.as_mut() {
+                rx.recv().await
+            } else {
+                // Channel already closed — pend forever so ctrlc_rx can still fire.
+                std::future::pending().await
+            }
+        };
+
         tokio::select! {
-            Some(key) = async {
-                match key_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None     => None,
+            maybe_key = key_fut => {
+                if let Some(key) = maybe_key {
+                    let quit = events::handle(
+                        key,
+                        config,
+                        Arc::clone(state),
+                        Arc::clone(metrics),
+                        data_dir(),
+                    ).await?;
+                    if quit { break; }
+                } else {
+                    // 2.8 — input task exited; disable key arm and warn operator.
+                    log::warn!(
+                        "Console input task exited — keyboard input disabled. \
+                         Use Ctrl-C to quit."
+                    );
+                    key_rx = None; // suppress repeated warnings on next select! iteration
                 }
-            } => {
-                let quit = events::handle(
-                    key,
-                    config,
-                    Arc::clone(state),
-                    Arc::clone(metrics),
-                    data_dir(),
-                ).await?;
-                if quit { break; }
             }
             Some(()) = ctrlc_rx.recv() => { break; }
         }
@@ -232,14 +286,8 @@ async fn event_loop(
     Ok(())
 }
 
-fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer").arg(url).spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-}
+// open_browser removed from this file — canonical definition is in
+// crate::runtime (src/runtime/mod.rs), called via super::open_browser (fix 2.4).
 
 // ─── Placeholder HTML ─────────────────────────────────────────────────────────
 
