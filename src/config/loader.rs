@@ -207,7 +207,7 @@ bind = "127.0.0.1"
 auto_port_fallback = true
 open_browser_on_start = false
 max_connections = 256
-content_security_policy = "default-src 'self'"
+content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
 {extra}
 
 [site]

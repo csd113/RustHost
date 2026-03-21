@@ -32,11 +32,13 @@ open_browser_on_start = false
 max_connections = 256
 
 # Content-Security-Policy value sent with every HTML response.
-# The default restricts all content to the same origin.
-# Relax this if you serve fonts, analytics scripts, or other third-party
-# resources from a CDN, for example:
-#   content_security_policy = "default-src 'self'; script-src 'self' cdn.example.com"
-content_security_policy = "default-src 'self'"
+# The default allows same-origin resources plus inline scripts and styles,
+# which is required for onclick handlers, <style> blocks, and style= attributes.
+# Tighten if your site uses no inline code:
+#   content_security_policy = "default-src 'self'"
+# Relax further for third-party CDN resources:
+#   content_security_policy = "default-src 'self' cdn.example.com; script-src 'self' 'unsafe-inline'"
+content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
 
 # ─── [site] ───────────────────────────────────────────────────────────────────
 

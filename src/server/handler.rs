@@ -172,6 +172,23 @@ pub async fn handle(
             .await?;
             metrics.add_error();
         }
+        Resolved::Redirect(location) => {
+            let body = format!("Redirecting to {location}");
+            let mut hdr = String::new();
+            let _ = std::fmt::write(
+                &mut hdr,
+                format_args!(
+                    "HTTP/1.1 301 Moved Permanently\r\n                     Location: {location}\r\n                     Content-Type: text/plain\r\n                     Content-Length: {len}\r\n                     Connection: close\r\n                     \r\n",
+                    len = body.len()
+                ),
+            );
+            stream.write_all(hdr.as_bytes()).await?;
+            if !is_head {
+                stream.write_all(body.as_bytes()).await?;
+            }
+            stream.flush().await?;
+            metrics.add_request();
+        }
         Resolved::Fallback => {
             write_response(
                 &mut stream,
@@ -373,6 +390,8 @@ pub(crate) enum Resolved {
     Fallback,
     Forbidden,
     DirectoryListing(std::path::PathBuf),
+    /// 301 redirect to the given Location URL (used to append a trailing slash).
+    Redirect(String),
 }
 
 #[must_use]
@@ -388,6 +407,12 @@ pub(crate) fn resolve_path(
     let candidate = canonical_root.join(relative);
 
     let target = if candidate.is_dir() {
+        // If the URL has no trailing slash, redirect so that relative links
+        // in the served index file resolve against the correct base URL.
+        if !url_path.ends_with('/') {
+            let redirect_to = format!("{url_path}/");
+            return Resolved::Redirect(redirect_to);
+        }
         let idx = candidate.join(index_file);
         if idx.exists() {
             idx

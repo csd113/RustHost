@@ -91,7 +91,7 @@ pub struct ServerConfig {
     pub max_connections: u32,
 
     /// Value of the `Content-Security-Policy` header sent with every HTML
-    /// response (task 5.3).  The default `"default-src 'self'"` restricts all
+    /// response (task 5.3).  The default `"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"` restricts all
     /// content to the same origin.
     ///
     /// Operators serving CDN fonts, analytics scripts, or other third-party
@@ -99,7 +99,7 @@ pub struct ServerConfig {
     ///
     /// ```toml
     /// [server]
-    /// content_security_policy = "default-src 'self'; script-src 'self' cdn.example.com"
+    /// content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; script-src 'self' cdn.example.com"
     /// ```
     ///
     /// **Tor note:** `Referrer-Policy: no-referrer` is always sent regardless
@@ -183,7 +183,7 @@ impl Default for Config {
                 auto_port_fallback: true,
                 open_browser_on_start: false,
                 max_connections: 256,
-                content_security_policy: "default-src 'self'".into(),
+                content_security_policy: "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'".into(),
             },
             site: SiteConfig {
                 directory: "site".into(),
