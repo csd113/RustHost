@@ -5,14 +5,14 @@
 use std::path::Path;
 
 use super::Config;
-use crate::Result;
+use crate::{AppError, Result};
 
 pub fn load(path: &Path) -> Result<Config> {
     let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+        .map_err(|e| AppError::ConfigLoad(format!("Cannot read {}: {e}", path.display())))?;
 
-    let config: Config =
-        toml::from_str(&raw).map_err(|e| format!("settings.toml is malformed: {e}"))?;
+    let config: Config = toml::from_str(&raw)
+        .map_err(|e| AppError::ConfigLoad(format!("settings.toml is malformed: {e}")))?;
 
     validate(&config)?;
     Ok(config)
@@ -22,15 +22,9 @@ fn validate(cfg: &Config) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
 
     // [server]
-    if cfg.server.port == 0 {
-        errors.push("[server] port must be between 1 and 65535".into());
-    }
-    if cfg.server.bind.parse::<std::net::IpAddr>().is_err() {
-        errors.push(format!(
-            "[server] bind = {:?} is not a valid IP address",
-            cfg.server.bind
-        ));
-    }
+    // port: NonZeroU16 — port 0 is already rejected by serde at parse time (4.2).
+    // bind: IpAddr     — invalid IPs are already rejected by serde at parse time (4.2).
+    // level: LogLevel  — invalid levels are already rejected by serde at parse time (4.2).
 
     // [site]
     if cfg.site.index_file.contains(std::path::MAIN_SEPARATOR) {
@@ -53,14 +47,6 @@ fn validate(cfg: &Config) -> Result<()> {
     }
 
     // [logging]
-    let valid_levels = ["trace", "debug", "info", "warn", "error"];
-    if !valid_levels.contains(&cfg.logging.level.as_str()) {
-        errors.push(format!(
-            "[logging] level = {:?} is invalid; choose one of: {}",
-            cfg.logging.level,
-            valid_levels.join(", ")
-        ));
-    }
     {
         let log_path = std::path::Path::new(&cfg.logging.file);
         if log_path.is_absolute() {
@@ -103,11 +89,6 @@ fn validate(cfg: &Config) -> Result<()> {
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(format!(
-            "settings.toml has {} error(s):\n  • {}",
-            errors.len(),
-            errors.join("\n  • ")
-        )
-        .into())
+        Err(AppError::ConfigValidation(errors))
     }
 }

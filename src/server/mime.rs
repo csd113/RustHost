@@ -14,7 +14,22 @@
 /// assert_eq!(mime::for_extension("xyz"),  "application/octet-stream");
 /// ```
 pub fn for_extension(ext: &str) -> &'static str {
-    match ext.to_ascii_lowercase().as_str() {
+    // 3.4 — Normalise to lowercase in a fixed stack buffer to avoid a heap
+    // allocation on every served file request. Extensions longer than 16 bytes
+    // are not in the table, so we short-circuit to the fallback immediately.
+    let bytes = ext.as_bytes();
+    let mut buf = [0u8; 16];
+    if bytes.len() > buf.len() {
+        return "application/octet-stream";
+    }
+    // Use zip to avoid any index that could theoretically panic under clippy's
+    // indexing_slicing lint; the length guard above already guarantees safety.
+    for (slot, &b) in buf.iter_mut().zip(bytes.iter()) {
+        *slot = b.to_ascii_lowercase();
+    }
+    // get() instead of a bare slice to satisfy clippy::indexing_slicing.
+    let lower = std::str::from_utf8(buf.get(..bytes.len()).unwrap_or_default()).unwrap_or("");
+    match lower {
         // Text
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",

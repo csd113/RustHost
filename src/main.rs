@@ -8,13 +8,20 @@
 
 mod config;
 mod console;
+mod error;
 mod logging;
 mod runtime;
 mod server;
 mod tor;
 
+pub use error::AppError;
+
 /// Common `Result` alias used throughout the codebase.
-pub type Result<T, E = Box<dyn std::error::Error + Send + Sync>> = std::result::Result<T, E>;
+///
+/// The error type is [`AppError`] — a typed enum covering every failure mode.
+/// All subsystems return this type so callers can match on specific variants
+/// rather than inspecting an opaque `Box<dyn Error>` string.
+pub type Result<T, E = AppError> = std::result::Result<T, E>;
 
 #[tokio::main]
 async fn main() {

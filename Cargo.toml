@@ -16,7 +16,20 @@ path = "src/main.rs"
 
 [dependencies]
 # Async runtime — drives the server, console, and all I/O
-tokio = { version = "1", features = ["full"] }
+# 3.6 — Explicit feature list instead of "full"; removes unused `process` and
+#        `io-std` components, reducing binary size and compile time.
+#        Note: open_browser uses std::process::Command (stdlib), not the Tokio
+#        process feature, so dropping `process` here is safe.
+tokio = { version = "1", features = [
+    "rt-multi-thread", # multi-threaded work-stealing executor
+    "net",             # TcpListener / TcpStream
+    "io-util",         # AsyncBufReadExt, AsyncWriteExt, copy
+    "fs",              # tokio::fs::File, metadata
+    "sync",            # Mutex, RwLock, Semaphore, oneshot, watch, mpsc
+    "time",            # interval, sleep, timeout
+    "macros",          # #[tokio::main], tokio::select!
+    "signal",          # SIGINT / SIGTERM (used by ctrlc integration)
+] }
 
 # ─── Arti (in-process Tor) ────────────────────────────────────────────────────
 #
@@ -46,6 +59,9 @@ futures = "0.3"
 sha3 = "0.10"
 data-encoding = "2"
 
+# Typed error enum — derives Display + Error for AppError variants
+thiserror = "1"
+
 # Configuration — TOML parsing and typed deserialization
 serde  = { version = "1", features = ["derive"] }
 toml   = "0.8"
@@ -59,8 +75,10 @@ crossterm = "0.27"
 # Timestamps — used in log formatting
 chrono = { version = "0.4", features = ["clock"] }
 
-# Signal handling — catches SIGINT / SIGTERM for graceful shutdown
-ctrlc = "3"
+# Signal handling — Ctrl-C and SIGTERM handled via tokio::signal (4.7)
+# ctrlc crate removed: tokio's built-in signal support (feature "signal", already
+# in the explicit feature list) eliminates the threading conflict between the ctrlc
+# crate's OS-level signal handler and Tokio's internal signal infrastructure.
 
 [profile.release]
 opt-level = 3

@@ -74,6 +74,12 @@ level = "info"
 # Log file path relative to ./rusthost-data/.
 file = "logs/rusthost.log"
 
+# When true (default), suppress Info/Debug/Trace records from third-party
+# crates (Arti, Tokio, TLS internals) so the log file stays focused on
+# application events. Warnings and errors from all crates are always shown.
+# Set false to see full dependency tracing (useful for debugging Tor issues).
+filter_dependencies = true
+
 # ─── [console] ────────────────────────────────────────────────────────────────
 
 [console]

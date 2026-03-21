@@ -15,7 +15,10 @@ pub mod handler;
 pub mod mime;
 
 use std::{
-    net::TcpListener as StdTcpListener, path::Path, path::PathBuf, sync::Arc, time::Duration,
+    net::{IpAddr, TcpListener as StdTcpListener},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
 use tokio::{
@@ -27,10 +30,10 @@ use tokio::{
 use crate::{
     config::Config,
     runtime::state::{SharedMetrics, SharedState},
-    Result,
+    AppError, Result,
 };
 
-// ─── Public API ─────────────────────────────────────────────────────────────
+// ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Start the HTTP server.
 ///
@@ -45,8 +48,9 @@ pub async fn run(
     mut shutdown: watch::Receiver<bool>,
     port_tx: oneshot::Sender<u16>,
 ) {
-    let bind_addr = &config.server.bind;
-    let base_port = config.server.port;
+    let bind_addr = config.server.bind;
+    // 4.2 — config.server.port is NonZeroU16; .get() produces the u16 value.
+    let base_port = config.server.port.get();
     let fallback = config.server.auto_port_fallback;
     let max_conns = config.server.max_connections as usize;
 
@@ -78,10 +82,10 @@ pub async fn run(
 
     let site_root = data_dir.join(&config.site.directory);
     // 2.3 — canonicalize once here so resolve_path never calls canonicalize()
-    // per-request. If the root is missing or inaccessible, fail fast before
-    // binding any port.
-    let canonical_root = match site_root.canonicalize() {
-        Ok(p) => p,
+    // per-request. If the root is missing or inaccessible, fail fast.
+    // 3.2 — Wrap in Arc<Path> so per-connection clones are O(1) refcount bumps.
+    let canonical_root: Arc<Path> = match site_root.canonicalize() {
+        Ok(p) => Arc::from(p.as_path()),
         Err(e) => {
             log::error!(
                 "Site root {} cannot be resolved: {e}. Check that [site] directory exists.",
@@ -90,7 +94,9 @@ pub async fn run(
             return;
         }
     };
-    let index_file = config.site.index_file.clone();
+    // 3.2 — Arc<str>: per-connection clone is an atomic refcount bump, not a
+    //        String heap allocation.
+    let index_file: Arc<str> = Arc::from(config.site.index_file.as_str());
     let dir_list = config.site.enable_directory_listing;
 
     let semaphore = Arc::new(Semaphore::new(max_conns));
@@ -112,13 +118,13 @@ pub async fn run(
                                  further connections will queue"
                             );
                         }
-                        let site = canonical_root.clone();
-                        let idx  = index_file.clone();
+                        let site = Arc::clone(&canonical_root);
+                        let idx  = Arc::clone(&index_file);
                         let met  = Arc::clone(&metrics);
                         join_set.spawn(async move {
                             let _permit = permit;
                             if let Err(e) = handler::handle(
-                                stream, &site, &idx, dir_list, met
+                                stream, site, idx, dir_list, met
                             ).await {
                                 log::debug!("Handler error: {e}");
                             }
@@ -144,11 +150,11 @@ pub async fn run(
     log::info!("HTTP server drained.");
 }
 
-// ─── Port binding ────────────────────────────────────────────────────────────
+// ─── Port binding ─────────────────────────────────────────────────────────────
 
 /// Try to bind to `addr:port`. When `fallback` is true, increments the port
 /// up to 10 times before giving up.
-fn bind_with_fallback(addr: &str, port: u16, fallback: bool) -> Result<(TcpListener, u16)> {
+fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpListener, u16)> {
     let max_attempts: u16 = if fallback { 10 } else { 1 };
 
     for attempt in 0..max_attempts {
@@ -164,22 +170,28 @@ fn bind_with_fallback(addr: &str, port: u16, fallback: bool) -> Result<(TcpListe
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && fallback => {
                 // Try the next port.
             }
-            Err(e) => {
-                return Err(format!(
-                    "Port {try_port} is already in use. \
-                     Change [server].port in settings.toml or set \
-                     auto_port_fallback = true.\n  OS error: {e}"
-                )
-                .into());
+            Err(source) => {
+                // 4.1 — use the structured ServerBind variant so callers can
+                //        match on the port number and source error separately.
+                return Err(AppError::ServerBind {
+                    port: try_port,
+                    source,
+                });
             }
         }
     }
 
-    Err(format!(
-        "Could not find a free port after {max_attempts} attempts \
-         starting from {port}."
-    )
-    .into())
+    Err(AppError::ServerBind {
+        port,
+        source: std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "Could not find a free port after {max_attempts} attempts \
+                 starting from {port}. Change [server].port in settings.toml \
+                 or set auto_port_fallback = true."
+            ),
+        ),
+    })
 }
 
 // ─── Site scanner ─────────────────────────────────────────────────────────────
@@ -199,8 +211,13 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
     queue.push_back(site_root.to_path_buf());
 
     while let Some(dir) = queue.pop_front() {
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| format!("Cannot read directory {}: {e}", dir.display()))?;
+        let entries = std::fs::read_dir(&dir).map_err(|e| {
+            // Preserve path context in the error while mapping to AppError::Io.
+            AppError::Io(std::io::Error::new(
+                e.kind(),
+                format!("Cannot read directory {}: {e}", dir.display()),
+            ))
+        })?;
 
         for entry in entries.flatten() {
             match entry.metadata() {

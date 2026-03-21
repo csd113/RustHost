@@ -10,7 +10,7 @@
 //! configured site root via [`std::fs::canonicalize`]. Any attempt to
 //! escape (e.g. `/../secret`) is rejected with HTTP 403.
 
-use std::{fmt::Write as _, path::Path};
+use std::{fmt::Write as _, path::Path, sync::Arc};
 
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -26,8 +26,8 @@ use crate::{runtime::state::SharedMetrics, Result};
 /// Handle one HTTP connection to completion.
 pub async fn handle(
     stream: TcpStream,
-    canonical_root: &Path, // 2.3 — pre-canonicalized by server::run
-    index_file: &str,
+    canonical_root: Arc<Path>, // 3.2 — pre-canonicalized (2.3); Arc avoids per-connection alloc
+    index_file: Arc<str>,      // 3.2 — Arc<str> clone is O(1)
     dir_listing: bool,
     metrics: SharedMetrics,
 ) -> Result<()> {
@@ -87,7 +87,7 @@ pub async fn handle(
     let path_only = raw_path.split('?').next().unwrap_or("/");
     let decoded = percent_decode(path_only);
 
-    match resolve_path(canonical_root, &decoded, index_file, dir_listing) {
+    match resolve_path(&canonical_root, &decoded, &index_file, dir_listing) {
         Resolved::File(abs_path) => {
             serve_file(&mut stream, &abs_path, is_head, &metrics).await?;
         }
@@ -200,11 +200,13 @@ async fn read_request(reader: &mut BufReader<TcpStream>) -> Result<String> {
         let mut line = String::new();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
-            return Err("Connection closed before headers were complete".into());
+            return Err(
+                std::io::Error::other("Connection closed before headers were complete").into(),
+            );
         }
         total = total.saturating_add(n);
         if total > 8_192 {
-            return Err("Request header too large (> 8 KiB)".into());
+            return Err(std::io::Error::other("Request header too large (> 8 KiB)").into());
         }
         request.push_str(&line);
         // Both `\r\n` (CRLF, RFC 7230 §3) and bare `\n` terminate the headers.
@@ -405,26 +407,84 @@ fn percent_encode_path(s: &str) -> String {
 // ─── Percent decoding ────────────────────────────────────────────────────────
 
 /// Decode percent-encoded characters in a URL path (e.g. `%20` → ` `).
+///
+/// # Correctness (fix 4.5)
+///
+/// The previous implementation decoded each `%XX` pair as an independent
+/// `char` cast from a `u8`, which produced two garbled characters for any
+/// multi-byte UTF-8 sequence (e.g. `%C3%A9` yielded `Ã©` instead of `é`).
+///
+/// This version accumulates consecutive percent-decoded bytes into a buffer
+/// and converts to UTF-8 via `String::from_utf8_lossy` only when a literal
+/// character (or end-of-input) breaks the run.  This correctly handles
+/// multi-byte sequences split across adjacent `%XX` tokens and falls back
+/// gracefully for invalid UTF-8.
+///
+/// Null bytes (`%00`) are never decoded — they are passed through as the
+/// literal string `%00` to prevent null-byte path injection attacks.
 fn percent_decode(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars();
+    // Buffer for consecutive percent-decoded bytes that may form a multi-byte
+    // UTF-8 character together.
+    let mut byte_buf: Vec<u8> = Vec::new();
 
-    while let Some(c) = chars.next() {
-        if c != '%' {
-            output.push(c);
-            continue;
-        }
-        // Decode the next two hex digits.
-        let h1 = chars.next().and_then(|c| c.to_digit(16));
-        let h2 = chars.next().and_then(|c| c.to_digit(16));
-        if let (Some(a), Some(b)) = (h1, h2) {
-            // Both digits are valid 0–15, so the combined value fits in u8.
-            let byte = u8::try_from((a << 4) | b).unwrap_or(b'?');
-            output.push(byte as char);
+    let src = input.as_bytes();
+    let mut i = 0;
+
+    while i < src.len() {
+        // Use .get() throughout to satisfy clippy::indexing_slicing.
+        if src.get(i).copied() == Some(b'%') {
+            let h1 = src.get(i.saturating_add(1)).copied().and_then(hex_digit);
+            let h2 = src.get(i.saturating_add(2)).copied().and_then(hex_digit);
+            if let (Some(hi), Some(lo)) = (h1, h2) {
+                let byte = (hi << 4) | lo;
+                if byte == 0x00 {
+                    // 4.5 — null byte: do not decode, emit literal %00.
+                    flush_byte_buf(&mut byte_buf, &mut output);
+                    output.push_str("%00");
+                } else {
+                    byte_buf.push(byte);
+                }
+                i = i.saturating_add(3);
+            } else {
+                // Incomplete or invalid %XX — pass through literal `%` and
+                // advance by 1 so the following characters are re-processed
+                // individually (preserving `%2` as `%2`, `%ZZ` as `%ZZ`).
+                flush_byte_buf(&mut byte_buf, &mut output);
+                output.push('%');
+                i = i.saturating_add(1);
+            }
         } else {
-            output.push('%');
+            flush_byte_buf(&mut byte_buf, &mut output);
+            // Advance by one full UTF-8 character so we never split a scalar.
+            let ch = input
+                .get(i..)
+                .and_then(|s| s.chars().next())
+                .unwrap_or('\u{FFFD}');
+            output.push(ch);
+            i = i.saturating_add(ch.len_utf8());
         }
     }
-
+    // Flush any trailing percent-decoded bytes at end-of-input.
+    flush_byte_buf(&mut byte_buf, &mut output);
     output
+}
+
+/// Convert a single ASCII hex digit byte to its numeric value, or `None`.
+const fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b.wrapping_sub(b'0')),
+        b'a'..=b'f' => Some(b.wrapping_sub(b'a').wrapping_add(10)),
+        b'A'..=b'F' => Some(b.wrapping_sub(b'A').wrapping_add(10)),
+        _ => None,
+    }
+}
+
+/// Interpret `buf` as UTF-8 (with lossy replacement for invalid sequences),
+/// append to `out`, then clear `buf`.
+fn flush_byte_buf(buf: &mut Vec<u8>, out: &mut String) {
+    if !buf.is_empty() {
+        out.push_str(&String::from_utf8_lossy(buf));
+        buf.clear();
+    }
 }
