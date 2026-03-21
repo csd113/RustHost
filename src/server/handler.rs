@@ -174,13 +174,20 @@ pub async fn handle(
         }
         Resolved::Redirect(location) => {
             let body = format!("Redirecting to {location}");
-            let mut hdr = String::new();
-            let _ = std::fmt::write(
-                &mut hdr,
-                format_args!(
-                    "HTTP/1.1 301 Moved Permanently\r\n                     Location: {location}\r\n                     Content-Type: text/plain\r\n                     Content-Length: {len}\r\n                     Connection: close\r\n                     \r\n",
-                    len = body.len()
-                ),
+            // The original format_args! string used source indentation that
+            // injected leading spaces after each \r\n, producing
+            // "folded header" lines (RFC 7230 §3.2.6 deprecated,
+            // RFC 9112 §5.1 forbidden). Strict HTTP clients reject them.
+            // Use a raw string with explicit \r\n\ continuations so the
+            // indentation is NOT part of the emitted bytes.
+            let body_len = body.len();
+            let hdr = format!(
+                "HTTP/1.1 301 Moved Permanently\r\n\
+                 Location: {location}\r\n\
+                 Content-Type: text/plain\r\n\
+                 Content-Length: {body_len}\r\n\
+                 Connection: close\r\n\
+                 \r\n"
             );
             stream.write_all(hdr.as_bytes()).await?;
             if !is_head {

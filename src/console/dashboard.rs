@@ -71,7 +71,16 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
         || match &state.tor_status {
             TorStatus::Disabled => dim("(disabled)"),
             TorStatus::Starting => dim("(bootstrapping…)"),
-            TorStatus::Ready => dim("(reading…)"),
+            // fix 3.11 — this branch is unreachable in practice because
+            // set_onion() sets Ready and Some(addr) atomically.  If it fires,
+            // an invariant has been violated; the honest label is "unavailable".
+            TorStatus::Ready => {
+                debug_assert!(
+                    false,
+                    "TorStatus::Ready with no onion_address — invariant violated"
+                );
+                dim("(address unavailable)")
+            }
             TorStatus::Failed(_) => dim("(unavailable)"),
         },
         |addr| format!("http://{addr}"),

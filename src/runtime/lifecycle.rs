@@ -192,16 +192,23 @@ async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
     };
 
     // 8. Start Tor (if enabled).
-    //    tor::init() spawns a Tokio task and returns immediately.
+    //    tor::init() spawns a Tokio task and returns its JoinHandle.
+    //    fix 3.1  — we store the handle and await it during shutdown so active
+    //               Tor circuits get a chance to close cleanly (max 5 s).
+    //    fix 3.6  — pass config.server.bind so the local proxy connect uses the
+    //               correct loopback address (e.g. ::1 on IPv6-only machines).
     //    2.10 — pass shutdown_rx so Tor's stream loop exits on clean shutdown.
-    if config.tor.enabled {
-        tor::init(
+    let tor_handle = if config.tor.enabled {
+        Some(tor::init(
             data_dir.clone(),
             bind_port,
+            config.server.bind,
             Arc::clone(&state),
             shutdown_rx.clone(),
-        );
-    }
+        ))
+    } else {
+        None
+    };
 
     // 9. Start console UI.
     let key_rx = start_console(&config, &state, &metrics, shutdown_rx.clone()).await?;
@@ -222,6 +229,13 @@ async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
 
     // 2.10 — wait for the HTTP server to drain in-flight connections (max 5 s).
     let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+    // fix 3.1 — await the Tor task so active circuits can send a clean
+    // RELAY_END cell before the runtime tears down.  The shutdown watch
+    // channel was already signalled above; this just drains the task.
+    if let Some(handle) = tor_handle {
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
 
     log::info!("RustHost shut down cleanly.");
     logging::flush();
@@ -273,6 +287,58 @@ async fn start_console(
     }
 }
 
+// ─── SIGTERM helper ───────────────────────────────────────────────────────────
+//
+// `tokio::select!` does not support `#[cfg(...)]` on individual arms; the macro
+// expands its arms textually before cfg evaluation, so a guarded arm produces a
+// parse error.  The solution is a cross-platform helper with identical call-site
+// syntax on every target:
+//
+//   • Unix     — registers a SIGTERM handler and awaits the first delivery.
+//   • non-Unix — awaits `std::future::pending()`, which never resolves.
+//
+// Both variants share the name `next_sigterm()` and return `()`, so a single
+// unconditional `select!` arm covers all platforms.  The caller pins the
+// returned future outside its loop so the Unix `Signal` handle (and its OS-level
+// signal pipe) is created exactly once for the lifetime of the event loop.
+//
+// Failure to register the Unix handler (e.g. signal limit reached) is logged as
+// a warning and the function falls back to `pending()` — the process remains
+// functional, just without SIGTERM-triggered graceful shutdown.
+
+/// On Unix, resolve once when `SIGTERM` is delivered; fall back to pending
+/// forever if the signal stream cannot be registered.
+///
+/// See the module-level comment above for the cross-platform design rationale.
+#[cfg(unix)]
+async fn next_sigterm() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::terminate()) {
+        Ok(mut stream) => {
+            // recv() returns Option<()>; None means the stream was dropped,
+            // which cannot happen here.  Either way we return so the select!
+            // arm fires and the graceful shutdown path runs.
+            stream.recv().await;
+        }
+        Err(e) => {
+            log::warn!(
+                "Could not register SIGTERM handler: {e}. \
+                 Send Ctrl-C or use --signal-file to stop the process."
+            );
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// On non-Unix platforms, pend forever so the `select!` arm is always
+/// present in the source but never fires.
+///
+/// See the module-level comment above for the cross-platform design rationale.
+#[cfg(not(unix))]
+async fn next_sigterm() {
+    std::future::pending::<()>().await
+}
+
 async fn event_loop(
     key_rx: Option<mpsc::UnboundedReceiver<events::KeyEvent>>,
     config: &Arc<Config>,
@@ -287,6 +353,25 @@ async fn event_loop(
     //        Pinned so it can be polled repeatedly inside select! without moving.
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+
+    // SIGTERM handling — cross-platform design note
+    // ─────────────────────────────────────────────
+    // `tokio::select!` is a declarative macro that expands its arms textually;
+    // it does not honour `#[cfg(...)]` attributes placed on individual arms.
+    // Putting `#[cfg(unix)] _ = sigterm.recv() => { … }` inside the macro
+    // causes a parse error ("no rules expected `}`") on every platform.
+    //
+    // Solution: a platform-unified helper function `next_sigterm()` with
+    // identical call-site syntax on all targets:
+    //   • Unix     — awaits the next SIGTERM delivery from the OS.
+    //   • non-Unix — awaits `std::future::pending()` (never resolves).
+    // Both branches return `()` so `select!` sees one unconditional arm.
+    //
+    // The future is pinned here, outside the loop, so the Unix `Signal` handle
+    // (and its internal OS registration) is created exactly once and reused
+    // across every `select!` iteration — same pattern as `ctrl_c` above.
+    let sigterm = next_sigterm();
+    tokio::pin!(sigterm);
 
     loop {
         // Build a future that yields the next key, or pends forever once the
@@ -324,6 +409,16 @@ async fn event_loop(
                 if let Err(e) = result {
                     log::warn!("Ctrl-C signal error: {e}");
                 }
+                break;
+            }
+            // Graceful shutdown on SIGTERM.
+            // On Unix this arm fires when the OS delivers SIGTERM, covering
+            // `systemctl stop`, `docker stop`, launchd unload, and any process
+            // supervisor that sends SIGTERM before SIGKILL.
+            // On non-Unix platforms `next_sigterm()` pends forever, so this
+            // arm is syntactically present but never selected.
+            () = &mut sigterm => {
+                log::info!("SIGTERM received — shutting down gracefully.");
                 break;
             }
         }

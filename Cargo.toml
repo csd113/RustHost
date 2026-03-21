@@ -66,6 +66,15 @@ chrono       = { version = "0.4", features = ["clock"] }
 # OS error codes used in the accept-loop backoff to distinguish EMFILE/ENFILE
 # (resource exhaustion → log error) from transient errors (log debug).
 libc         = "0.2"
+# Vendor OpenSSL source so the binary builds without system libssl-dev headers
+# on Linux.  native-tls (pulled transitively through arti-client → tor-rtcompat)
+# links against OpenSSL on Linux; without this feature flag the build fails on
+# any machine that lacks the -dev package.  macOS and Windows are unaffected
+# (they use Security.framework and SChannel respectively), but the `vendored`
+# feature is a no-op on those targets so there is no downside to enabling it
+# unconditionally.  Build-time cost is ~60 s on first compile; subsequent
+# incremental builds are fast because the OpenSSL objects are cached.
+openssl      = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
 tempfile = "3"

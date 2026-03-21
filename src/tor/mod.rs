@@ -16,10 +16,13 @@
 //!
 //! ## Flow
 //!
-//! 1. `init()` spawns a Tokio task (non-blocking, same public API as before).
+//! 1. `init()` spawns a Tokio task and returns its `JoinHandle`.
+//!    The handle is awaited by lifecycle during graceful shutdown so active
+//!    Tor circuits get a chance to close cleanly (fix 3.1).
 //! 2. `TorClient::create_bootstrapped()` connects to the Tor network.
-//!    First run downloads ~2 MB of directory consensus (~30 s).  Subsequent
-//!    runs reuse the cache in `rusthost-data/arti_cache/` and are fast.
+//!    A 120-second timeout prevents an indefinite hang on firewalled networks
+//!    (fix 3.3).  First run downloads ~2 MB of directory consensus (~30 s).
+//!    Subsequent runs reuse the cache in `rusthost-data/arti_cache/` and are fast.
 //! 3. `tor_client.launch_onion_service()` registers the hidden service.
 //!    The address is derived from the keypair and is available immediately.
 //!    The keypair is persisted in `rusthost-data/arti_state/keys/` so the
@@ -29,41 +32,144 @@
 //!    arriving on `HiddenServicePort 80 127.0.0.1:{port}`).
 //! 5. Each `StreamRequest` is accepted and bridged to the local HTTP server
 //!    with `tokio::io::copy_bidirectional` in its own Tokio task.
-//! 6. `kill()` is a no-op — the `TorClient` is dropped when the task exits
+//!    Both the local connect and the bidirectional copy carry timeouts to
+//!    bound the lifetime of stalled connections (fix 3.1, fix 3.2).
+//! 6. When the `stream_requests` stream ends unexpectedly (transient network
+//!    disruption, Arti circuit reset) the module re-bootstraps with
+//!    exponential backoff up to `MAX_RETRIES` times before giving up
+//!    (fix 3.4).
+//! 7. `kill()` is a no-op — the `TorClient` is dropped when the task exits
 //!    during normal Tokio runtime shutdown, which closes all circuits cleanly.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::TorClient;
 use futures::StreamExt;
-use tokio::{net::TcpStream, sync::watch};
+use tokio::{net::TcpStream, sync::watch, task::JoinHandle};
 use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{config::OnionServiceConfigBuilder, handle_rend_requests, HsId, StreamRequest};
 
 use crate::runtime::state::{SharedState, TorStatus};
 
-// ─── Public entry point ──────────────────────────────────────────────────────
+// ─── Timeout / retry constants ────────────────────────────────────────────────
+
+/// How long to wait for Arti to complete the initial directory bootstrap.
+/// Covers first-run consensus download plus circuit establishment.
+const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long to wait for the local HTTP server to accept a proxied connection.
+/// A hung local server should not hold a semaphore permit indefinitely.
+const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum wall-clock lifetime of a single proxied Tor stream.
+/// Prevents stalled or adversarially slow clients from exhausting the
+/// semaphore by holding permits open with no forward data progress.
+const STREAM_MAX_LIFETIME: Duration = Duration::from_secs(300);
+
+/// Base delay between re-bootstrap attempts (multiplied by attempt count).
+const RETRY_BASE_SECS: u64 = 30;
+
+/// Maximum number of automatic re-bootstrap attempts after an unexpected
+/// stream-end before the module sets `TorStatus::Failed` permanently.
+const MAX_RETRIES: u32 = 5;
+
+// ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Initialise Tor using the embedded Arti client.
 ///
-/// Spawns a Tokio task and returns immediately.  Tor status and the onion
-/// address are written into `state` as things progress, exactly as before.
+/// Spawns a Tokio task and returns its [`JoinHandle`].  The caller **must**
+/// await the handle (with a timeout) during graceful shutdown so active Tor
+/// circuits can close cleanly before the runtime exits (fix 3.1).
 ///
-/// `shutdown` is a watch channel whose `true` value triggers a clean exit
-/// from the stream-request loop (fix 2.10).
+/// Tor status and the onion address are written into `state` as things
+/// progress.  `shutdown` is a watch channel whose `true` value triggers a
+/// clean exit from the stream-request loop.
+///
+/// `bind_addr` must match `config.server.bind` so the local proxy connect
+/// uses the correct loopback address even when the server is bound to `::1`
+/// rather than `127.0.0.1` (fix 3.6).
 pub fn init(
     data_dir: PathBuf,
     bind_port: u16,
+    bind_addr: IpAddr,
     state: SharedState,
     shutdown: watch::Receiver<bool>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run(data_dir, bind_port, state.clone(), shutdown).await {
-            log::error!("Tor: fatal error: {e}");
-            set_status(&state, TorStatus::Failed(e.to_string())).await;
+        let mut attempts = 0u32;
+
+        loop {
+            // `run()` returns:
+            //   Ok(true)  — stream ended unexpectedly; caller should retry
+            //   Ok(false) — clean shutdown signal received; caller should exit
+            //   Err(e)    — fatal, unrecoverable error
+            match run(
+                data_dir.clone(),
+                bind_port,
+                bind_addr,
+                state.clone(),
+                shutdown.clone(),
+            )
+            .await
+            {
+                Ok(false) => {
+                    // Shutdown signal — exit cleanly without touching status.
+                    log::info!("Tor: task exiting cleanly.");
+                    break;
+                }
+                Ok(true) => {
+                    // Stream ended unexpectedly (transient network disruption).
+                    // Use saturating_add to satisfy clippy::integer_arithmetic —
+                    // in practice attempts never exceeds MAX_RETRIES (a small u32).
+                    attempts = attempts.saturating_add(1);
+                    if attempts > MAX_RETRIES {
+                        log::error!(
+                            "Tor: stream ended {MAX_RETRIES} consecutive times; giving up."
+                        );
+                        set_status(
+                            &state,
+                            TorStatus::Failed("too many reconnect attempts".into()),
+                        )
+                        .await;
+                        break;
+                    }
+
+                    let delay =
+                        Duration::from_secs(RETRY_BASE_SECS.saturating_mul(u64::from(attempts)));
+                    log::warn!(
+                        "Tor: stream ended; re-bootstrapping in {delay:?} \
+                         (attempt {attempts}/{MAX_RETRIES})"
+                    );
+
+                    // Clear the displayed address while reconnecting.
+                    state.write().await.onion_address = None;
+                    set_status(&state, TorStatus::Starting).await;
+
+                    // Honour shutdown signals that arrive during the backoff sleep.
+                    // The cloned receiver must be bound to a local variable so it
+                    // lives for the full duration of the select! borrow (E0716).
+                    let mut backoff_shutdown = shutdown.clone();
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        _ = backoff_shutdown.changed() => {
+                            if *backoff_shutdown.borrow() {
+                                log::info!("Tor: shutdown during backoff — exiting.");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::error!("Tor: fatal error: {e}");
+                    set_status(&state, TorStatus::Failed(e.to_string())).await;
+                    break;
+                }
+            }
         }
-    });
+    })
 }
 
 // `kill()` has been removed (fix 2.10): the `TorClient` is owned by the task
@@ -73,12 +179,19 @@ pub fn init(
 
 // ─── Core async logic ─────────────────────────────────────────────────────────
 
+/// Run the full Tor lifecycle (bootstrap → launch service → proxy streams).
+///
+/// Returns:
+/// - `Ok(false)` — shutdown signal received; caller should exit.
+/// - `Ok(true)`  — stream ended unexpectedly; caller should retry.
+/// - `Err(e)`    — unrecoverable error; caller should set `Failed` and exit.
 async fn run(
     data_dir: PathBuf,
     bind_port: u16,
+    bind_addr: IpAddr,
     state: SharedState,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     set_status(&state, TorStatus::Starting).await;
 
     // ── 1. Build TorClientConfig ──────────────────────────────────────────
@@ -99,12 +212,19 @@ async fn run(
 
     // ── 2. Bootstrap ──────────────────────────────────────────────────────
     //
-    // Async-blocks until Tor has fetched enough directory info to open
-    // circuits safely.  Subsequent runs reuse the cached consensus and
-    // finish in a few seconds.
-    let tor_client = TorClient::create_bootstrapped(config)
-        .await
-        .map_err(|e| format!("Tor bootstrap failed: {e}"))?;
+    // fix 3.3 — wrap in a timeout so a firewalled network (where Tor traffic
+    // is silently dropped) does not cause the task to stall indefinitely with
+    // TorStatus::Starting showing in the dashboard.
+    let tor_client =
+        tokio::time::timeout(BOOTSTRAP_TIMEOUT, TorClient::create_bootstrapped(config))
+            .await
+            .map_err(|_| {
+                format!(
+                    "Tor bootstrap timed out after {}s — check network connectivity",
+                    BOOTSTRAP_TIMEOUT.as_secs()
+                )
+            })?
+            .map_err(|e| format!("Tor bootstrap failed: {e}"))?;
 
     log::info!("Tor: connected to the Tor network");
 
@@ -162,18 +282,29 @@ async fn run(
     // each other.  Dropping the task naturally closes the Tor circuit.
     let mut stream_requests = handle_rend_requests(rend_requests);
 
+    // fix 3.2 — the semaphore bounds active concurrent proxied streams.
+    // If `acquire_owned` ever returns Err it means `semaphore` was explicitly
+    // closed, which we now do when exiting via the shutdown arm so the
+    // acquire branch is always reachable (fix 3.5).
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(256));
 
-    // 2.10 — use select! so a shutdown signal can break the accept loop cleanly,
-    // instead of blocking indefinitely in stream_requests.next().
+    // 2.10 — use select! so a shutdown signal can break the accept loop
+    // cleanly, instead of blocking indefinitely in stream_requests.next().
     loop {
         tokio::select! {
             next = stream_requests.next() => {
                 if let Some(stream_req) = next {
-                    let local_addr = format!("127.0.0.1:{bind_port}");
-                    let Ok(permit) = std::sync::Arc::clone(&semaphore).acquire_owned().await else {
-                        break; // semaphore closed
-                    };
+                    // fix 3.6 — derive local address from the actual bind address,
+                    // not a hardcoded "127.0.0.1", so IPv6 bind configs work.
+                    let local_addr = format!("{bind_addr}:{bind_port}");
+
+                    // fix 3.5 — propagate semaphore errors rather than silently
+                    // breaking; `acquire_owned` only fails if closed explicitly.
+                    let permit = std::sync::Arc::clone(&semaphore)
+                        .acquire_owned()
+                        .await
+                        .map_err(|e| format!("semaphore closed unexpectedly: {e}"))?;
+
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Err(e) = proxy_stream(stream_req, &local_addr).await {
@@ -184,20 +315,21 @@ async fn run(
                 } else {
                     // The onion service stream ended unexpectedly (Tor network
                     // disruption, Arti internal error, resource exhaustion).
-                    // Flip the dashboard to Failed so the operator sees a clear
-                    // signal rather than a permanently green READY badge.
+                    // Return Ok(true) so init()'s retry loop can re-bootstrap
+                    // instead of dying permanently (fix 3.4).
                     log::warn!(
-                        "Tor: stream_requests stream ended — onion service is no longer active"
+                        "Tor: stream_requests stream ended — will attempt re-bootstrap"
                     );
-                    // 2.9 — use Failed(String) with a human-readable reason
-                    set_status(&state, TorStatus::Failed("stream ended".into())).await;
                     state.write().await.onion_address = None;
-                    return Ok(());
+                    return Ok(true); // signal: retry
                 }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     log::info!("Tor: shutdown signal received — stopping stream loop");
+                    // fix 3.5 — close the semaphore so any in-progress
+                    // acquire_owned() call in the `next` arm returns immediately.
+                    semaphore.close();
                     break;
                 }
             }
@@ -206,7 +338,7 @@ async fn run(
 
     // Clean shutdown: clear the displayed onion address.
     state.write().await.onion_address = None;
-    Ok(())
+    Ok(false) // signal: do not retry
 }
 
 // ─── Stream proxying ─────────────────────────────────────────────────────────
@@ -224,13 +356,46 @@ async fn run(
 /// `DataStream` implements `tokio::io::AsyncRead + AsyncWrite` when the
 /// `tokio` feature is enabled on `arti-client`, so `copy_bidirectional`
 /// works with no adapter needed.
+///
+/// fix 3.1 — both the local connect and the bidirectional copy are wrapped in
+/// timeouts to prevent stalled connections from holding semaphore permits
+/// indefinitely and exhausting the connection pool.
 async fn proxy_stream(
     stream_req: StreamRequest,
     local_addr: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tor_stream = stream_req.accept(Connected::new_empty()).await?;
-    let mut local = TcpStream::connect(local_addr).await?;
-    tokio::io::copy_bidirectional(&mut tor_stream, &mut local).await?;
+
+    // fix 3.1a — bound the time spent waiting for the local server to accept.
+    // If the HTTP server is wedged or still starting, we release the permit
+    // quickly rather than holding it until the OS TCP timeout fires.
+    let mut local = tokio::time::timeout(LOCAL_CONNECT_TIMEOUT, TcpStream::connect(local_addr))
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out connecting to local server at {local_addr} \
+                 after {}s",
+                LOCAL_CONNECT_TIMEOUT.as_secs()
+            )
+        })?
+        .map_err(|e| format!("local connect to {local_addr} failed: {e}"))?;
+
+    // fix 3.2 — cap the total wall-clock lifetime of a proxied stream.
+    // A slow or adversarially idle client cannot hold a permit forever; after
+    // STREAM_MAX_LIFETIME the connection is closed from our side.
+    tokio::time::timeout(
+        STREAM_MAX_LIFETIME,
+        tokio::io::copy_bidirectional(&mut tor_stream, &mut local),
+    )
+    .await
+    .map_err(|_| {
+        format!(
+            "stream lifetime exceeded {}s — closing",
+            STREAM_MAX_LIFETIME.as_secs()
+        )
+    })? // timeout → Err
+    .map_err(|e| format!("bidirectional copy failed: {e}"))?; // io::Error → Err
+
     Ok(())
 }
 
@@ -274,12 +439,17 @@ pub(crate) fn onion_address_from_pubkey(pubkey: &[u8; 32]) -> String {
     // ADDRESS_BYTES = PUBKEY (32) || CHECKSUM (2) || VERSION (1) = 35 bytes
     let mut address_bytes = [0u8; 35];
     address_bytes[..32].copy_from_slice(pubkey);
-    // Consume the first two checksum bytes via an iterator — clippy cannot
-    // prove at compile time that a GenericArray has >= 2 elements, so direct
-    // indexing triggers `indexing_slicing`.  SHA3-256 always produces 32 bytes.
-    let mut hash_iter = hash.iter().copied();
-    address_bytes[32] = hash_iter.next().unwrap_or(0);
-    address_bytes[33] = hash_iter.next().unwrap_or(0);
+
+    // fix 3.8 — index hash directly rather than via a fallible iterator.
+    // SHA3-256 always produces exactly 32 bytes; the GenericArray is
+    // guaranteed to have indices 0 and 1.  The `indexing_slicing` lint
+    // fires here because clippy cannot prove the length at compile time for
+    // GenericArray, so we suppress it with a targeted allow.
+    #[allow(clippy::indexing_slicing)]
+    {
+        address_bytes[32] = hash[0];
+        address_bytes[33] = hash[1];
+    }
     address_bytes[34] = version;
 
     // RFC 4648 base32, no padding, lowercase → 56 characters
@@ -327,11 +497,12 @@ mod tests {
 
         let mut bytes = [0u8; 35];
         bytes[..32].copy_from_slice(pubkey);
-        // Use iterator instead of direct indexing to avoid clippy::indexing_slicing.
-        // SHA3-256 always produces 32 bytes, so next() will never return None.
-        let mut it = hash.iter().copied();
-        bytes[32] = it.next().unwrap_or(0);
-        bytes[33] = it.next().unwrap_or(0);
+        // SHA3-256 always produces 32 bytes; direct indexing is safe.
+        #[allow(clippy::indexing_slicing)]
+        {
+            bytes[32] = hash[0];
+            bytes[33] = hash[1];
+        }
         bytes[34] = version;
 
         format!("{}.onion", BASE32_NOPAD.encode(&bytes).to_ascii_lowercase())

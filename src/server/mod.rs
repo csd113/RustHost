@@ -231,21 +231,31 @@ fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpLis
     })
 }
 
-/// Return `true` when `e` represents file-descriptor exhaustion (`EMFILE` or
-/// `ENFILE`) on Unix platforms.
+/// Return `true` when `e` represents file-descriptor exhaustion.
 ///
-/// On non-Unix targets (Windows) where these error codes have no equivalent,
-/// always returns `false`.
+/// On Unix this matches `EMFILE` (24, per-process FD limit) and `ENFILE`
+/// (23, system-wide FD limit), both specified by POSIX and identical on
+/// Linux, macOS, FreeBSD, and other POSIX-conformant systems.
+///
+/// On Windows this matches `WSAEMFILE` (10024), the Winsock equivalent of
+/// `EMFILE` — it fires when the per-process socket descriptor table is full.
+///
+/// On all other targets the function always returns `false`.
 fn is_fd_exhaustion(e: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
         // EMFILE (24): too many open files for the process.
         // ENFILE (23): too many open files system-wide.
-        // Both values are specified by POSIX and identical on Linux, macOS,
-        // FreeBSD, and other POSIX-conformant systems.
         matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // WSAEMFILE (10024): per-process socket handle limit reached.
+        // This is the Windows Sockets equivalent of POSIX EMFILE and fires
+        // when the process has exhausted its socket descriptor table.
+        matches!(e.raw_os_error(), Some(10_024))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = e;
         false

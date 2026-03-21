@@ -35,7 +35,15 @@ fn validate(cfg: &Config) -> Result<()> {
     // level: LogLevel  — invalid levels are already rejected by serde at parse time (4.2).
 
     // [site]
-    if cfg.site.index_file.contains(std::path::MAIN_SEPARATOR) {
+    // `index_file` must be a bare filename, not a path.
+    // Use Path::components() rather than checking for MAIN_SEPARATOR:
+    // on Windows both `/` and `\` are valid separators, so a string-contains
+    // check on `\` alone misses "sub/index.html" written with forward slashes.
+    if std::path::Path::new(&cfg.site.index_file)
+        .components()
+        .count()
+        > 1
+    {
         errors.push("[site] index_file must be a filename only, not a path".into());
     }
     {
@@ -49,7 +57,16 @@ fn validate(cfg: &Config) -> Result<()> {
         {
             errors.push("[site] directory must not contain '..' components".into());
         }
-        if cfg.site.directory.contains(std::path::MAIN_SEPARATOR) {
+        // Count only Normal components so this check is independent from the
+        // is_absolute() guard above (a RootDir component would double-trigger).
+        // As with index_file, Path::components() handles both `/` and `\` on
+        // Windows, making the check correct on all platforms.
+        if dir_path
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .count()
+            > 1
+        {
             errors.push("[site] directory must be a directory name only, not a path".into());
         }
     }
