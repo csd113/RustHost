@@ -27,6 +27,19 @@ auto_port_fallback = true
 # Open the system default browser at http://localhost:<port> on startup.
 open_browser_on_start = false
 
+# Maximum number of concurrent HTTP connections. Excess connections queue
+# at the OS TCP backlog level rather than spawning unbounded tasks.
+max_connections = 256
+
+# Content-Security-Policy value sent with every HTML response.
+# The default allows same-origin resources plus inline scripts and styles,
+# which is required for onclick handlers, <style> blocks, and style= attributes.
+# Tighten if your site uses no inline code:
+#   content_security_policy = "default-src 'self'"
+# Relax further for third-party CDN resources:
+#   content_security_policy = "default-src 'self' cdn.example.com; script-src 'self' 'unsafe-inline'"
+content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+
 # ─── [site] ───────────────────────────────────────────────────────────────────
 
 [site]
@@ -39,9 +52,6 @@ index_file = "index.html"
 
 # Return an HTML file listing for directory requests instead of index_file.
 enable_directory_listing = false
-
-# Watch the site directory for changes and update console stats automatically.
-auto_reload = false
 
 # ─── [tor] ────────────────────────────────────────────────────────────────────
 
@@ -73,6 +83,12 @@ level = "info"
 # Log file path relative to ./rusthost-data/.
 file = "logs/rusthost.log"
 
+# When true (default), suppress Info/Debug/Trace records from third-party
+# crates (Arti, Tokio, TLS internals) so the log file stays focused on
+# application events. Warnings and errors from all crates are always shown.
+# Set false to see full dependency tracing (useful for debugging Tor issues).
+filter_dependencies = true
+
 # ─── [console] ────────────────────────────────────────────────────────────────
 
 [console]
@@ -95,6 +111,13 @@ show_timestamps = false
 instance_name = "RustHost"
 "#;
 
+/// Write the default `settings.toml` to `path`, creating parent directories
+/// as needed.
+///
+/// # Errors
+///
+/// Returns [`crate::AppError::Io`] if the parent directory cannot be created
+/// or the file cannot be written.
 pub fn write_default_config(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

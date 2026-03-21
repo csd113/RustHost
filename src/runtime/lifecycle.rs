@@ -7,10 +7,20 @@
 //!    instructions, and exits cleanly.
 //! 2. **Normal run** — loads config, starts every subsystem, enters the
 //!    event dispatch loop, then shuts down gracefully.
+//!
+//! ## CLI override support (5.5)
+//!
+//! [`CliArgs`] carries optional path overrides from `--config` and `--data-dir`.
+//! When absent the original defaults (relative to `current_exe()`) are used,
+//! preserving backward compatibility for zero-argument invocations.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::{
     config::{self, Config},
@@ -19,49 +29,69 @@ use crate::{
         events,
         state::{AppState, Metrics, SharedMetrics, SharedState, TorStatus},
     },
-    server, tor, Result,
+    server, tor, AppError, Result,
 };
 
-// ─── Paths ──────────────────────────────────────────────────────────────────
+// ─── Public types ─────────────────────────────────────────────────────────────
 
-fn data_dir() -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    exe.parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("rusthost-data")
+/// CLI-supplied path overrides.  Both fields default to `None`, which causes
+/// [`run`] to fall back to the standard paths relative to `current_exe()`.
+#[derive(Debug, Default)]
+pub struct CliArgs {
+    /// Explicit path to `settings.toml`; overrides the default derived from
+    /// `data_dir`.
+    pub config_path: Option<PathBuf>,
+    /// Explicit data-directory root; overrides `<exe-dir>/rusthost-data/`.
+    pub data_dir: Option<PathBuf>,
 }
 
-fn settings_path() -> PathBuf {
-    data_dir().join("settings.toml")
-}
+// ─── Entry point ─────────────────────────────────────────────────────────────
 
-// ─── Entry point ────────────────────────────────────────────────────────────
+/// Entry point for the `rusthost-cli` binary.
+///
+/// Computes the data-directory and settings path (honouring any overrides in
+/// `args`), then either performs first-run setup or starts the full server.
+///
+/// # Errors
+///
+/// Returns an [`AppError`] if the config cannot be loaded, logging cannot be
+/// initialised, or any other fatal startup condition occurs.
+/// Path overrides are supplied via [`CliArgs`].
+pub async fn run(args: CliArgs) -> Result<()> {
+    // 4.4 + 5.5 — data_dir is computed exactly once and threaded everywhere.
+    // A CLI override takes precedence; the default is relative to current_exe().
+    let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
 
-pub async fn run() -> Result<()> {
-    if is_first_run() {
-        first_run_setup()?;
+    let settings_path = args
+        .config_path
+        .unwrap_or_else(|| data_dir.join("settings.toml"));
+
+    if settings_path.exists() {
+        normal_run(data_dir, &settings_path).await?;
     } else {
-        normal_run().await?;
+        first_run_setup(&data_dir, &settings_path)?;
     }
     Ok(())
 }
 
-// ─── First Run ──────────────────────────────────────────────────────────────
-
-fn is_first_run() -> bool {
-    !settings_path().exists()
+/// Compute the default data directory (`<exe-dir>/rusthost-data/`).
+fn default_data_dir() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    exe.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("rusthost-data")
 }
 
-fn first_run_setup() -> Result<()> {
-    let base = data_dir();
+// ─── First Run ───────────────────────────────────────────────────────────────
 
+fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
     for sub in &["site", "logs"] {
-        std::fs::create_dir_all(base.join(sub))?;
+        std::fs::create_dir_all(data_dir.join(sub))?;
     }
 
-    config::defaults::write_default_config(&settings_path())?;
+    config::defaults::write_default_config(settings_path)?;
 
-    let placeholder = base.join("site/index.html");
+    let placeholder = data_dir.join("site/index.html");
     if !placeholder.exists() {
         std::fs::write(&placeholder, PLACEHOLDER_HTML)?;
     }
@@ -80,17 +110,19 @@ fn first_run_setup() -> Result<()> {
     Ok(())
 }
 
-// ─── Normal Run ─────────────────────────────────────────────────────────────
+// ─── Normal Run ──────────────────────────────────────────────────────────────
 
-async fn normal_run() -> Result<()> {
+async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
     // 1. Load and validate config.
-    let config = Arc::new(config::loader::load(&settings_path())?);
+    let config = Arc::new(config::loader::load(settings_path)?);
 
     // 2. Initialise logging.
-    logging::init(&config.logging, &data_dir())?;
+    logging::init(&config.logging, &data_dir)?;
     log::info!("RustHost starting — version {}", env!("CARGO_PKG_VERSION"));
 
-    if config.server.bind == "0.0.0.0" {
+    // 4.2 — config.server.bind is now IpAddr; use is_unspecified() instead of
+    //        string comparison.
+    if config.server.bind.is_unspecified() {
         log::warn!("[server] bind = \"0.0.0.0\" — server is reachable on all interfaces.");
     }
 
@@ -105,9 +137,22 @@ async fn normal_run() -> Result<()> {
     }
 
     // 5. Scan site directory for initial file stats.
+    // 2.2 — wrap in spawn_blocking; scan_site now returns Result.
     {
-        let site_root = data_dir().join(&config.site.directory);
-        let (count, bytes) = server::scan_site(&site_root);
+        let site_root = data_dir.join(&config.site.directory);
+        let scan_root = site_root.clone();
+        let (count, bytes) =
+            match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    log::warn!("Could not scan site directory on startup: {e}");
+                    (0, 0)
+                }
+                Err(e) => {
+                    log::warn!("Site scan task panicked on startup: {e}");
+                    (0, 0)
+                }
+            };
         let mut s = state.write().await;
         s.site_file_count = count;
         s.site_total_bytes = bytes;
@@ -116,68 +161,94 @@ async fn normal_run() -> Result<()> {
     // 6. Shutdown channels.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // 7. Ctrl-C handler.
-    let (ctrlc_tx, mut ctrlc_rx) = mpsc::channel::<()>(1);
-    ctrlc::set_handler(move || {
-        let _ = ctrlc_tx.try_send(());
-    })?;
+    // 7. Start HTTP server task.
+    let (port_tx, port_rx) = oneshot::channel::<u16>();
+    // 2.10 — keep the JoinHandle so we can await the server during shutdown drain.
+    let server_handle = spawn_server(
+        &config,
+        &state,
+        &metrics,
+        &shutdown_rx,
+        port_tx,
+        data_dir.clone(),
+    );
 
-    // 8. Start HTTP server task.
-    spawn_server(&config, &state, &metrics, &shutdown_rx);
+    // Wait for the server to signal its bound port via the oneshot channel.
+    // A 10-second timeout ensures a bind failure doesn't block forever.
+    let bind_port = match tokio::time::timeout(Duration::from_secs(10), port_rx).await {
+        Ok(Ok(port)) => port,
+        Ok(Err(_)) => {
+            log::error!("Server port channel closed before sending — server failed to bind");
+            return Err(AppError::ServerStartup(
+                "Server task exited before signalling its bound port".into(),
+            ));
+        }
+        Err(_) => {
+            log::error!("Timed out waiting for server to bind");
+            return Err(AppError::ServerStartup(
+                "Timed out waiting for server to bind (10 s)".into(),
+            ));
+        }
+    };
 
-    // Wait for the server to bind so actual_port is populated before we pass
-    // it to Tor. 50 ms is enough for localhost; the auto-fallback logic inside
-    // server::run handles the real timing.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // 9. Start Tor (if enabled).
-    //    tor::init() spawns a Tokio task and returns immediately — never blocks
-    //    the async executor.
+    // 8. Start Tor (if enabled).
+    //    tor::init() spawns a Tokio task and returns immediately.
+    //    2.10 — pass shutdown_rx so Tor's stream loop exits on clean shutdown.
     if config.tor.enabled {
-        let bind_port = state.read().await.actual_port;
-        tor::init(data_dir(), bind_port, Arc::clone(&state));
+        tor::init(
+            data_dir.clone(),
+            bind_port,
+            Arc::clone(&state),
+            shutdown_rx.clone(),
+        );
     }
 
-    // 10. Start console UI.
+    // 9. Start console UI.
     let key_rx = start_console(&config, &state, &metrics, shutdown_rx.clone()).await?;
 
-    // 11. Open browser (if configured).
+    // 10. Open browser (if configured).
     if config.server.open_browser_on_start {
         let port = state.read().await.actual_port;
-        open_browser(&format!("http://localhost:{port}"));
+        // 2.4 — use canonical open_browser from crate::runtime
+        super::open_browser(&format!("http://localhost:{port}"));
     }
 
-    // 12. Event dispatch loop.
-    event_loop(key_rx, &config, &state, &metrics, &mut ctrlc_rx).await?;
+    // 11. Event dispatch loop.
+    event_loop(key_rx, &config, &state, &metrics, data_dir).await?;
 
-    // 13. Graceful shutdown.
+    // 12. Graceful shutdown.
     log::info!("Shutting down…");
     let _ = shutdown_tx.send(true);
-    // Drop the Arti TorClient — closes all Tor circuits cleanly.
-    tor::kill();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 2.10 — wait for the HTTP server to drain in-flight connections (max 5 s).
+    let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
+
+    log::info!("RustHost shut down cleanly.");
+    logging::flush();
     console::cleanup();
-    log::info!("Goodbye.");
 
     Ok(())
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Spawn the HTTP server task and return its `JoinHandle` so the shutdown
+/// sequence can await the connection drain (fix 2.10).
 fn spawn_server(
     config: &Arc<Config>,
     state: &SharedState,
     metrics: &SharedMetrics,
     shutdown: &watch::Receiver<bool>,
-) {
+    port_tx: oneshot::Sender<u16>,
+    data_dir: PathBuf,
+) -> tokio::task::JoinHandle<()> {
     let cfg = Arc::clone(config);
     let st = Arc::clone(state);
     let met = Arc::clone(metrics);
-    let data = data_dir();
     let shut = shutdown.clone();
     tokio::spawn(async move {
-        server::run(cfg, st, met, data, shut).await;
-    });
+        server::run(cfg, st, met, data_dir, shut, port_tx).await;
+    })
 }
 
 async fn start_console(
@@ -196,6 +267,7 @@ async fn start_console(
         Ok(Some(rx))
     } else {
         let port = state.read().await.actual_port;
+        // 4.2 — config.server.bind is IpAddr, Display impl formats correctly.
         println!("RustHost running on http://{}:{port}", config.server.bind);
         Ok(None)
     }
@@ -206,42 +278,60 @@ async fn event_loop(
     config: &Arc<Config>,
     state: &SharedState,
     metrics: &SharedMetrics,
-    ctrlc_rx: &mut mpsc::Receiver<()>,
+    data_dir: PathBuf,
 ) -> Result<()> {
+    // 2.8 — mutable so we can set to None when the channel closes.
     let mut key_rx = key_rx;
+
+    // 4.7 — tokio::signal::ctrl_c() replaces ctrlc crate's set_handler + mpsc.
+    //        Pinned so it can be polled repeatedly inside select! without moving.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
     loop {
-        tokio::select! {
-            Some(key) = async {
-                match key_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None     => None,
-                }
-            } => {
-                let quit = events::handle(
-                    key,
-                    config,
-                    Arc::clone(state),
-                    Arc::clone(metrics),
-                    data_dir(),
-                ).await?;
-                if quit { break; }
+        // Build a future that yields the next key, or pends forever once the
+        // channel closes (avoids repeated None-match after input task death).
+        let key_fut = async {
+            if let Some(rx) = key_rx.as_mut() {
+                rx.recv().await
+            } else {
+                std::future::pending().await
             }
-            Some(()) = ctrlc_rx.recv() => { break; }
+        };
+
+        tokio::select! {
+            maybe_key = key_fut => {
+                if let Some(key) = maybe_key {
+                    let quit = events::handle(
+                        key,
+                        config,
+                        Arc::clone(state),
+                        Arc::clone(metrics),
+                        data_dir.clone(),
+                    ).await?;
+                    if quit { break; }
+                } else {
+                    // 2.8 — input task exited; disable key arm and warn operator.
+                    log::warn!(
+                        "Console input task exited — keyboard input disabled. \
+                         Use Ctrl-C to quit."
+                    );
+                    key_rx = None;
+                }
+            }
+            // 4.7 — Ctrl-C handled directly through Tokio's signal machinery.
+            result = &mut ctrl_c => {
+                if let Err(e) = result {
+                    log::warn!("Ctrl-C signal error: {e}");
+                }
+                break;
+            }
         }
     }
     Ok(())
 }
 
-fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer").arg(url).spawn();
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-}
-
-// ─── Placeholder HTML ─────────────────────────────────────────────────────────
+// ─── Placeholder HTML ────────────────────────────────────────────────────────
 
 const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">

@@ -37,7 +37,7 @@ use crate::{
         events::KeyEvent,
         state::{ConsoleMode, SharedMetrics, SharedState},
     },
-    Result,
+    AppError, Result,
 };
 
 // ─── Global raw-mode flag ────────────────────────────────────────────────────
@@ -54,37 +54,47 @@ static RAW_MODE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// reads from this channel to dispatch events.
 ///
 /// Note: not `async` — all awaits live inside the spawned tasks.
+///
+/// # Errors
+///
+/// Returns [`AppError::Console`] if the terminal cannot be put into raw mode
+/// or the alternate screen cannot be entered.
 pub fn start(
     config: Arc<Config>,
     state: SharedState,
     metrics: SharedMetrics,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<KeyEvent>> {
-    terminal::enable_raw_mode()?;
-    execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
+    // 4.1 — map crossterm io errors to AppError::Console.
+    terminal::enable_raw_mode()
+        .map_err(|e| AppError::Console(format!("Failed to enable raw mode: {e}")))?;
+    execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide)
+        .map_err(|e| AppError::Console(format!("Failed to enter alternate screen: {e}")))?;
     RAW_MODE_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
 
     execute!(
         stdout(),
         terminal::Clear(terminal::ClearType::All),
         cursor::MoveTo(0, 0)
-    )?;
+    )
+    .map_err(|e| AppError::Console(format!("Failed to clear screen: {e}")))?;
 
-    // ── Key event channel ────────────────────────────────────────────────────
+    // ── Key event channel ─────────────────────────────────────────────────────
     let (key_tx, key_rx) = tokio::sync::mpsc::unbounded_channel::<KeyEvent>();
 
-    // ── Input task (blocking thread) ─────────────────────────────────────────
+    // ── Input task (blocking thread) ──────────────────────────────────────────
     input::spawn(key_tx, shutdown.clone());
 
-    // ── Render task ──────────────────────────────────────────────────────────
+    // ── Render task ───────────────────────────────────────────────────────────
     let rate = config.console.refresh_rate_ms;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(rate));
+        let mut last_rendered = String::new(); // 3.3 — change-detection state
 
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(e) = render(&config, &state, &metrics).await {
+                    if let Err(e) = render(&config, &state, &metrics, &mut last_rendered).await {
                         log::debug!("Render error: {e}");
                     }
                 }
@@ -98,9 +108,14 @@ pub fn start(
     Ok(key_rx)
 }
 
-// ─── Render ──────────────────────────────────────────────────────────────────
+// ─── Render ───────────────────────────────────────────────────────────────────
 
-async fn render(config: &Config, state: &SharedState, metrics: &SharedMetrics) -> Result<()> {
+async fn render(
+    config: &Config,
+    state: &SharedState,
+    metrics: &SharedMetrics,
+    last_rendered: &mut String, // 3.3 — previous frame for change-detection
+) -> Result<()> {
     let mode = state.read().await.console_mode.clone();
 
     let output = match mode {
@@ -113,19 +128,30 @@ async fn render(config: &Config, state: &SharedState, metrics: &SharedMetrics) -
         ConsoleMode::Help => dashboard::render_help(),
     };
 
+    // 3.3 — Skip all terminal I/O when the frame is identical to the previous
+    // one. At 100 ms ticks this eliminates nearly every write during idle periods
+    // (no traffic, no state change).
+    if output == *last_rendered {
+        return Ok(());
+    }
+    last_rendered.clone_from(&output);
+
     let mut out = stdout();
     execute!(
         out,
         cursor::MoveTo(0, 0),
         terminal::Clear(terminal::ClearType::FromCursorDown)
-    )?;
-    out.write_all(output.as_bytes())?;
-    out.flush()?;
+    )
+    .map_err(|e| AppError::Console(format!("Terminal write error: {e}")))?;
+    out.write_all(output.as_bytes())
+        .map_err(|e| AppError::Console(format!("stdout write error: {e}")))?;
+    out.flush()
+        .map_err(|e| AppError::Console(format!("stdout flush error: {e}")))?;
 
     Ok(())
 }
 
-// ─── Cleanup ─────────────────────────────────────────────────────────────────
+// ─── Cleanup ──────────────────────────────────────────────────────────────────
 
 /// Restore the terminal to its original state.
 ///

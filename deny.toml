@@ -77,6 +77,24 @@ skip = [
     { name = "windows_x86_64_gnullvm" },
     { name = "windows_x86_64_msvc" },
     { name = "winnow" },
+    # 4.6 — Five additional duplicates present in Cargo.lock but previously
+    # absent from this list, causing `cargo deny check` to warn on every run.
+    #
+    # foldhash 0.1.x / 0.2.x — two generations pulled by hashbrown 0.15 vs 0.16
+    # (both via arti's dependency tree; different sub-crates pin different gens)
+    { name = "foldhash" },
+    # hashbrown 0.12 / 0.15 / 0.16 — pulled by indexmap 1.x (0.12), tokio/arti
+    # (0.15), and the latest arti-client dependency updates (0.16)
+    { name = "hashbrown" },
+    # indexmap 1.x / 2.x — arti-client 0.40 still carries several crates that
+    # depend on indexmap 1.x while the rest of the tree has migrated to 2.x
+    { name = "indexmap" },
+    # redox_syscall 0.5.x / 0.7.x — pulled by crossterm (0.5) and tokio (0.7)
+    # via their respective platform abstraction layers for Redox OS
+    { name = "redox_syscall" },
+    # schemars 0.9.x / 1.x — arti-client 0.40 uses schemars 0.9 for config
+    # schema generation; our direct deps have moved to 1.x
+    { name = "schemars" },
 ]
 
 # ─── Advisories ───────────────────────────────────────────────────────────────

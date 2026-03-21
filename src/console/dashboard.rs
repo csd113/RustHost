@@ -32,6 +32,7 @@ const RULE: &str = "────────────────────
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 
+#[must_use]
 pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &Config) -> String {
     let mut out = String::with_capacity(1_024);
 
@@ -57,10 +58,7 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
         TorStatus::Disabled => dim("DISABLED"),
         TorStatus::Starting => yellow("STARTING — polling for .onion address…"),
         TorStatus::Ready => green("READY"),
-        TorStatus::Failed(None) => red("FAILED — see log for details"),
-        TorStatus::Failed(Some(code)) => {
-            red(&format!("FAILED (exit {code}) — see log for details"))
-        }
+        TorStatus::Failed(reason) => red(&format!("FAILED ({reason}) — see log for details")),
     };
     let _ = writeln!(out, "  Tor          : {tor_str}\r");
     out.push_str("\r\n");
@@ -118,6 +116,7 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
 
 // ─── Log view ────────────────────────────────────────────────────────────────
 
+#[must_use]
 pub fn render_log_view(show_timestamps: bool) -> String {
     let lines = logging::recent_lines(40);
 
@@ -145,6 +144,7 @@ pub fn render_log_view(show_timestamps: bool) -> String {
 
 // ─── Help ────────────────────────────────────────────────────────────────────
 
+#[must_use]
 pub fn render_help() -> String {
     let mut out = String::with_capacity(512);
     let _ = writeln!(out, "{RULE}\r");
@@ -173,14 +173,53 @@ pub fn render_help() -> String {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn strip_timestamp(line: &str) -> &str {
-    let mut count = 0usize;
-    for (i, b) in line.bytes().enumerate() {
-        if b == b']' {
-            count = count.saturating_add(1);
-            if count == 2 {
-                return line[i.saturating_add(1)..].trim_start();
-            }
-        }
+    // Split on ']', skip the first two tokens ([level] and [timestamp]),
+    // return the remainder trimmed. Uses splitn so we stop after the third
+    // piece and never slice at a non-character boundary.
+    let mut parts = line.splitn(3, ']');
+    parts.next(); // consume "[level"
+    parts.next(); // consume "[timestamp"
+    parts.next().map_or(line, str::trim_start)
+}
+
+// ─── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::strip_timestamp;
+
+    #[test]
+    fn strip_timestamp_ascii_log_line() {
+        // A typical log line: "[INFO][2024-01-01 12:00:00] message body"
+        // strip_timestamp should consume the two bracketed tokens and return
+        // " message body" with leading whitespace trimmed.
+        let line = "[INFO][2024-01-01 12:00:00] message body";
+        assert_eq!(strip_timestamp(line), "message body");
     }
-    line
+
+    #[test]
+    fn strip_timestamp_multibyte_utf8_does_not_panic() {
+        // A log line whose payload contains a multi-byte UTF-8 character.
+        // splitn(3, ']') must not slice at a non-character boundary.
+        let line = "[INFO][2024-01-01 12:00:00] café au lait";
+        let result = strip_timestamp(line);
+        // Must not panic; the multi-byte payload must be preserved.
+        assert_eq!(result, "café au lait");
+    }
+
+    #[test]
+    fn strip_timestamp_no_brackets_returns_original() {
+        // When there is no `]` delimiter at all the function must return the
+        // original line unchanged rather than an empty string.
+        let line = "bare message without any brackets";
+        assert_eq!(strip_timestamp(line), line);
+    }
+
+    #[test]
+    fn strip_timestamp_only_one_bracket_pair_returns_original() {
+        // Only a single `]` present — the second `parts.next()` consumes None,
+        // so the third `parts.next()` also returns None → fall back to `line`.
+        let line = "[INFO] single bracket only";
+        assert_eq!(strip_timestamp(line), line);
+    }
 }

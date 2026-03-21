@@ -25,7 +25,7 @@ use std::{
 use chrono::Local;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
-use crate::{config::LoggingConfig, Result};
+use crate::{config::LoggingConfig, AppError, Result};
 
 // ─── Global ring buffer ──────────────────────────────────────────────────────
 
@@ -50,13 +50,31 @@ pub fn recent_lines(limit: usize) -> Vec<String> {
 
 struct RustHostLogger {
     max_level: LevelFilter,
+    filter_dependencies: bool,
     /// Optional file handle. `None` when `logging.enabled = false`.
     file: Option<Mutex<File>>,
 }
 
 impl Log for RustHostLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= self.max_level
+        if metadata.level() > self.max_level {
+            return false;
+        }
+        // 4.3 — Target-based dependency filtering.
+        //
+        // When `filter_dependencies` is true, only pass through records that:
+        //   a) come from the `rusthost` crate (target starts with "rusthost"), OR
+        //   b) are at Warn level or above (always surfaced regardless of origin).
+        //
+        // This suppresses Info/Debug/Trace noise from Arti, Tokio, TLS internals
+        // and keeps the log file focused on application events.
+        if self.filter_dependencies {
+            let target = metadata.target();
+            let is_app = target.starts_with("rusthost");
+            let is_important = metadata.level() <= Level::Warn;
+            return is_app || is_important;
+        }
+        true
     }
 
     fn log(&self, record: &Record) {
@@ -69,12 +87,16 @@ impl Log for RustHostLogger {
         let line = format!("[{level}] [{timestamp}] {}", record.args());
 
         // Push to ring buffer.
+        // 3.5 — Clone before acquiring the lock so the String heap allocation
+        // does not contend with concurrent Arti logging threads. The lock is
+        // then held only for the O(1) push_back pointer swap.
         if let Some(buf) = LOG_BUFFER.get() {
+            let ring_line = line.clone();
             if let Ok(mut guard) = buf.lock() {
                 if guard.len() >= 1_000 {
                     guard.pop_front();
                 }
-                guard.push_back(line.clone());
+                guard.push_back(ring_line);
             }
         }
 
@@ -95,6 +117,15 @@ impl Log for RustHostLogger {
     }
 }
 
+/// Flush all buffered log entries to the log file.
+///
+/// Invokes `RustHostLogger::flush()`, which acquires the file mutex and calls
+/// `File::flush()`. Call this once during shutdown, after the final log entry
+/// has been written, to guarantee no lines are lost in the OS page cache.
+pub fn flush() {
+    log::logger().flush();
+}
+
 // ─── Init ────────────────────────────────────────────────────────────────────
 
 /// Initialise the global logger. Must be called once before any `log!` macro.
@@ -103,10 +134,18 @@ impl Log for RustHostLogger {
 ///
 /// Opens the log file in append mode (creating parent dirs as needed),
 /// registers the logger, and initialises the ring buffer.
+///
+/// # Errors
+///
+/// Returns [`AppError::Io`] if the log file's parent directory cannot be
+/// created, or [`AppError::LogInit`] if the logger is already initialised or
+/// cannot be registered with the `log` facade.
 pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
     LOG_BUFFER.get_or_init(|| Mutex::new(VecDeque::with_capacity(1_000)));
 
-    let max_level = parse_level(&config.level);
+    // 4.2 — LogLevel is now a typed enum; convert directly to LevelFilter.
+    //        The duplicate parse_level() helper is no longer needed.
+    let max_level: LevelFilter = config.level.into();
 
     let file = if config.enabled {
         let log_path = data_dir.join(&config.file);
@@ -117,31 +156,28 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
             .create(true)
             .append(true)
             .open(&log_path)
-            .map_err(|e| format!("Cannot open log file {}: {e}", log_path.display()))?;
+            .map_err(|e| {
+                AppError::LogInit(format!("Cannot open log file {}: {e}", log_path.display()))
+            })?;
         Some(Mutex::new(f))
     } else {
         None
     };
 
-    let logger = Box::new(RustHostLogger { max_level, file });
+    let logger = Box::new(RustHostLogger {
+        max_level,
+        filter_dependencies: config.filter_dependencies,
+        file,
+    });
 
-    log::set_logger(Box::leak(logger)).map_err(|e| format!("Failed to set global logger: {e}"))?;
+    log::set_logger(Box::leak(logger))
+        .map_err(|e| AppError::LogInit(format!("Failed to set global logger: {e}")))?;
     log::set_max_level(max_level);
 
     Ok(())
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-fn parse_level(s: &str) -> LevelFilter {
-    match s.to_ascii_lowercase().as_str() {
-        "trace" => LevelFilter::Trace,
-        "debug" => LevelFilter::Debug,
-        "warn" => LevelFilter::Warn,
-        "error" => LevelFilter::Error,
-        _ => LevelFilter::Info, // "info" and any unknown value
-    }
-}
 
 const fn level_label(level: Level) -> &'static str {
     match level {
