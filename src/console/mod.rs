@@ -65,6 +65,28 @@ pub fn start(
     metrics: SharedMetrics,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<KeyEvent>> {
+    // On Windows, the console host must have VT (Virtual Terminal) escape-
+    // sequence processing enabled before we write any ANSI colour codes.
+    // Windows Terminal and modern ConHost (Win 10 1903+) enable it
+    // automatically, but older ConHost versions (Windows Server 2016/2019 with
+    // default settings) do not.  Without this, colour escape sequences appear
+    // as literal characters (e.g. "^[[32m") rather than being interpreted.
+    //
+    // Failure is non-fatal: the terminal is still functional, just monochrome.
+    // We warn so the operator knows why colours are missing rather than
+    // silently degrading.
+    #[cfg(windows)]
+    if let Err(e) = execute!(
+        stdout(),
+        crossterm::terminal::EnableVirtualTerminalProcessing
+    ) {
+        log::warn!(
+            "Could not enable Windows VT processing: {e}. \
+             ANSI colours may not render correctly. \
+             Upgrade to Windows Terminal or Windows 10 1903+ for full colour support."
+        );
+    }
+
     // 4.1 — map crossterm io errors to AppError::Console.
     terminal::enable_raw_mode()
         .map_err(|e| AppError::Console(format!("Failed to enable raw mode: {e}")))?;

@@ -21,8 +21,16 @@ pub mod state;
 pub fn open_browser(url: &str) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
+    // `explorer.exe <url>` is unreliable — on some Windows configurations it
+    // opens File Explorer instead of the default browser.  `cmd /c start`
+    // delegates to the Windows shell association table, which always picks the
+    // correct handler.  The empty-string third argument is required to prevent
+    // `start` from treating the URL (which may contain special chars) as the
+    // window title.
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("explorer").arg(url).spawn();
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .spawn();
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }

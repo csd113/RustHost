@@ -37,10 +37,6 @@ pub enum AppError {
     #[error("Server startup error: {0}")]
     ServerStartup(String),
 
-    /// An error originating in the Tor / Arti subsystem.
-    #[error("Tor error: {0}")]
-    Tor(String),
-
     /// Console / terminal I/O error (crossterm or raw-mode operations).
     #[error("Console error: {0}")]
     Console(String),
