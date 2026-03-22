@@ -75,6 +75,11 @@ libc         = "0.2"
 # unconditionally.  Build-time cost is ~60 s on first compile; subsequent
 # incremental builds are fast because the OpenSSL objects are cached.
 openssl      = { version = "0.10", features = ["vendored"] }
+# Force rusqlite's bundled SQLite for cross-compilation targets.
+# arti-client pulls rusqlite transitively; declaring it here unifies the feature
+# across the whole dep tree so cross-compiling to Linux/Windows works without a
+# system sqlite3 library present on the host Mac.
+rusqlite     = { version = "*", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"
