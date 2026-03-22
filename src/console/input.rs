@@ -33,7 +33,7 @@ pub fn spawn(tx: UnboundedSender<KeyEvent>, shutdown: watch::Receiver<bool>) {
 
 fn map_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
     if modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
-        return KeyEvent::Quit;
+        return KeyEvent::ForceQuit;
     }
 
     match code {
@@ -42,6 +42,8 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyCode::Char('o' | 'O') => KeyEvent::Open,
         KeyCode::Char('l' | 'L') => KeyEvent::ToggleLogs,
         KeyCode::Char('q' | 'Q') | KeyCode::Esc => KeyEvent::Quit,
+        KeyCode::Char('y' | 'Y') => KeyEvent::Confirm,
+        KeyCode::Char('n' | 'N') => KeyEvent::Cancel,
         _ => KeyEvent::Other,
     }
 }

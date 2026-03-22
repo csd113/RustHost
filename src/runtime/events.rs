@@ -16,7 +16,14 @@ pub enum KeyEvent {
     Reload,
     Open,
     ToggleLogs,
+    /// Q or Esc — request quit, shows confirm prompt.
     Quit,
+    /// Y — confirm the quit prompt.
+    Confirm,
+    /// N — cancel the quit prompt.
+    Cancel,
+    /// Ctrl+C — immediate quit, no prompt.
+    ForceQuit,
     Other,
 }
 
@@ -38,7 +45,25 @@ pub async fn handle(
     data_dir: PathBuf,
 ) -> Result<bool> {
     match event {
-        KeyEvent::Quit => return Ok(true),
+        KeyEvent::ForceQuit => return Ok(true),
+
+        KeyEvent::Quit => {
+            let mut s = state.write().await;
+            s.console_mode = ConsoleMode::ConfirmQuit;
+        }
+
+        KeyEvent::Confirm => {
+            if state.read().await.console_mode == ConsoleMode::ConfirmQuit {
+                return Ok(true);
+            }
+        }
+
+        KeyEvent::Cancel => {
+            let mut s = state.write().await;
+            if s.console_mode == ConsoleMode::ConfirmQuit {
+                s.console_mode = ConsoleMode::Dashboard;
+            }
+        }
 
         KeyEvent::Help => {
             let mut s = state.write().await;
@@ -52,7 +77,9 @@ pub async fn handle(
         KeyEvent::ToggleLogs => {
             let mut s = state.write().await;
             s.console_mode = match s.console_mode {
-                ConsoleMode::Dashboard | ConsoleMode::Help => ConsoleMode::LogView,
+                ConsoleMode::Dashboard | ConsoleMode::Help | ConsoleMode::ConfirmQuit => {
+                    ConsoleMode::LogView
+                }
                 ConsoleMode::LogView => ConsoleMode::Dashboard,
             };
         }
@@ -104,7 +131,7 @@ pub async fn handle(
 
         KeyEvent::Other => {
             let mut s = state.write().await;
-            if s.console_mode == ConsoleMode::Help {
+            if s.console_mode == ConsoleMode::Help || s.console_mode == ConsoleMode::ConfirmQuit {
                 s.console_mode = ConsoleMode::Dashboard;
             }
         }

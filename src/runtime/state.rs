@@ -48,6 +48,8 @@ pub enum ConsoleMode {
     LogView,
     /// Key-binding help overlay (toggled by H).
     Help,
+    /// Quit confirmation prompt (shown after pressing Q).
+    ConfirmQuit,
 }
 
 // ─── AppState ───────────────────────────────────────────────────────────────

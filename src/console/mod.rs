@@ -148,6 +148,7 @@ async fn render(
         }
         ConsoleMode::LogView => dashboard::render_log_view(config.console.show_timestamps),
         ConsoleMode::Help => dashboard::render_help(),
+        ConsoleMode::ConfirmQuit => dashboard::render_confirm_quit(),
     };
 
     // 3.3 — Skip all terminal I/O when the frame is identical to the previous

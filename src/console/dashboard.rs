@@ -179,6 +179,23 @@ pub fn render_help() -> String {
     out
 }
 
+// ─── Confirm quit ─────────────────────────────────────────────────────────────
+
+#[must_use]
+pub fn render_confirm_quit() -> String {
+    let mut out = String::with_capacity(256);
+    let _ = writeln!(out, "{RULE}\r");
+    let _ = writeln!(out, "  {}\r", bold("Quit RustHost?"));
+    let _ = writeln!(out, "{RULE}\r");
+    out.push_str("\r\n");
+    let _ = writeln!(out, "  The server will stop accepting connections.\r");
+    out.push_str("\r\n");
+    let _ = writeln!(out, "  {} Quit   {} Cancel\r", bold("[Y]"), bold("[N]"));
+    out.push_str("\r\n");
+    let _ = writeln!(out, "{RULE}\r");
+    out
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn strip_timestamp(line: &str) -> &str {

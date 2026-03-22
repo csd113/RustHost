@@ -70,7 +70,7 @@ async fn receive_request(
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             // 5.2 — Send 400 on any read failure (oversized headers, reset, etc.)
-            log::debug!("Failed to read request headers: {e}");
+            log::warn!("Failed to read request headers: {e}");
             let mut stream = reader.into_inner();
             write_response(
                 &mut stream,
@@ -86,7 +86,7 @@ async fn receive_request(
             return Ok(RequestOutcome::Responded);
         }
         Err(_elapsed) => {
-            log::debug!("Request timeout — sending 408");
+            log::warn!("Request timeout — sending 408");
             let mut stream = reader.into_inner();
             write_response(
                 &mut stream,
@@ -98,6 +98,7 @@ async fn receive_request(
                 csp,
             )
             .await?;
+            metrics.add_error();
             return Ok(RequestOutcome::Responded);
         }
     };
@@ -112,21 +113,38 @@ async fn receive_request(
             raw_path: path.to_owned(),
             stream,
         }),
-        ParseResult::MethodNotAllowed => {
-            // RFC 9110 §15.5.6: 405 with Allow header listing supported methods.
-            stream
-                .write_all(
-                    b"HTTP/1.1 405 Method Not Allowed\r\n\
-                      Allow: GET, HEAD\r\n\
-                      Content-Length: 0\r\n\
-                      Connection: close\r\n\
-                      \r\n",
-                )
-                .await?;
-            metrics.add_error();
+        ParseResult::MethodNotAllowed { method } => {
+            if method == "OPTIONS" {
+                // Browsers send OPTIONS preflight requests automatically; respond
+                // with 200 + Allow so they can proceed without counting as errors.
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Allow: GET, HEAD, POST, OPTIONS\r\n\
+                          Content-Length: 0\r\n\
+                          Connection: close\r\n\
+                          \r\n",
+                    )
+                    .await?;
+                metrics.add_request();
+            } else {
+                // RFC 9110 §15.5.6: 405 with Allow header listing supported methods.
+                log::warn!("405 Method Not Allowed: {method}");
+                stream
+                    .write_all(
+                        b"HTTP/1.1 405 Method Not Allowed\r\n\
+                          Allow: GET, HEAD, POST, OPTIONS\r\n\
+                          Content-Length: 0\r\n\
+                          Connection: close\r\n\
+                          \r\n",
+                    )
+                    .await?;
+                metrics.add_error();
+            }
             Ok(RequestOutcome::Responded)
         }
         ParseResult::BadRequest => {
+            log::warn!("400 Bad Request — malformed request line");
             write_response(
                 &mut stream,
                 400,
@@ -297,7 +315,10 @@ async fn serve_file(
             let file_len = match file.metadata().await {
                 Ok(m) => m.len(),
                 Err(e) => {
-                    log::debug!("Failed to read file metadata: {e}");
+                    log::warn!(
+                        "Failed to read file metadata for {}: {e}",
+                        abs_path.display()
+                    );
                     write_response(
                         stream,
                         500,
@@ -315,16 +336,7 @@ async fn serve_file(
             let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let content_type = mime::for_extension(ext);
 
-            write_headers(
-                stream,
-                200,
-                "OK",
-                content_type,
-                file_len,
-                csp,
-                None,
-            )
-            .await?;
+            write_headers(stream, 200, "OK", content_type, file_len, csp, None).await?;
             if !is_head {
                 // fix H-2 — a slow reader holds a semaphore permit for an
                 // unbounded time without a write timeout.  120 s is generous
@@ -344,6 +356,7 @@ async fn serve_file(
             metrics.add_request();
         }
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            log::warn!("403 Forbidden (permission denied): {}", abs_path.display());
             write_response(
                 stream,
                 403,
@@ -357,6 +370,10 @@ async fn serve_file(
             metrics.add_error();
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log::warn!(
+                "404 Not Found (file disappeared after resolve): {}",
+                abs_path.display()
+            );
             write_response(
                 stream,
                 404,
@@ -440,7 +457,7 @@ async fn read_request(reader: &mut BufReader<TcpStream>) -> Result<String> {
 /// the RFC 9110-correct status code in each case (fix H-4).
 enum ParseResult<'a> {
     Ok { method: &'a str, path: &'a str },
-    MethodNotAllowed,
+    MethodNotAllowed { method: &'a str },
     BadRequest,
 }
 
@@ -453,13 +470,18 @@ fn parse_path(request: &str) -> ParseResult<'_> {
     let Some(method) = it.next() else {
         return ParseResult::BadRequest;
     };
-    if method != "GET" && method != "HEAD" {
-        return ParseResult::MethodNotAllowed;
+    if method != "GET" && method != "HEAD" && method != "POST" {
+        return ParseResult::MethodNotAllowed { method };
     }
     let Some(path) = it.next() else {
         return ParseResult::BadRequest;
     };
-    ParseResult::Ok { method, path }
+    // Treat POST as GET — this is a static file server with no POST semantics.
+    // Serving the file is the correct response; the browser gets what it navigated to.
+    ParseResult::Ok {
+        method: if method == "HEAD" { "HEAD" } else { "GET" },
+        path,
+    }
 }
 
 // ─── Path resolution ─────────────────────────────────────────────────────────
