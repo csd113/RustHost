@@ -78,7 +78,6 @@ fn serialize_ip_addr<S: serde::Serializer>(addr: &IpAddr, s: S) -> Result<S::Ok,
 pub enum CspLevel {
     /// No `Content-Security-Policy` header is sent. The browser applies its
     /// own defaults. Recommended starting point — tighten once the site works.
-    #[default]
     Off,
     /// Sends `default-src * 'unsafe-inline' 'unsafe-eval' data: blob:`.
     ///
@@ -92,6 +91,7 @@ pub enum CspLevel {
     /// font-src 'self' data:`
     ///
     /// Suitable for self-contained sites that serve all assets locally.
+    #[default]
     Strict,
 }
 
@@ -229,7 +229,7 @@ impl Default for Config {
                 auto_port_fallback: true,
                 open_browser_on_start: false,
                 max_connections: 256,
-                csp_level: CspLevel::Off,
+                csp_level: CspLevel::Strict,
             },
             site: SiteConfig {
                 directory: "site".into(),
