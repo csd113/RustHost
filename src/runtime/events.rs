@@ -16,7 +16,14 @@ pub enum KeyEvent {
     Reload,
     Open,
     ToggleLogs,
+    /// Q or Esc — request quit, shows confirm prompt.
     Quit,
+    /// Y — confirm the quit prompt.
+    Confirm,
+    /// N — cancel the quit prompt.
+    Cancel,
+    /// Ctrl+C — immediate quit, no prompt.
+    ForceQuit,
     Other,
 }
 
@@ -38,7 +45,25 @@ pub async fn handle(
     data_dir: PathBuf,
 ) -> Result<bool> {
     match event {
-        KeyEvent::Quit => return Ok(true),
+        KeyEvent::ForceQuit => return Ok(true),
+
+        KeyEvent::Quit => {
+            let mut s = state.write().await;
+            s.console_mode = ConsoleMode::ConfirmQuit;
+        }
+
+        KeyEvent::Confirm => {
+            if state.read().await.console_mode == ConsoleMode::ConfirmQuit {
+                return Ok(true);
+            }
+        }
+
+        KeyEvent::Cancel => {
+            let mut s = state.write().await;
+            if s.console_mode == ConsoleMode::ConfirmQuit {
+                s.console_mode = ConsoleMode::Dashboard;
+            }
+        }
 
         KeyEvent::Help => {
             let mut s = state.write().await;
@@ -52,7 +77,9 @@ pub async fn handle(
         KeyEvent::ToggleLogs => {
             let mut s = state.write().await;
             s.console_mode = match s.console_mode {
-                ConsoleMode::Dashboard | ConsoleMode::Help => ConsoleMode::LogView,
+                ConsoleMode::Dashboard | ConsoleMode::Help | ConsoleMode::ConfirmQuit => {
+                    ConsoleMode::LogView
+                }
                 ConsoleMode::LogView => ConsoleMode::Dashboard,
             };
         }
@@ -87,13 +114,24 @@ pub async fn handle(
 
         KeyEvent::Open => {
             let port = state.read().await.actual_port;
-            // 2.4 — use the canonical definition in crate::runtime
-            super::open_browser(&format!("http://localhost:{port}"));
+            // fix S-1 — use the actual bind address, not hardcoded "localhost".
+            // If bind = "::1", localhost may resolve to 127.0.0.1 and miss the listener.
+            let url = match config.server.bind {
+                std::net::IpAddr::V4(a) if a.is_unspecified() => {
+                    format!("http://127.0.0.1:{port}")
+                }
+                std::net::IpAddr::V6(a) if a.is_unspecified() => {
+                    format!("http://[::1]:{port}")
+                }
+                std::net::IpAddr::V6(a) => format!("http://[{a}]:{port}"),
+                std::net::IpAddr::V4(a) => format!("http://{a}:{port}"),
+            };
+            super::open_browser(&url);
         }
 
         KeyEvent::Other => {
             let mut s = state.write().await;
-            if s.console_mode == ConsoleMode::Help {
+            if s.console_mode == ConsoleMode::Help || s.console_mode == ConsoleMode::ConfirmQuit {
                 s.console_mode = ConsoleMode::Dashboard;
             }
         }

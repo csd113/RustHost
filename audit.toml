@@ -1,3 +1,29 @@
-# audit.toml
+# cargo-audit configuration for rusthost
+#
+# fix G-3 — previously this file contained a bare `ignore` entry with no
+# rationale, creating a silent suppression that future developers could not
+# evaluate.  Rationale is now documented here to match deny.toml.
+#
+# Standardising on `cargo deny check advisories` as the primary advisory gate
+# is recommended; this file is kept for developers who run `cargo audit`
+# directly.  Both files must be kept in sync when advisories are added or
+# the threat model changes (e.g. if RSA decryption is ever added to the code).
+
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+ignore = [
+    # rsa 0.9.x — Marvin attack: timing side-channel on DECRYPTION only.
+    # (RUSTSEC-2023-0071, https://rustsec.org/advisories/RUSTSEC-2023-0071)
+    #
+    # `rsa` is pulled in transitively by `arti-client` for X.509 certificate
+    # parsing in Tor directory consensus documents.  It is used exclusively
+    # for RSA *signature verification*, never for decryption.  The Marvin
+    # attack requires an adversary to make thousands of adaptive
+    # chosen-ciphertext decryption queries — a threat model that does not
+    # apply here.
+    #
+    # No patched version of `rsa` exists as of this writing.
+    # Revisit when arti upgrades past rsa 0.9.x or a fixed version ships.
+    # If RSA decryption is ever added to this codebase, remove this ignore
+    # immediately and treat the advisory as exploitable.
+    "RUSTSEC-2023-0071",
+]

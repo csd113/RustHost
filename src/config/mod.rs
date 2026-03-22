@@ -58,6 +58,62 @@ fn serialize_ip_addr<S: serde::Serializer>(addr: &IpAddr, s: S) -> Result<S::Ok,
     s.serialize_str(&addr.to_string())
 }
 
+// ─── CSP level ───────────────────────────────────────────────────────────────
+
+/// Preset Content-Security-Policy levels selectable in `settings.toml`.
+///
+/// | Level     | CSP header sent                                           | Use case                      |
+/// |-----------|-----------------------------------------------------------|-------------------------------|
+/// | `off`     | *(none)*                                                  | Dev / any site, zero friction |
+/// | `relaxed` | `default-src * 'unsafe-inline' 'unsafe-eval' data: blob:` | Sites with external CDNs      |
+/// | `strict`  | same-origin only + inline scripts/styles                  | High-security deployments     |
+///
+/// The default is `off` so pages render correctly out of the box.
+/// Tighten once you know which external origins your site actually needs.
+///
+/// **Tor note:** `Referrer-Policy: no-referrer` is always sent regardless of
+/// this setting, preventing the `.onion` address from leaking to third parties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CspLevel {
+    /// No `Content-Security-Policy` header is sent. The browser applies its
+    /// own defaults. Recommended starting point — tighten once the site works.
+    #[default]
+    Off,
+    /// Sends `default-src * 'unsafe-inline' 'unsafe-eval' data: blob:`.
+    ///
+    /// Permits resources from any origin, inline scripts/styles, `eval`,
+    /// `data:` URIs, and blob URLs. Use when loading assets from external CDNs.
+    Relaxed,
+    /// Sends a same-origin-only policy with inline scripts and styles permitted.
+    ///
+    /// Policy: `default-src 'self'; script-src 'self' 'unsafe-inline';
+    /// style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:;
+    /// font-src 'self' data:`
+    ///
+    /// Suitable for self-contained sites that serve all assets locally.
+    Strict,
+}
+
+impl CspLevel {
+    /// Return the literal CSP header value for this level, or an empty string
+    /// when the level is [`CspLevel::Off`] (no header should be sent).
+    #[must_use]
+    pub const fn as_header_value(self) -> &'static str {
+        match self {
+            Self::Off => "",
+            Self::Relaxed => "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:",
+            Self::Strict => {
+                "default-src 'self'; \
+                 script-src 'self' 'unsafe-inline'; \
+                 style-src 'self' 'unsafe-inline'; \
+                 img-src 'self' data: blob:; \
+                 font-src 'self' data:"
+            }
+        }
+    }
+}
+
 // ─── Config structs ──────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,22 +146,11 @@ pub struct ServerConfig {
     pub open_browser_on_start: bool,
     pub max_connections: u32,
 
-    /// Value of the `Content-Security-Policy` header sent with every HTML
-    /// response (task 5.3).  The default `"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"` restricts all
-    /// content to the same origin.
-    ///
-    /// Operators serving CDN fonts, analytics scripts, or other third-party
-    /// resources can relax this without touching source code, e.g.:
-    ///
-    /// ```toml
-    /// [server]
-    /// content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; script-src 'self' cdn.example.com"
-    /// ```
-    ///
-    /// **Tor note:** `Referrer-Policy: no-referrer` is always sent regardless
-    /// of this setting, preventing the `.onion` URL from leaking to any
-    /// third-party origin referenced in served HTML.
-    pub content_security_policy: String,
+    /// Content-Security-Policy preset.  See [`CspLevel`] for available values
+    /// (`"off"`, `"relaxed"`, `"strict"`) and the header each one sends.
+    /// Defaults to `"off"` — no CSP header, maximum browser compatibility.
+    #[serde(default)]
+    pub csp_level: CspLevel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,10 +159,11 @@ pub struct SiteConfig {
     pub directory: String,
     pub index_file: String,
     pub enable_directory_listing: bool,
-    // `auto_reload` has been removed: the field was advertised in the default
-    // config but never implemented. Old config files containing `auto_reload`
-    // will now be rejected at startup with a clear "unknown field" error,
-    // prompting the operator to remove the obsolete key (fix 2.6).
+    /// When `true`, directory listings and direct requests expose dot-files
+    /// (e.g. `.git/`, `.env`).  Defaults to `false` so hidden files are not
+    /// accidentally served (fix H-10).
+    #[serde(default)]
+    pub expose_dotfiles: bool,
 }
 
 /// Controls Tor integration.
@@ -183,12 +229,13 @@ impl Default for Config {
                 auto_port_fallback: true,
                 open_browser_on_start: false,
                 max_connections: 256,
-                content_security_policy: "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'".into(),
+                csp_level: CspLevel::Off,
             },
             site: SiteConfig {
                 directory: "site".into(),
                 index_file: "index.html".into(),
                 enable_directory_listing: false,
+                expose_dotfiles: false,
             },
             tor: TorConfig { enabled: true },
             logging: LoggingConfig {

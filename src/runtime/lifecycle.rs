@@ -75,11 +75,25 @@ pub async fn run(args: CliArgs) -> Result<()> {
 }
 
 /// Compute the default data directory (`<exe-dir>/rusthost-data/`).
+/// Compute the default data directory (`<exe-dir>/rusthost-data/`).
+///
+/// fix L-1 — if `current_exe()` fails (deleted binary, unusual OS, restricted
+/// environment) we previously fell back silently to `./rusthost-data`, hiding
+/// the misconfiguration.  Now we emit a visible warning so operators know the
+/// key material and site files landed somewhere unexpected.
 fn default_data_dir() -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    exe.parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("rusthost-data")
+    match std::env::current_exe() {
+        Ok(exe) => exe.parent().map_or_else(
+            || PathBuf::from("rusthost-data"),
+            |p| p.join("rusthost-data"),
+        ),
+        Err(e) => {
+            eprintln!(
+                "Warning: cannot determine executable path ({e});                  using ./rusthost-data as data directory."
+            );
+            PathBuf::from("rusthost-data")
+        }
+    }
 }
 
 // ─── First Run ───────────────────────────────────────────────────────────────
@@ -199,10 +213,14 @@ async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
     //               correct loopback address (e.g. ::1 on IPv6-only machines).
     //    2.10 — pass shutdown_rx so Tor's stream loop exits on clean shutdown.
     let tor_handle = if config.tor.enabled {
+        // fix T-2 — pass max_connections so the Tor semaphore is sized
+        // identically to the HTTP server connection limit.
+        let max_tor = config.server.max_connections as usize;
         Some(tor::init(
             data_dir.clone(),
             bind_port,
             config.server.bind,
+            max_tor,
             Arc::clone(&state),
             shutdown_rx.clone(),
         ))
@@ -216,8 +234,20 @@ async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
     // 10. Open browser (if configured).
     if config.server.open_browser_on_start {
         let port = state.read().await.actual_port;
-        // 2.4 — use canonical open_browser from crate::runtime
-        super::open_browser(&format!("http://localhost:{port}"));
+        // fix S-1 — use the actual bind address instead of hardcoding "localhost".
+        // If bind = "::1" and localhost resolves to 127.0.0.1, the browser
+        // tries the wrong interface.  Format IPv6 with brackets.
+        let url = match config.server.bind {
+            std::net::IpAddr::V4(a) if a.is_unspecified() => {
+                format!("http://127.0.0.1:{port}")
+            }
+            std::net::IpAddr::V6(a) if a.is_unspecified() => {
+                format!("http://[::1]:{port}")
+            }
+            std::net::IpAddr::V6(a) => format!("http://[{a}]:{port}"),
+            std::net::IpAddr::V4(a) => format!("http://{a}:{port}"),
+        };
+        super::open_browser(&url);
     }
 
     // 11. Event dispatch loop.
@@ -227,14 +257,16 @@ async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
     log::info!("Shutting down…");
     let _ = shutdown_tx.send(true);
 
-    // 2.10 — wait for the HTTP server to drain in-flight connections (max 5 s).
-    let _ = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
-
-    // fix 3.1 — await the Tor task so active circuits can send a clean
-    // RELAY_END cell before the runtime tears down.  The shutdown watch
-    // channel was already signalled above; this just drains the task.
+    // fix M-2 / clippy::integer_arithmetic — checked_add returns None only if
+    // the instant would overflow (practically impossible); fall back to now so
+    // the drain phase exits immediately rather than panicking or using bare `+`.
+    let shutdown_deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(8))
+        .unwrap_or_else(tokio::time::Instant::now);
+    let _ = tokio::time::timeout_at(shutdown_deadline, server_handle).await;
     if let Some(handle) = tor_handle {
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let remaining = shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let _ = tokio::time::timeout(remaining, handle).await;
     }
 
     log::info!("RustHost shut down cleanly.");
