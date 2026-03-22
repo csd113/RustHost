@@ -47,6 +47,8 @@ Drop the binary next to your site files, run it once, and you get:
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
+![rystgit](https://github.com/user-attachments/assets/30752d0f-5be2-4c80-b3a2-4fa0530ff3ab)
+
 ---
 
 ## Features
