@@ -120,7 +120,7 @@ async fn receive_request(
                 stream
                     .write_all(
                         b"HTTP/1.1 200 OK\r\n\
-                          Allow: GET, HEAD, POST, OPTIONS\r\n\
+                          Allow: GET, HEAD, OPTIONS\r\n\
                           Content-Length: 0\r\n\
                           Connection: close\r\n\
                           \r\n",
@@ -133,7 +133,7 @@ async fn receive_request(
                 stream
                     .write_all(
                         b"HTTP/1.1 405 Method Not Allowed\r\n\
-                          Allow: GET, HEAD, POST, OPTIONS\r\n\
+                          Allow: GET, HEAD, OPTIONS\r\n\
                           Content-Length: 0\r\n\
                           Connection: close\r\n\
                           \r\n",
@@ -470,18 +470,13 @@ fn parse_path(request: &str) -> ParseResult<'_> {
     let Some(method) = it.next() else {
         return ParseResult::BadRequest;
     };
-    if method != "GET" && method != "HEAD" && method != "POST" {
+    if method != "GET" && method != "HEAD" {
         return ParseResult::MethodNotAllowed { method };
     }
     let Some(path) = it.next() else {
         return ParseResult::BadRequest;
     };
-    // Treat POST as GET — this is a static file server with no POST semantics.
-    // Serving the file is the correct response; the browser gets what it navigated to.
-    ParseResult::Ok {
-        method: if method == "HEAD" { "HEAD" } else { "GET" },
-        path,
-    }
+    ParseResult::Ok { method, path }
 }
 
 // ─── Path resolution ─────────────────────────────────────────────────────────
