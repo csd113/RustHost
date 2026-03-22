@@ -183,6 +183,7 @@ pub async fn handle(
             serve_file(&mut stream, &abs_path, is_head, &metrics, &csp).await?;
         }
         Resolved::NotFound => {
+            log::debug!("404 Not Found: {decoded}");
             write_response(
                 &mut stream,
                 404,
@@ -193,7 +194,7 @@ pub async fn handle(
                 &csp,
             )
             .await?;
-            metrics.add_error();
+            metrics.add_request();
         }
         Resolved::Redirect(location) => {
             // fix H-3 — sanitize CR/LF from location to prevent CRLF injection.
@@ -227,6 +228,7 @@ pub async fn handle(
             metrics.add_request();
         }
         Resolved::Forbidden => {
+            log::warn!("403 Forbidden: {decoded}");
             write_response(
                 &mut stream,
                 403,
@@ -313,7 +315,16 @@ async fn serve_file(
             let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let content_type = mime::for_extension(ext);
 
-            write_headers(stream, 200, "OK", content_type, file_len, csp, None).await?;
+            write_headers(
+                stream,
+                200,
+                "OK",
+                content_type,
+                file_len,
+                csp,
+                None,
+            )
+            .await?;
             if !is_head {
                 // fix H-2 — a slow reader holds a semaphore permit for an
                 // unbounded time without a write timeout.  120 s is generous
