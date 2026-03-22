@@ -105,26 +105,42 @@ async fn receive_request(
     let mut stream = reader.into_inner();
 
     // 1.4 — parse_path extracts (method, path); returns None for non-GET/HEAD.
-    let Some((method, raw_path_ref)) = parse_path(&request) else {
-        write_response(
-            &mut stream,
-            400,
-            "Bad Request",
-            "text/plain",
-            b"Bad Request",
-            false,
-            csp,
-        )
-        .await?;
-        metrics.add_error();
-        return Ok(RequestOutcome::Responded);
-    };
-
-    Ok(RequestOutcome::Ready {
-        is_head: method == "HEAD",
-        raw_path: raw_path_ref.to_owned(),
-        stream,
-    })
+    // H-4: use ParseResult to distinguish malformed request from disallowed method.
+    match parse_path(&request) {
+        ParseResult::Ok { method, path } => Ok(RequestOutcome::Ready {
+            is_head: method == "HEAD",
+            raw_path: path.to_owned(),
+            stream,
+        }),
+        ParseResult::MethodNotAllowed => {
+            // RFC 9110 §15.5.6: 405 with Allow header listing supported methods.
+            stream
+                .write_all(
+                    b"HTTP/1.1 405 Method Not Allowed\r\n\
+                      Allow: GET, HEAD\r\n\
+                      Content-Length: 0\r\n\
+                      Connection: close\r\n\
+                      \r\n",
+                )
+                .await?;
+            metrics.add_error();
+            Ok(RequestOutcome::Responded)
+        }
+        ParseResult::BadRequest => {
+            write_response(
+                &mut stream,
+                400,
+                "Bad Request",
+                "text/plain",
+                b"Bad Request",
+                false,
+                csp,
+            )
+            .await?;
+            metrics.add_error();
+            Ok(RequestOutcome::Responded)
+        }
+    }
 }
 
 /// Handle one HTTP connection to completion.
@@ -136,11 +152,12 @@ async fn receive_request(
 /// Request` response rather than being surfaced as errors.
 pub async fn handle(
     stream: TcpStream,
-    canonical_root: Arc<Path>, // 3.2 — pre-canonicalized (2.3); Arc avoids per-connection alloc
-    index_file: Arc<str>,      // 3.2 — Arc<str> clone is O(1)
+    canonical_root: Arc<Path>,
+    index_file: Arc<str>,
     dir_listing: bool,
+    expose_dotfiles: bool, // fix H-10: when false, hide dot-files from directory listings
     metrics: SharedMetrics,
-    csp: Arc<str>, // 5.3 — Content-Security-Policy, applied to HTML responses only
+    csp: Arc<str>,
 ) -> Result<()> {
     let RequestOutcome::Ready {
         is_head,
@@ -155,7 +172,13 @@ pub async fn handle(
     let path_only = raw_path.split('?').next().unwrap_or("/");
     let decoded = percent_decode(path_only);
 
-    match resolve_path(&canonical_root, &decoded, &index_file, dir_listing) {
+    match resolve_path(
+        &canonical_root,
+        &decoded,
+        &index_file,
+        dir_listing,
+        expose_dotfiles,
+    ) {
         Resolved::File(abs_path) => {
             serve_file(&mut stream, &abs_path, is_head, &metrics, &csp).await?;
         }
@@ -173,23 +196,14 @@ pub async fn handle(
             metrics.add_error();
         }
         Resolved::Redirect(location) => {
-            let body = format!("Redirecting to {location}");
-            // The original format_args! string used source indentation that
-            // injected leading spaces after each \r\n, producing
-            // "folded header" lines (RFC 7230 §3.2.6 deprecated,
-            // RFC 9112 §5.1 forbidden). Strict HTTP clients reject them.
-            // Use a raw string with explicit \r\n\ continuations so the
-            // indentation is NOT part of the emitted bytes.
-            let body_len = body.len();
-            let hdr = format!(
-                "HTTP/1.1 301 Moved Permanently\r\n\
-                 Location: {location}\r\n\
-                 Content-Type: text/plain\r\n\
-                 Content-Length: {body_len}\r\n\
-                 Connection: close\r\n\
-                 \r\n"
-            );
-            stream.write_all(hdr.as_bytes()).await?;
+            // fix H-3 — sanitize CR/LF from location to prevent CRLF injection.
+            // fix H-9 — emit all security headers (especially Referrer-Policy:
+            // no-referrer) on the 301; previously this response bypassed
+            // write_headers entirely, leaking the .onion URL as a Referer.
+            let safe_location = sanitize_header_value(&location);
+            let body = format!("Redirecting to {safe_location}");
+            let body_len = body.len() as u64;
+            write_redirect(&mut stream, &safe_location, body_len, &csp).await?;
             if !is_head {
                 stream.write_all(body.as_bytes()).await?;
             }
@@ -197,10 +211,13 @@ pub async fn handle(
             metrics.add_request();
         }
         Resolved::Fallback => {
+            // fix S-2 — 503 Service Unavailable accurately represents "no content
+            // configured yet" and prevents the fallback page being cached or indexed
+            // as a working endpoint.  Previously returned 200 which could be cached.
             write_response(
                 &mut stream,
-                200,
-                "OK",
+                503,
+                "Service Unavailable",
                 "text/html; charset=utf-8",
                 fallback::NO_SITE_HTML.as_bytes(),
                 is_head,
@@ -223,7 +240,20 @@ pub async fn handle(
             metrics.add_error();
         }
         Resolved::DirectoryListing(dir_path) => {
-            let html = build_directory_listing(&dir_path, &decoded);
+            // fix H-1 — std::fs::read_dir is a blocking syscall; calling it
+            // directly on a Tokio worker thread starves other tasks.  For large
+            // directories this can block all workers simultaneously under load.
+            let decoded_clone = decoded.clone();
+            let expose_dotfiles_inner = expose_dotfiles;
+            let html = tokio::task::spawn_blocking(move || {
+                build_directory_listing(&dir_path, &decoded_clone, expose_dotfiles_inner)
+            })
+            .await
+            .map_err(|e| {
+                crate::AppError::Io(std::io::Error::other(format!(
+                    "directory listing task panicked: {e}"
+                )))
+            })?;
             write_response(
                 &mut stream,
                 200,
@@ -256,46 +286,92 @@ async fn serve_file(
     metrics: &SharedMetrics,
     csp: &str,
 ) -> Result<()> {
-    // 1.7 — Stream the file instead of reading it entirely into memory.
-    if let Ok(mut file) = tokio::fs::File::open(abs_path).await {
-        let file_len = match file.metadata().await {
-            Ok(m) => m.len(),
-            Err(e) => {
-                log::debug!("Failed to read file metadata: {e}");
-                write_response(
-                    stream,
-                    500,
-                    "Internal Server Error",
-                    "text/plain",
-                    b"Internal Server Error",
-                    false,
-                    csp,
-                )
-                .await?;
-                metrics.add_error();
-                return Ok(());
+    // fix H-6 — distinguish error kinds so the client gets the right status:
+    //   PermissionDenied → 403 Forbidden
+    //   NotFound         → 404 Not Found
+    //   anything else    → 500 Internal Server Error (also logged)
+    match tokio::fs::File::open(abs_path).await {
+        Ok(mut file) => {
+            let file_len = match file.metadata().await {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    log::debug!("Failed to read file metadata: {e}");
+                    write_response(
+                        stream,
+                        500,
+                        "Internal Server Error",
+                        "text/plain",
+                        b"Internal Server Error",
+                        false,
+                        csp,
+                    )
+                    .await?;
+                    metrics.add_error();
+                    return Ok(());
+                }
+            };
+            let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let content_type = mime::for_extension(ext);
+
+            write_headers(stream, 200, "OK", content_type, file_len, csp, None).await?;
+            if !is_head {
+                // fix H-2 — a slow reader holds a semaphore permit for an
+                // unbounded time without a write timeout.  120 s is generous
+                // for Tor (slow) while still ejecting fully-idle connections.
+                const RESPONSE_WRITE_TIMEOUT: std::time::Duration =
+                    std::time::Duration::from_secs(120);
+                tokio::time::timeout(RESPONSE_WRITE_TIMEOUT, tokio::io::copy(&mut file, stream))
+                    .await
+                    .map_err(|_| {
+                        crate::AppError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "response write timed out — client too slow",
+                        ))
+                    })??;
             }
-        };
-        let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let content_type = mime::for_extension(ext);
-        write_headers(stream, 200, "OK", content_type, file_len, csp).await?;
-        if !is_head {
-            tokio::io::copy(&mut file, stream).await?;
+            stream.flush().await?;
+            metrics.add_request();
         }
-        stream.flush().await?;
-        metrics.add_request();
-    } else {
-        write_response(
-            stream,
-            404,
-            "Not Found",
-            "text/plain",
-            b"Not Found",
-            false,
-            csp,
-        )
-        .await?;
-        metrics.add_error();
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            write_response(
+                stream,
+                403,
+                "Forbidden",
+                "text/plain",
+                b"Forbidden",
+                false,
+                csp,
+            )
+            .await?;
+            metrics.add_error();
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_response(
+                stream,
+                404,
+                "Not Found",
+                "text/plain",
+                b"Not Found",
+                false,
+                csp,
+            )
+            .await?;
+            metrics.add_error();
+        }
+        Err(e) => {
+            log::error!("Unexpected error opening {}: {e}", abs_path.display());
+            write_response(
+                stream,
+                500,
+                "Internal Server Error",
+                "text/plain",
+                b"Internal Server Error",
+                false,
+                csp,
+            )
+            .await?;
+            metrics.add_error();
+        }
     }
     Ok(())
 }
@@ -347,21 +423,32 @@ async fn read_request(reader: &mut BufReader<TcpStream>) -> Result<String> {
     Ok(request)
 }
 
-/// Extract the method and URL path from `GET /path HTTP/1.1`.
+/// Outcome of parsing the HTTP request line.
 ///
-/// Returns `(method, path)` or `None` if the request line is malformed or
-/// the method is not `GET`/`HEAD`.
-fn parse_path(request: &str) -> Option<(&str, &str)> {
-    let first = request.lines().next()?;
+/// Separates "bad syntax" from "disallowed method" so the caller can return
+/// the RFC 9110-correct status code in each case (fix H-4).
+enum ParseResult<'a> {
+    Ok { method: &'a str, path: &'a str },
+    MethodNotAllowed,
+    BadRequest,
+}
+
+/// Extract the method and URL path from `GET /path HTTP/1.1`.
+fn parse_path(request: &str) -> ParseResult<'_> {
+    let Some(first) = request.lines().next() else {
+        return ParseResult::BadRequest;
+    };
     let mut it = first.splitn(3, ' ');
-    let method = it.next()?;
-
+    let Some(method) = it.next() else {
+        return ParseResult::BadRequest;
+    };
     if method != "GET" && method != "HEAD" {
-        return None;
+        return ParseResult::MethodNotAllowed;
     }
-
-    let path = it.next()?;
-    Some((method, path))
+    let Some(path) = it.next() else {
+        return ParseResult::BadRequest;
+    };
+    ParseResult::Ok { method, path }
 }
 
 // ─── Path resolution ─────────────────────────────────────────────────────────
@@ -407,15 +494,25 @@ pub(crate) fn resolve_path(
     url_path: &str,
     index_file: &str,
     dir_listing: bool,
+    expose_dotfiles: bool, // fix H-10: when false, 403 on direct requests to dot-files
 ) -> Resolved {
-    // 2.3 — `canonical_root` is already resolved by `server::run`; no
-    // canonicalize() syscall needed here on every request.
+    // fix H-10 — block direct requests for dot-files (e.g. /.git/config, /.env)
+    // regardless of whether they exist, unless the operator explicitly opts in.
+    // Directory listing filtering is handled in build_directory_listing.
+    if !expose_dotfiles {
+        for component in std::path::Path::new(url_path).components() {
+            if let std::path::Component::Normal(name) = component {
+                if name.to_str().is_some_and(|s| s.starts_with('.')) {
+                    return Resolved::Forbidden;
+                }
+            }
+        }
+    }
+
     let relative = url_path.trim_start_matches('/');
     let candidate = canonical_root.join(relative);
 
     let target = if candidate.is_dir() {
-        // If the URL has no trailing slash, redirect so that relative links
-        // in the served index file resolve against the correct base URL.
         if !url_path.ends_with('/') {
             let redirect_to = format!("{url_path}/");
             return Resolved::Redirect(redirect_to);
@@ -433,11 +530,6 @@ pub(crate) fn resolve_path(
     };
 
     let Ok(canonical) = target.canonicalize() else {
-        // Target does not exist on disk. Use lexical normalization (no syscalls)
-        // to determine whether the path would land inside the root:
-        //   - Root itself missing             → Fallback  (no site configured)
-        //   - Normalized path within root     → NotFound  (404)
-        //   - Normalized path escapes root    → Forbidden (403)
         if !canonical_root.exists() {
             return Resolved::Fallback;
         }
@@ -457,6 +549,20 @@ pub(crate) fn resolve_path(
 }
 
 // ─── Response writing ────────────────────────────────────────────────────────
+
+/// Strip CR and LF characters from any string destined for an HTTP header value.
+///
+/// fix H-3 — decoded URL paths may contain CRLF characters (legal on Linux
+/// filesystems), which can split a header line and inject arbitrary response
+/// headers.  Removing them is the correct fix; the redirected URL is otherwise
+/// unchanged.  Applied to the CSP value in [`write_headers`] for the same reason.
+fn sanitize_header_value(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains(['\r', '\n']) {
+        std::borrow::Cow::Owned(s.chars().filter(|&c| c != '\r' && c != '\n').collect())
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
 
 /// Write a complete HTTP response, optionally suppressing the body (for HEAD).
 ///
@@ -480,7 +586,7 @@ async fn write_response(
     // at the narrowest possible scope.
     #[allow(clippy::cast_possible_truncation)]
     let body_len: u64 = body.len() as u64;
-    write_headers(stream, status, reason, content_type, body_len, csp).await?;
+    write_headers(stream, status, reason, content_type, body_len, csp, None).await?;
     if !suppress_body {
         stream.write_all(body).await?;
     }
@@ -508,7 +614,7 @@ async fn write_response(
 /// `Referrer-Policy: no-referrer` is especially important for the Tor hidden
 /// service use case: without it, the `.onion` URL leaks in the `Referer`
 /// header sent to any third-party resource (CDN, fonts, analytics) embedded
-/// in a served HTML page.
+/// in a served HTML page. (See [`write_redirect`] for redirect responses.)
 ///
 /// # Errors
 ///
@@ -520,19 +626,62 @@ async fn write_headers(
     content_type: &str,
     content_length: u64,
     csp: &str,
+    content_disposition: Option<&str>, // fix H-5: pass Some("attachment") for SVG
 ) -> Result<()> {
     let is_html = content_type.starts_with("text/html");
-    let csp_line = if is_html && !csp.is_empty() {
-        format!("Content-Security-Policy: {csp}\r\n")
+    // fix H-3 — strip CR/LF from the CSP value before embedding it in a header.
+    let safe_csp = sanitize_header_value(csp);
+    let csp_line = if is_html && !safe_csp.is_empty() {
+        format!("Content-Security-Policy: {safe_csp}\r\n")
     } else {
         String::new()
     };
+    let cd_line =
+        content_disposition.map_or_else(String::new, |cd| format!("Content-Disposition: {cd}\r\n"));
 
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {content_length}\r\n\
          Connection: close\r\n\
+         Cache-Control: no-store\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: SAMEORIGIN\r\n\
+         Referrer-Policy: no-referrer\r\n\
+         Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n\
+         {cd_line}\
+         {csp_line}\
+         \r\n"
+    );
+    stream.write_all(header.as_bytes()).await?;
+    Ok(())
+}
+
+/// Write a 301 redirect with all security headers (fix H-9).
+///
+/// Previously the redirect arm constructed its own raw header string, bypassing
+/// `write_headers` entirely. This meant the 301 carried none of the security
+/// headers — critically missing `Referrer-Policy: no-referrer`, which would
+/// leak the .onion address to the redirect destination as a Referer header.
+async fn write_redirect(
+    stream: &mut TcpStream,
+    location: &str,
+    body_len: u64,
+    csp: &str,
+) -> Result<()> {
+    let safe_csp = sanitize_header_value(csp);
+    let csp_line = if safe_csp.is_empty() {
+        String::new()
+    } else {
+        format!("Content-Security-Policy: {safe_csp}\r\n")
+    };
+    let header = format!(
+        "HTTP/1.1 301 Moved Permanently\r\n\
+         Location: {location}\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {body_len}\r\n\
+         Connection: close\r\n\
+         Cache-Control: no-store\r\n\
          X-Content-Type-Options: nosniff\r\n\
          X-Frame-Options: SAMEORIGIN\r\n\
          Referrer-Policy: no-referrer\r\n\
@@ -546,21 +695,33 @@ async fn write_headers(
 
 // ─── Directory listing ───────────────────────────────────────────────────────
 
-fn build_directory_listing(dir: &Path, url_path: &str) -> String {
+fn build_directory_listing(dir: &Path, url_path: &str, expose_dotfiles: bool) -> String {
     let mut items = String::new();
 
     if let Ok(entries) = std::fs::read_dir(dir) {
         let mut names: Vec<String> = entries
             .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
+            .filter_map(|e| {
+                let name = e.file_name().into_string().ok()?;
+                // fix H-10 — hide dot-files (e.g. .git, .env, .htpasswd) by default.
+                // These are almost always unintentional and can expose credentials or
+                // full repository history to anyone with directory listing enabled.
+                if expose_dotfiles || !name.starts_with('.') {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
             .collect();
         names.sort();
 
-        let base = url_path.trim_end_matches('/');
+        // fix H-8 — html_escape(base) prevents XSS via a crafted directory name
+        // containing characters like `"` or `>` that would break the href attribute
+        // context.  Without escaping, a directory named `"onmouseover=alert(1)/`
+        // produces a raw href that executes JavaScript in the .onion origin.
+        let base = html_escape(url_path.trim_end_matches('/'));
         for name in &names {
-            // 1.3 — Percent-encode the filename for the href attribute.
             let encoded_name = percent_encode_path(name);
-            // 1.3 — HTML-entity-escape the filename for the visible link text.
             let escaped_name = html_escape(name);
             let _ = writeln!(
                 items,
@@ -569,7 +730,6 @@ fn build_directory_listing(dir: &Path, url_path: &str) -> String {
         }
     }
 
-    // 1.3 — Also escape url_path when used in page title / heading.
     let escaped_path = html_escape(url_path);
     format!(
         r#"<!DOCTYPE html>
@@ -656,6 +816,9 @@ pub(crate) fn percent_decode(input: &str) -> String {
 
     while i < src.len() {
         if src.get(i).copied() == Some(b'%') {
+            // fix H-7 / clippy::integer_arithmetic — use saturating arithmetic
+            // throughout; the loop guard ensures these never actually saturate,
+            // but the lint requires every addition to be explicitly guarded.
             let h1 = src.get(i.saturating_add(1)).copied().and_then(hex_digit);
             let h2 = src.get(i.saturating_add(2)).copied().and_then(hex_digit);
             if let (Some(hi), Some(lo)) = (h1, h2) {
@@ -676,7 +839,6 @@ pub(crate) fn percent_decode(input: &str) -> String {
             }
         } else {
             flush_byte_buf(&mut byte_buf, &mut output);
-            // Advance by one full UTF-8 character so we never split a scalar.
             let ch = input
                 .get(i..)
                 .and_then(|s| s.chars().next())
@@ -794,7 +956,7 @@ mod tests {
     #[test]
     fn resolve_path_happy_path() {
         let (_tmp, root) = make_test_tree();
-        let result = resolve_path(&root, "/index.html", "index.html", false);
+        let result = resolve_path(&root, "/index.html", "index.html", false, false);
         assert!(
             matches!(result, Resolved::File(_)),
             "expected Resolved::File, got {result:?}"
@@ -809,7 +971,7 @@ mod tests {
         // canonicalize() resolves `<root>/../secret.txt` → `<tmp>/secret.txt`
         // which is a real file, but it does NOT start_with `root` → Forbidden.
         let _ = tmp; // keep alive so secret.txt exists for canonicalize
-        let result = resolve_path(&root, "/../secret.txt", "index.html", false);
+        let result = resolve_path(&root, "/../secret.txt", "index.html", false, false);
         assert_eq!(
             result,
             Resolved::Forbidden,
@@ -824,14 +986,14 @@ mod tests {
         let (tmp, root) = make_test_tree();
         let decoded = super::percent_decode("/../secret.txt"); // already decoded form
         let _ = tmp;
-        let result = resolve_path(&root, &decoded, "index.html", false);
+        let result = resolve_path(&root, &decoded, "index.html", false, false);
         assert_eq!(result, Resolved::Forbidden);
     }
 
     #[test]
     fn resolve_path_missing_file_returns_not_found() {
         let (_tmp, root) = make_test_tree();
-        let result = resolve_path(&root, "/does_not_exist.txt", "index.html", false);
+        let result = resolve_path(&root, "/does_not_exist.txt", "index.html", false, false);
         assert_eq!(result, Resolved::NotFound);
     }
 
@@ -839,7 +1001,7 @@ mod tests {
     fn resolve_path_missing_root_returns_fallback() {
         // Passing a non-existent root means every canonicalize() call fails.
         let missing_root = Path::new("/nonexistent/root/that/does/not/exist");
-        let result = resolve_path(missing_root, "/index.html", "index.html", false);
+        let result = resolve_path(missing_root, "/index.html", "index.html", false, false);
         assert_eq!(result, Resolved::Fallback);
     }
 }

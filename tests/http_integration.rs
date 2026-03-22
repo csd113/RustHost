@@ -325,8 +325,14 @@ async fn get_nonexistent_file_returns_404() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+// fix H-11 — this test previously asserted status 400 for a POST request,
+// which encoded the *incorrect* behaviour (RFC 9110 §15.5.6 requires 405 +
+// Allow header for known-but-disallowed methods).  The old assertion would
+// pass when the bug was present and fail when it was fixed, causing developers
+// to mistakenly revert the H-4 fix to make CI green again.
 #[tokio::test]
-async fn post_request_returns_400() -> Result<(), Box<dyn std::error::Error>> {
+async fn disallowed_method_returns_405_with_allow_header() -> Result<(), Box<dyn std::error::Error>>
+{
     let (tmp, site) = make_site(&[("index.html", b"ok")])?;
     let server = TestServer::start(&site).await?;
 
@@ -338,8 +344,12 @@ async fn post_request_returns_400() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(
         status_code(&response),
-        Some(400),
-        "POST must be rejected with 400:\n{response}"
+        Some(405),
+        "POST must return 405 Method Not Allowed (RFC 9110 §15.5.6):\n{response}"
+    );
+    assert!(
+        has_header(&response, "allow"),
+        "405 response must include Allow header:\n{response}"
     );
     Ok(())
 }

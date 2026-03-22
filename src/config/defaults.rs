@@ -31,14 +31,29 @@ open_browser_on_start = false
 # at the OS TCP backlog level rather than spawning unbounded tasks.
 max_connections = 256
 
-# Content-Security-Policy value sent with every HTML response.
-# The default allows same-origin resources plus inline scripts and styles,
-# which is required for onclick handlers, <style> blocks, and style= attributes.
-# Tighten if your site uses no inline code:
-#   content_security_policy = "default-src 'self'"
-# Relax further for third-party CDN resources:
-#   content_security_policy = "default-src 'self' cdn.example.com; script-src 'self' 'unsafe-inline'"
-content_security_policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+# Content-Security-Policy level.
+#
+# Controls the Content-Security-Policy header sent with every HTML response.
+# Three presets are available:
+#
+#   "off"     — No CSP header is sent (default). The browser uses its own
+#               defaults, which allow same-origin and most cross-origin
+#               resources. Start here; tighten once your site is working.
+#
+#   "relaxed" — Sends: default-src * 'unsafe-inline' 'unsafe-eval' data: blob:
+#               Allows resources from any origin plus inline scripts/styles,
+#               eval, data: URIs, and blob URLs. Use when loading assets from
+#               external CDNs or third-party services.
+#
+#   "strict"  — Sends a same-origin-only policy:
+#               default-src 'self'; script-src 'self' 'unsafe-inline';
+#               style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:;
+#               font-src 'self' data:
+#               Suitable for self-contained sites with no external assets.
+#
+# Note: Referrer-Policy: no-referrer is always sent regardless of this setting,
+# so the .onion address never leaks to third-party origins via the Referer header.
+csp_level = "off"
 
 # ─── [site] ───────────────────────────────────────────────────────────────────
 

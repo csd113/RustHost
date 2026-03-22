@@ -110,8 +110,9 @@ pub async fn run(
     let index_file: Arc<str> = Arc::from(config.site.index_file.as_str());
     // 5.3 — Content-Security-Policy forwarded to every handler so it can be
     //        emitted on HTML responses without a global static.
-    let csp_header: Arc<str> = Arc::from(config.server.content_security_policy.as_str());
+    let csp_header: Arc<str> = Arc::from(config.server.csp_level.as_header_value());
     let dir_list = config.site.enable_directory_listing;
+    let expose_dots = config.site.expose_dotfiles;
 
     let semaphore = Arc::new(Semaphore::new(max_conns));
     // 2.10 — JoinSet tracks in-flight handler tasks so shutdown can drain them.
@@ -147,7 +148,7 @@ pub async fn run(
                         join_set.spawn(async move {
                             let _permit = permit;
                             if let Err(e) = handler::handle(
-                                stream, site, idx, dir_list, met, csp,
+                                stream, site, idx, dir_list, expose_dots, met, csp,
                             ).await {
                                 log::debug!("Handler error: {e}");
                             }
@@ -286,6 +287,13 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
     let mut queue: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
     queue.push_back(site_root.to_path_buf());
 
+    // fix M-1 — track visited inodes to detect and break symlink cycles.
+    // Without cycle detection, a symlink loop (e.g. site/loop -> site/) grows
+    // the BFS queue unboundedly and the function never returns, permanently
+    // consuming a spawn_blocking thread.
+    #[cfg(unix)]
+    let mut visited_inodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
     while let Some(dir) = queue.pop_front() {
         let entries = std::fs::read_dir(&dir).map_err(|e| {
             AppError::Io(std::io::Error::new(
@@ -295,15 +303,39 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
         })?;
 
         for entry in entries.flatten() {
-            match entry.metadata() {
-                Ok(m) if m.is_file() => {
-                    count = count.saturating_add(1);
-                    bytes = bytes.saturating_add(m.len());
+            // fix M-1: use symlink_metadata (does not follow symlinks) to
+            // detect symlinked directories before following them.
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_file() {
+                count = count.saturating_add(1);
+                bytes = bytes.saturating_add(meta.len());
+            } else if meta.is_dir() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    let ino = meta.ino();
+                    if !visited_inodes.insert(ino) {
+                        log::warn!(
+                            "Symlink cycle detected at {} (inode {ino}), skipping",
+                            entry.path().display()
+                        );
+                        continue;
+                    }
                 }
-                Ok(m) if m.is_dir() => {
-                    queue.push_back(entry.path());
+                #[cfg(not(unix))]
+                {
+                    // On non-Unix, skip symlinked directories to avoid cycles.
+                    if let Ok(sym_meta) = entry.path().symlink_metadata() {
+                        if sym_meta.file_type().is_symlink() {
+                            log::warn!(
+                                "Skipping symlinked directory {} (no inode tracking on this platform)",
+                                entry.path().display()
+                            );
+                            continue;
+                        }
+                    }
                 }
-                _ => {}
+                queue.push_back(entry.path());
             }
         }
     }

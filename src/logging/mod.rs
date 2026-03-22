@@ -48,11 +48,61 @@ pub fn recent_lines(limit: usize) -> Vec<String> {
 
 // ─── Logger ──────────────────────────────────────────────────────────────────
 
+/// Maximum log file size before rotation (100 MB).
+///
+/// fix G-2 — without a size cap the log file grows unboundedly.  At INFO level
+/// with modest traffic this reaches ~2.5 GB/year; DEBUG with Arti noise is
+/// orders of magnitude larger.  A full disk silently corrupts Arti's circuit
+/// database and prevents Tor consensus downloads on restart.
+const MAX_LOG_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
+
+/// Wraps the log file handle together with its path so the write path can
+/// rotate the file (rename current → .log.1, open fresh) when it grows large.
+struct LogFile {
+    file: File,
+    path: std::path::PathBuf,
+}
+
+impl LogFile {
+    /// Write `line` to the file, rotating first if the file exceeds [`MAX_LOG_BYTES`].
+    fn write_line(&mut self, line: &str) {
+        // fix G-2 — check size before every write.  On error (e.g. the file
+        // was deleted by logrotate externally) we just write to the current
+        // handle and let the OS sort it out.
+        if let Ok(meta) = self.file.metadata() {
+            if meta.len() >= MAX_LOG_BYTES {
+                let rotated = self.path.with_extension("log.1");
+                // best-effort rename; ignore errors (read-only fs, etc.)
+                let _ = std::fs::rename(&self.path, &rotated);
+                // Re-open with the same restrictive permissions.
+                #[cfg(unix)]
+                let new_file = {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .mode(0o600)
+                        .open(&self.path)
+                };
+                #[cfg(not(unix))]
+                let new_file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path);
+                if let Ok(f) = new_file {
+                    self.file = f;
+                }
+            }
+        }
+        let _ = writeln!(self.file, "{line}");
+    }
+}
+
 struct RustHostLogger {
     max_level: LevelFilter,
     filter_dependencies: bool,
     /// Optional file handle. `None` when `logging.enabled = false`.
-    file: Option<Mutex<File>>,
+    file: Option<Mutex<LogFile>>,
 }
 
 impl Log for RustHostLogger {
@@ -102,16 +152,16 @@ impl Log for RustHostLogger {
 
         // Write to file.
         if let Some(file_mutex) = &self.file {
-            if let Ok(mut f) = file_mutex.lock() {
-                let _ = writeln!(f, "{line}");
+            if let Ok(mut lf) = file_mutex.lock() {
+                lf.write_line(&line);
             }
         }
     }
 
     fn flush(&self) {
         if let Some(file_mutex) = &self.file {
-            if let Ok(mut f) = file_mutex.lock() {
-                let _ = f.flush();
+            if let Ok(mut lf) = file_mutex.lock() {
+                let _ = lf.file.flush();
             }
         }
     }
@@ -144,14 +194,40 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
     LOG_BUFFER.get_or_init(|| Mutex::new(VecDeque::with_capacity(1_000)));
 
     // 4.2 — LogLevel is now a typed enum; convert directly to LevelFilter.
-    //        The duplicate parse_level() helper is no longer needed.
     let max_level: LevelFilter = config.level.into();
 
     let file = if config.enabled {
         let log_path = data_dir.join(&config.file);
+
+        // fix G-1 — restrict the log directory to owner-only (0o700) before
+        // creating the file.  Default umask typically yields 0o755, meaning
+        // any local user on a shared host can read the log and discover the
+        // .onion address that is logged at INFO level on every startup.
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
+
+        // fix G-1 — open with explicit 0o600 mode (owner read/write only).
+        // Without this, OpenOptions inherits the process umask, typically
+        // producing a world-readable 0o644 file.
+        #[cfg(unix)]
+        let f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&log_path)
+                .map_err(|e| {
+                    AppError::LogInit(format!("Cannot open log file {}: {e}", log_path.display()))
+                })?
+        };
+        #[cfg(not(unix))]
         let f = OpenOptions::new()
             .create(true)
             .append(true)
@@ -159,7 +235,13 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
             .map_err(|e| {
                 AppError::LogInit(format!("Cannot open log file {}: {e}", log_path.display()))
             })?;
-        Some(Mutex::new(f))
+
+        // fix G-2 — store the path alongside the file handle so the write
+        // path can rotate the file when it exceeds MAX_LOG_BYTES.
+        Some(Mutex::new(LogFile {
+            file: f,
+            path: log_path,
+        }))
     } else {
         None
     };
