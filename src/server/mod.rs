@@ -17,10 +17,14 @@ pub mod mime;
 use std::{
     net::{IpAddr, TcpListener as StdTcpListener},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
+use dashmap::DashMap;
 use tokio::{
     net::TcpListener,
     sync::{oneshot, watch, Semaphore},
@@ -33,6 +37,181 @@ use crate::{
     AppError, Result,
 };
 
+// ─── Per-IP rate limiting (C-4) ───────────────────────────────────────────────
+
+/// RAII guard that decrements the per-IP counter when dropped.
+///
+/// The guard is moved into each spawned handler task.  When the task
+/// completes — normally or via panic — the `Drop` impl decrements the counter
+/// and removes the map entry when the count reaches zero, preventing unbounded
+/// map growth.
+struct PerIpGuard {
+    counter: Arc<AtomicU32>,
+    map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
+    addr: IpAddr,
+}
+
+impl Drop for PerIpGuard {
+    fn drop(&mut self) {
+        let prev = self.counter.fetch_sub(1, Ordering::Relaxed);
+        // If this was the last connection from this IP, remove the entry.
+        // Keeping zero-count entries would let the map grow without bound on
+        // servers with many distinct client IPs.
+        if prev == 1 {
+            self.map.remove(&self.addr);
+        }
+    }
+}
+
+/// Attempt to acquire a per-IP connection slot using a lock-free CAS loop.
+///
+/// Returns `Ok(guard)` when a slot is available.  The caller moves the guard
+/// into the handler task; `Drop` releases the slot automatically.
+///
+/// Returns `Err(())` when `addr` already holds `limit` connections.  The
+/// caller should drop the `TcpStream` without writing any HTTP response —
+/// the OS-level TCP RST is intentional: it signals rejection at near-zero
+/// cost compared to sending a `503 Service Unavailable` body.
+fn try_acquire_per_ip(
+    map: &Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
+    addr: IpAddr,
+    limit: u32,
+) -> std::result::Result<PerIpGuard, ()> {
+    // `or_insert_with` holds the DashMap shard lock only for the duration of
+    // the closure, which is shorter than holding it across the CAS loop.
+    let counter = Arc::clone(
+        map.entry(addr)
+            .or_insert_with(|| Arc::new(AtomicU32::new(0)))
+            .value(),
+    );
+
+    // Lock-free increment: loop until CAS succeeds or limit is exceeded.
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current >= limit {
+            return Err(());
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current.saturating_add(1),
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                return Ok(PerIpGuard {
+                    counter,
+                    map: Arc::clone(map),
+                    addr,
+                });
+            }
+            Err(updated) => current = updated,
+        }
+    }
+}
+
+// ─── Server context ───────────────────────────────────────────────────────────
+
+/// Shared references prepared once before the accept loop starts.
+///
+/// Extracting these into a struct keeps [`run`] under the 100-line limit
+/// imposed by `clippy::nursery::too_many_lines` while grouping the values
+/// that every spawned handler task needs.
+struct ServerContext {
+    canonical_root: Arc<Path>,
+    index_file: Arc<str>,
+    csp_header: Arc<str>,
+    dir_list: bool,
+    expose_dots: bool,
+    semaphore: Arc<Semaphore>,
+    per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
+    max_conns: usize,
+    max_per_ip: u32,
+}
+
+impl ServerContext {
+    /// Resolve `site_root` and build all shared state needed by the accept loop.
+    ///
+    /// Returns `None` and logs an error if the site root cannot be canonicalized.
+    fn new(config: &Config, data_dir: &Path) -> Option<Self> {
+        let site_root = data_dir.join(&config.site.directory);
+        let canonical_root: Arc<Path> = match site_root.canonicalize() {
+            Ok(p) => Arc::from(p.as_path()),
+            Err(e) => {
+                log::error!(
+                    "Site root {} cannot be resolved: {e}. \
+                     Check that [site] directory exists.",
+                    site_root.display()
+                );
+                return None;
+            }
+        };
+        // `u32 as usize`: usize ≥ 32 bits on every supported target, so this
+        // cast is always lossless.
+        #[allow(clippy::cast_possible_truncation)]
+        let max_conns = config.server.max_connections as usize;
+        Some(Self {
+            canonical_root,
+            index_file: Arc::from(config.site.index_file.as_str()),
+            csp_header: Arc::from(config.server.csp_level.as_header_value()),
+            dir_list: config.site.enable_directory_listing,
+            expose_dots: config.site.expose_dotfiles,
+            semaphore: Arc::new(Semaphore::new(max_conns)),
+            per_ip_map: Arc::new(DashMap::new()),
+            max_conns,
+            max_per_ip: config.server.max_connections_per_ip,
+        })
+    }
+
+    /// Attempt to spawn a handler task for one accepted connection.
+    ///
+    /// Returns `false` when the global semaphore has been closed (shutdown),
+    /// `true` in all other cases (connection accepted, rejected, or dropped).
+    async fn spawn_connection(
+        &self,
+        stream: tokio::net::TcpStream,
+        peer: std::net::SocketAddr,
+        metrics: &SharedMetrics,
+        join_set: &mut JoinSet<()>,
+    ) -> bool {
+        let peer_ip = peer.ip();
+        let Ok(ip_guard) = try_acquire_per_ip(&self.per_ip_map, peer_ip, self.max_per_ip) else {
+            log::warn!(
+                "Per-IP limit ({}) reached for {peer_ip}; dropping connection",
+                self.max_per_ip
+            );
+            drop(stream);
+            return true;
+        };
+
+        let Ok(permit) = Arc::clone(&self.semaphore).acquire_owned().await else {
+            return false; // semaphore closed — signal shutdown to caller
+        };
+        if self.semaphore.available_permits() == 0 {
+            log::warn!(
+                "Connection limit ({}) reached; further connections will queue",
+                self.max_conns
+            );
+        }
+
+        let site = Arc::clone(&self.canonical_root);
+        let idx = Arc::clone(&self.index_file);
+        let met = Arc::clone(metrics);
+        let csp = Arc::clone(&self.csp_header);
+        let dir_list = self.dir_list;
+        let expose_dots = self.expose_dots;
+        join_set.spawn(async move {
+            let _permit = permit;
+            let _ip_guard = ip_guard;
+            if let Err(e) =
+                handler::handle(stream, site, idx, dir_list, expose_dots, met, csp).await
+            {
+                log::debug!("Handler error: {e}");
+            }
+        });
+        true
+    }
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /// Start the HTTP server.
@@ -41,7 +220,7 @@ use crate::{
 /// sends the bound port through `port_tx` so Tor can start without a sleep,
 /// then accepts connections until the shutdown watch fires.
 ///
-/// ## Accept-loop observability (task 5.4)
+/// ## Accept-loop observability
 ///
 /// Accept errors use exponential backoff (1 ms → 1 s) to prevent log storms
 /// under persistent failures such as `EMFILE`.  Error severity is split:
@@ -59,68 +238,31 @@ pub async fn run(
     port_tx: oneshot::Sender<u16>,
 ) {
     let bind_addr = config.server.bind;
-    // 4.2 — config.server.port is NonZeroU16; .get() produces the u16 value.
     let base_port = config.server.port.get();
-    let fallback = config.server.auto_port_fallback;
-    // `u32 as usize`: usize ≥ 32 bits on every target Rust supports, so this
-    // conversion is lossless.  The allow suppresses clippy::cast_possible_truncation.
-    #[allow(clippy::cast_possible_truncation)]
-    let max_conns = config.server.max_connections as usize;
 
-    let (listener, bound_port) = match bind_with_fallback(bind_addr, base_port, fallback) {
-        Ok(v) => v,
-        Err(e) => {
-            log::error!("Server failed to bind: {e}");
-            // port_tx is dropped here, which closes the channel; lifecycle
-            // will receive an Err from the oneshot receiver.
-            return;
-        }
-    };
-
+    let (listener, bound_port) =
+        match bind_with_fallback(bind_addr, base_port, config.server.auto_port_fallback) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("Server failed to bind: {e}");
+                return;
+            }
+        };
     if bound_port != base_port {
         log::warn!("Configured port {base_port} was in use; bound to {bound_port} instead.");
     }
-
     {
         let mut s = state.write().await;
         s.actual_port = bound_port;
         s.server_running = true;
     }
-
-    // Signal the bound port to lifecycle so Tor can start immediately.
     let _ = port_tx.send(bound_port);
-
     log::info!("HTTP server listening on {bind_addr}:{bound_port}");
 
-    let site_root = data_dir.join(&config.site.directory);
-    // 2.3 — canonicalize once here so resolve_path never calls canonicalize()
-    // per-request. If the root is missing or inaccessible, fail fast.
-    // 3.2 — Wrap in Arc<Path> so per-connection clones are O(1) refcount bumps.
-    let canonical_root: Arc<Path> = match site_root.canonicalize() {
-        Ok(p) => Arc::from(p.as_path()),
-        Err(e) => {
-            log::error!(
-                "Site root {} cannot be resolved: {e}. Check that [site] directory exists.",
-                site_root.display()
-            );
-            return;
-        }
+    let Some(ctx) = ServerContext::new(&config, &data_dir) else {
+        return;
     };
-    // 3.2 — Arc<str>: per-connection clone is an atomic refcount bump.
-    let index_file: Arc<str> = Arc::from(config.site.index_file.as_str());
-    // 5.3 — Content-Security-Policy forwarded to every handler so it can be
-    //        emitted on HTML responses without a global static.
-    let csp_header: Arc<str> = Arc::from(config.server.csp_level.as_header_value());
-    let dir_list = config.site.enable_directory_listing;
-    let expose_dots = config.site.expose_dotfiles;
-
-    let semaphore = Arc::new(Semaphore::new(max_conns));
-    // 2.10 — JoinSet tracks in-flight handler tasks so shutdown can drain them.
     let mut join_set: JoinSet<()> = JoinSet::new();
-
-    // 5.4 — Exponential backoff on accept errors.
-    // Starts at 1 ms, doubles on each consecutive error, caps at 1 s.
-    // Reset to 1 ms after the next successful accept.
     let mut backoff_ms: u64 = 1;
 
     loop {
@@ -128,34 +270,13 @@ pub async fn run(
             result = listener.accept() => {
                 match result {
                     Ok((stream, peer)) => {
-                        // 5.4 — reset backoff after a successful accept.
                         backoff_ms = 1;
-
                         log::debug!("Connection from {peer}");
-                        let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
+                        if !ctx.spawn_connection(stream, peer, &metrics, &mut join_set).await {
                             break; // semaphore closed — shutting down
-                        };
-                        if semaphore.available_permits() == 0 {
-                            log::warn!(
-                                "Connection limit ({max_conns}) reached; \
-                                 further connections will queue"
-                            );
                         }
-                        let site = Arc::clone(&canonical_root);
-                        let idx  = Arc::clone(&index_file);
-                        let met  = Arc::clone(&metrics);
-                        let csp  = Arc::clone(&csp_header);
-                        join_set.spawn(async move {
-                            let _permit = permit;
-                            if let Err(e) = handler::handle(
-                                stream, site, idx, dir_list, expose_dots, met, csp,
-                            ).await {
-                                log::debug!("Handler error: {e}");
-                            }
-                        });
                     }
                     Err(e) => {
-                        // 5.4 — differentiate error severity.
                         if is_fd_exhaustion(&e) {
                             log::error!(
                                 "Accept error — file-descriptor limit reached \
@@ -165,16 +286,11 @@ pub async fn run(
                         } else {
                             log::debug!("Accept error (transient): {e}");
                         }
-
-                        // 5.4 — exponential backoff: prevents log storms under
-                        // persistent errors such as EMFILE (thousands of errors
-                        // per second in a tight loop become at most one per 1 s).
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                         backoff_ms = backoff_ms.saturating_mul(2).min(1_000);
                     }
                 }
             }
-
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { break; }
             }
@@ -183,8 +299,6 @@ pub async fn run(
 
     state.write().await.server_running = false;
     log::info!("HTTP server stopped accepting; draining in-flight connections…");
-
-    // 2.10 — wait up to 5 seconds for in-flight handlers to complete.
     let drain = async { while join_set.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
     log::info!("HTTP server drained.");
@@ -295,12 +409,15 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
     let mut visited_inodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     while let Some(dir) = queue.pop_front() {
-        let entries = std::fs::read_dir(&dir).map_err(|e| {
-            AppError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Cannot read directory {}: {e}", dir.display()),
-            ))
-        })?;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) => {
+                // Skip unreadable directories with a per-directory warning.
+                // Do NOT abort the entire scan — the rest of the tree may be readable.
+                log::warn!("Skipping unreadable directory {}: {e}", dir.display());
+                continue;
+            }
+        };
 
         for entry in entries.flatten() {
             // fix M-1: use symlink_metadata (does not follow symlinks) to
