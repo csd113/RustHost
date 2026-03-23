@@ -1027,7 +1027,7 @@ fn percent_encode_path(s: &str) -> String {
 /// The function signature is unchanged from the previous hand-rolled version
 /// so all call sites compile without modification.
 #[must_use]
-pub(crate) fn percent_decode(input: &str) -> String {
+pub fn percent_decode(input: &str) -> String {
     use percent_encoding::percent_decode_str;
 
     percent_decode_str(input)

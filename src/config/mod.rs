@@ -47,7 +47,6 @@ impl From<LogLevel> for LevelFilter {
 ///
 /// Replaces the post-parse `.parse::<IpAddr>()` check in `loader.rs` with a
 /// parse-time error so an invalid IP is caught the moment the file is read
-/// (fix 4.2).
 fn deserialize_ip_addr<'de, D: Deserializer<'de>>(d: D) -> Result<IpAddr, D::Error> {
     let s = String::deserialize(d)?;
     s.parse().map_err(serde::de::Error::custom)
@@ -118,9 +117,6 @@ impl CspLevel {
 
 /// A single URL redirect or rewrite rule, matched before filesystem resolution.
 ///
-/// Addresses M-13 — allows operators to declare redirects in `settings.toml`
-/// without modifying server code.
-///
 /// Example `settings.toml` entry:
 /// ```toml
 /// [[redirects]]
@@ -164,11 +160,11 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Non-zero port number.  `NonZeroU16` prevents port 0 at the type level:
-    /// serde rejects a zero value during deserialisation (fix 4.2).
+    /// serde rejects a zero value during deserialisation.
     pub port: NonZeroU16,
 
     /// Network interface to bind to.  Parsed from TOML string at load time;
-    /// an invalid IP address is rejected immediately (fix 4.2).
+    /// an invalid IP address is rejected immediately.
     #[serde(
         deserialize_with = "deserialize_ip_addr",
         serialize_with = "serialize_ip_addr"
@@ -181,7 +177,7 @@ pub struct ServerConfig {
 
     /// Maximum concurrent connections from a single IP address.
     ///
-    /// Prevents a single client from monopolising the connection pool (C-4).
+    /// Prevents a single client from monopolising the connection pool.
     /// When the limit is reached the connection is dropped at the TCP level —
     /// the OS sends a RST so no HTTP overhead is incurred.
     ///
@@ -214,7 +210,7 @@ pub struct SiteConfig {
     pub enable_directory_listing: bool,
     /// When `true`, directory listings and direct requests expose dot-files
     /// (e.g. `.git/`, `.env`).  Defaults to `false` so hidden files are not
-    /// accidentally served (fix H-10).
+    /// accidentally served.
     #[serde(default)]
     pub expose_dotfiles: bool,
 
@@ -234,7 +230,7 @@ pub struct SiteConfig {
 
     /// Optional custom 500/503 page path, relative to the site directory.
     /// Served with status 503 when the server cannot fulfil the request due
-    /// to internal errors.  Addresses H-10.
+    /// to internal errors.
     #[serde(default)]
     pub error_503: Option<String>,
 }

@@ -16,7 +16,7 @@ pub mod state;
 /// Open `url` in the system default browser.
 ///
 /// Single canonical definition extracted from `lifecycle.rs` and `events.rs`
-/// to eliminate the duplicated function (fix 2.4). Any future fix — URL
+/// to eliminate the duplicated function. Any future improvement — URL
 /// sanitisation, logging, sandboxing — needs to be applied here only.
 ///
 /// Phase 2 (H-7): spawn errors are now logged at `warn` level rather than

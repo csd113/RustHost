@@ -415,6 +415,13 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 
 // ─── Site scanner ─────────────────────────────────────────────────────────────
 
+/// Maximum directory depth `scan_site` will traverse.
+///
+/// Prevents runaway BFS on artificially deep or adversarially-constructed
+/// directory trees.  A legitimate site tree is extremely unlikely to exceed
+/// this depth; anything beyond it is almost certainly a mistake or an attack.
+const MAX_SCAN_DEPTH: usize = 64;
+
 /// Recursively count files and total bytes in `site_root` (BFS traversal).
 ///
 /// Returns `Err` if any `read_dir` call fails so callers can log a warning
@@ -434,17 +441,30 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
     let mut count = 0u32;
     let mut bytes = 0u64;
 
-    let mut queue: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
-    queue.push_back(site_root.to_path_buf());
+    // Queue entries carry a depth counter so the BFS can be bounded.
+    // Using (PathBuf, usize) instead of PathBuf adds one word per queue entry —
+    // negligible compared to the path allocation — and avoids a separate counter
+    // map or recursive call stack.
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = std::collections::VecDeque::new();
+    queue.push_back((site_root.to_path_buf(), 0));
 
-    // fix M-1 — track visited inodes to detect and break symlink cycles.
-    // Without cycle detection, a symlink loop (e.g. site/loop -> site/) grows
-    // the BFS queue unboundedly and the function never returns, permanently
+    // Track visited inodes to detect and break symlink cycles.
+    // Without cycle detection a directory symlink loop (e.g. site/loop -> site/)
+    // grows the BFS queue unboundedly and the function never returns, permanently
     // consuming a spawn_blocking thread.
     #[cfg(unix)]
     let mut visited_inodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
-    while let Some(dir) = queue.pop_front() {
+    while let Some((dir, depth)) = queue.pop_front() {
+        // Depth-bound check — emit a warning and skip rather than abort or panic.
+        if depth >= MAX_SCAN_DEPTH {
+            log::warn!(
+                "scan_site: depth limit ({MAX_SCAN_DEPTH}) reached at {};                  subdirectories below this point will not be counted",
+                dir.display()
+            );
+            continue;
+        }
+
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) => {
@@ -456,8 +476,8 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
         };
 
         for entry in entries.flatten() {
-            // fix M-1: use symlink_metadata (does not follow symlinks) to
-            // detect symlinked directories before following them.
+            // Use symlink_metadata (does not follow symlinks) to detect symlinked
+            // directories before following them into potential cycles.
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_file() {
                 count = count.saturating_add(1);
@@ -488,7 +508,7 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
                         }
                     }
                 }
-                queue.push_back(entry.path());
+                queue.push_back((entry.path(), depth.saturating_add(1)));
             }
         }
     }

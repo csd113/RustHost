@@ -124,7 +124,7 @@ async fn render(
     // a second time inside the Dashboard branch to read the full state snapshot.
     // The two-lock pattern is a TOCTOU hazard — `console_mode` could change
     // between the first and second acquire — and also holds the lock for longer
-    // than necessary (fix M-3).
+    // than necessary.
     let (mode, state_snapshot) = {
         let s = state.read().await;
         (s.console_mode.clone(), s.clone())

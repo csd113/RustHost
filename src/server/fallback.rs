@@ -8,7 +8,7 @@
 
 /// HTML content of the built-in "no content" page.
 ///
-/// fix S-2 — the previous version named `RustHost` explicitly, allowing
+/// the previous version named `RustHost` explicitly, allowing
 /// adversaries scanning the Tor network to fingerprint the software and look up
 /// version-specific CVEs.  A generic message gives away nothing about the
 /// implementation.  The HTTP status is also changed to 503 (see `handler.rs`

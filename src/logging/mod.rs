@@ -174,10 +174,10 @@ const ROTATION_CHECK_INTERVAL: u64 = 100;
 
 /// Maximum log file size before rotation (100 MB).
 ///
-/// fix G-2 — without a size cap the log file grows unboundedly.  At INFO level
-/// with modest traffic this reaches ~2.5 GB/year; DEBUG with Arti noise is
-/// orders of magnitude larger.  A full disk silently corrupts Arti's circuit
-/// database and prevents Tor consensus downloads on restart.
+/// Without a size cap the log file grows unboundedly — at INFO level with modest
+/// traffic this reaches ~2.5 GB/year; DEBUG with Arti noise is orders of magnitude
+/// larger.  A full disk silently corrupts Arti's circuit database and prevents
+/// Tor consensus downloads on restart.
 const MAX_LOG_BYTES: u64 = 100 * 1024 * 1024; // 100 MB
 
 /// Wraps the log file handle together with its path so the write path can
@@ -229,12 +229,35 @@ impl LogFile {
         }
     }
 
-    /// Rotate the log file: rename current to `.log.1` and open a fresh file.
+    /// Rotate the log file, keeping up to `MAX_LOG_BACKUPS` numbered copies.
+    ///
+    /// Rotation sequence: `.log.4` is deleted, `.log.3` → `.log.4`, …,
+    /// `.log.1` → `.log.2`, current `.log` → `.log.1`, then a fresh file
+    /// is opened.  All renames are best-effort; errors (read-only filesystem,
+    /// missing backup) are silently ignored so a single rename failure does
+    /// not abort the entire rotation.
     fn rotate(&mut self) {
-        let rotated = self.path.with_extension("log.1");
-        // best-effort rename; ignore errors (read-only fs, etc.)
-        let _ = std::fs::rename(&self.path, &rotated);
-        // Re-open with the same restrictive permissions.
+        const MAX_LOG_BACKUPS: u32 = 5;
+
+        // Delete the oldest backup to make room.
+        let oldest = self.path.with_extension(format!("log.{MAX_LOG_BACKUPS}"));
+        let _ = std::fs::remove_file(&oldest);
+
+        // Shift .log.N → .log.(N+1) from highest to lowest to avoid overwriting.
+        for n in (1..MAX_LOG_BACKUPS).rev() {
+            let from = self.path.with_extension(format!("log.{n}"));
+            let to = self
+                .path
+                .with_extension(format!("log.{}", n.saturating_add(1)));
+            if from.exists() {
+                let _ = std::fs::rename(&from, &to);
+            }
+        }
+
+        // Move the current log to .log.1.
+        let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
+
+        // Re-open a fresh file with the same restrictive permissions.
         #[cfg(unix)]
         let new_file = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -357,10 +380,9 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
     let file = if config.enabled {
         let log_path = data_dir.join(&config.file);
 
-        // fix G-1 — restrict the log directory to owner-only (0o700) before
-        // creating the file.  Default umask typically yields 0o755, meaning
-        // any local user on a shared host can read the log and discover the
-        // .onion address that is logged at INFO level on every startup.
+        // Restrict the log directory to owner-only (0o700) before creating the
+        // file — the default umask typically yields 0o755, meaning any local user
+        // on a shared host can read the log and discover the .onion address.
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent)?;
             #[cfg(unix)]
@@ -392,9 +414,9 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
             }
         }
 
-        // fix G-1 — open with explicit 0o600 mode (owner read/write only).
-        // Without this, OpenOptions inherits the process umask, typically
-        // producing a world-readable 0o644 file.
+        // Open with owner-only 0o600 permissions — without an explicit mode,
+        // OpenOptions inherits the process umask, typically yielding a world-
+        // readable 0o644 file.
         #[cfg(unix)]
         let f = {
             use std::os::unix::fs::OpenOptionsExt;
@@ -416,8 +438,8 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
                 AppError::LogInit(format!("Cannot open log file {}: {e}", log_path.display()))
             })?;
 
-        // fix G-2 — store the path alongside the file handle so the write
-        // path can rotate the file when it exceeds MAX_LOG_BYTES.
+        // Store the path alongside the file handle so the write path can
+        // rotate the file when it exceeds MAX_LOG_BYTES.
         Some(Mutex::new(LogFile {
             file: f,
             path: log_path,

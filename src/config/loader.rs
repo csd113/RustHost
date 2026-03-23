@@ -34,12 +34,12 @@ fn validate(cfg: &Config) -> Result<()> {
     // bind: IpAddr     — invalid IPs are already rejected by serde at parse time (4.2).
     // level: LogLevel  — invalid levels are already rejected by serde at parse time (4.2).
 
-    // fix C-1 — a free-form CSP string with embedded CR/LF could inject
+    // a free-form CSP string with embedded CR/LF could inject
     // arbitrary headers.  The field is now a typed `CspLevel` enum so serde
     // rejects any value that isn't "off", "relaxed", or "strict" at parse time;
     // no runtime check is needed here.
 
-    // fix C-2 — max_connections = 0 deadlocks (semaphore never grants permits);
+    // max_connections = 0 deadlocks (semaphore never grants permits);
     // very large values defeat the connection limit entirely.
     if cfg.server.max_connections == 0 {
         errors.push("[server] max_connections must be at least 1".into());

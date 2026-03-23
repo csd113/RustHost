@@ -162,10 +162,9 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
 /// Compute the default data directory (`<exe-dir>/rusthost-data/`).
 /// Compute the default data directory (`<exe-dir>/rusthost-data/`).
 ///
-/// fix L-1 — if `current_exe()` fails (deleted binary, unusual OS, restricted
-/// environment) we previously fell back silently to `./rusthost-data`, hiding
-/// the misconfiguration.  Now we emit a visible warning so operators know the
-/// key material and site files landed somewhere unexpected.
+/// If `current_exe()` fails (deleted binary, unusual OS, restricted environment)
+/// we fall back to `./rusthost-data` and emit a visible warning so operators
+/// know the key material and site files may have landed somewhere unexpected.
 fn default_data_dir() -> PathBuf {
     match std::env::current_exe() {
         Ok(exe) => exe.parent().map_or_else(
@@ -305,14 +304,14 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
 
     // 8. Start Tor (if enabled).
     //    tor::init() spawns a Tokio task and returns its JoinHandle.
-    //    fix 3.1  — we store the handle and await it during shutdown so active
-    //               Tor circuits get a chance to close cleanly (max 5 s).
-    //    fix 3.6  — pass config.server.bind so the local proxy connect uses the
-    //               correct loopback address (e.g. ::1 on IPv6-only machines).
-    //    2.10 — pass shutdown_rx so Tor's stream loop exits on clean shutdown.
+    //    Store the JoinHandle and await it during shutdown so active Tor circuits
+    //    get a chance to close cleanly (max 5 s).
+    //    Pass config.server.bind so the local proxy connect uses the correct
+    //    loopback address (e.g. ::1 on IPv6-only machines).
+    //    Pass shutdown_rx so Tor's stream loop exits on clean shutdown.
     let tor_handle = if config.tor.enabled {
-        // fix T-2 — pass max_connections so the Tor semaphore is sized
-        // identically to the HTTP server connection limit.
+        // Pass max_connections so the Tor semaphore is sized identically to
+        // the HTTP server connection limit.
         let max_tor = config.server.max_connections as usize;
         Some(tor::init(
             data_dir.clone(),
@@ -332,9 +331,9 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     // 10. Open browser (if configured).
     if config.server.open_browser_on_start {
         let port = state.read().await.actual_port;
-        // fix S-1 — use the actual bind address instead of hardcoding "localhost".
-        // If bind = "::1" and localhost resolves to 127.0.0.1, the browser
-        // tries the wrong interface.  Format IPv6 with brackets.
+        // Use the actual bind address instead of hardcoding "localhost".
+        // If bind = "::1" and localhost resolves to 127.0.0.1 the browser
+        // would try the wrong interface — format IPv6 with brackets.
         let url = match config.server.bind {
             std::net::IpAddr::V4(a) if a.is_unspecified() => {
                 format!("http://127.0.0.1:{port}")
@@ -437,7 +436,7 @@ async fn graceful_shutdown(
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Spawn the HTTP server task and return its `JoinHandle` so the shutdown
-/// sequence can await the connection drain (fix 2.10).
+/// sequence can await the connection drain.
 ///
 /// Returns the `JoinHandle` and the `watch::Sender` used to push a new
 /// `canonical_root` to the accept loop when the operator presses `[R]`.

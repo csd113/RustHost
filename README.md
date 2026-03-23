@@ -9,7 +9,8 @@
 
 <div align="center">
 
-**A self-contained static file server with first-class Tor onion service support — no binaries, no `torrc`, no compromise.**
+**A single-binary static file server with built-in Tor onion service support.**
+No daemons. No config files outside this project. No compromise.
 
 [![Rust](https://img.shields.io/badge/rust-1.86%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
@@ -23,13 +24,15 @@
 
 ## What is RustHost?
 
-RustHost is a single-binary static file server that brings your content to the clearnet **and** the Tor network simultaneously — with zero external dependencies. Tor is embedded directly into the process via [Arti](https://gitlab.torproject.org/tpo/core/arti), the official Rust Tor implementation. No `tor` daemon, no `torrc`, no system configuration required.
+RustHost is a static file server — you give it a folder of HTML, CSS, and JavaScript files, and it serves them over HTTP. What makes it different is that it also puts your site on the **Tor network** automatically, giving every site a `.onion` address right alongside the normal `localhost` one.
 
-Drop the binary next to your site files, run it once, and you get:
+It's a single binary with Tor baked in. No installing a separate Tor program, no editing system config files.
 
-- A local HTTP server ready for immediate use
-- A stable `.onion` v3 address that survives restarts
-- A live terminal dashboard showing you everything at a glance
+**Who is it for?** Developers who want a quick local server with privacy features, self-hosters who want their sites reachable over Tor, and anyone who wants to run a personal site without touching system-level config.
+
+---
+
+## What it looks like
 
 ```
 ┌─ RustHost ─────────────────────────────────────────────────────────┐
@@ -47,185 +50,251 @@ Drop the binary next to your site files, run it once, and you get:
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-![rystgit](https://github.com/user-attachments/assets/30752d0f-5be2-4c80-b3a2-4fa0530ff3ab)
+![rusthost screenshot](https://github.com/user-attachments/assets/30752d0f-5be2-4c80-b3a2-4fa0530ff3ab)
 
 ---
 
-## Features
+## Key Features
 
-### 🌐 HTTP Server
-- Built directly on `tokio::net::TcpListener` — no HTTP framework dependency
-- Handles `GET` and `HEAD` requests; concurrent connections via per-task Tokio workers
-- **Buffered request reading** via `tokio::io::BufReader` — headers read line-by-line, not byte-by-byte
-- **File streaming** via `tokio::io::copy` — memory per connection is bounded by the socket buffer (~256 KB) regardless of file size
-- **30-second request timeout** (configurable via `request_timeout_secs`); slow or idle connections receive `408 Request Timeout`
-- **Semaphore-based connection limit** (configurable via `max_connections`, default 256) — excess connections queue at the OS backlog level rather than spawning unbounded tasks
-- Percent-decoded URL paths with correct multi-byte UTF-8 handling; null bytes (`%00`) are never decoded
-- Query string & fragment stripping before path resolution
-- **Path traversal protection** — every path verified as a descendant of the site root via `canonicalize` (called once at startup, not per request); escapes rejected with `403 Forbidden`
-- Configurable index file, optional HTML directory listing with fully HTML-escaped and URL-encoded filenames, and a built-in fallback page
-- Automatic port selection if the configured port is busy (up to 10 attempts)
-- Request header cap at 8 KiB; `Content-Type`, `Content-Length`, and `Connection: close` on every response
-- **Security headers on every response**: `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy: no-referrer`, `Permissions-Policy`; configurable `Content-Security-Policy` on HTML responses
-- **HEAD responses** include correct `Content-Length` but no body, as required by RFC 7231 §4.3.2
-- Accept loop uses **exponential backoff** on errors and distinguishes `EMFILE` (operator-level error) from transient errors (`ECONNRESET`, `ECONNABORTED`)
+- **Static file server** — serves HTML, CSS, JS, images, fonts, audio, and video with correct MIME types
+- **Built-in Tor support** — your site gets a stable `.onion` address automatically, no external Tor install needed
+- **Live terminal dashboard** — shows your endpoints, request counts, and logs in a clean full-screen UI
+- **Single binary** — no installer, no runtime dependencies, no system packages to manage
+- **SPA-friendly** — supports React, Vue, and Svelte client-side routing with a fallback-to-`index.html` option
+- **HTTP protocol done right** — keep-alive, `ETag`/conditional GET, range requests, Brotli/Gzip compression
+- **Security headers out of the box** — CSP, HSTS, `X-Content-Type-Options`, `Referrer-Policy`, and more on every response
+- **Rate limiting per IP** — lock-free connection cap prevents a single client from taking down your server
+- **Per-IP connection limits**, request timeouts, path traversal protection, and header injection prevention
+- **Hot reload** — press `[R]` to refresh site stats without restarting
+- **Headless mode** — run it in the background under systemd without the TUI
 
-### 🧅 Tor Onion Service *(fully working)*
-- Embedded via [Arti](https://gitlab.torproject.org/tpo/core/arti) — the official Rust Tor client — in-process, no external daemon
-- Bootstraps to the Tor network in the background; never blocks your server or dashboard
-- **Stable address**: the v3 service keypair is persisted to `rusthost-data/arti_state/`. Delete the directory to rotate to a new address
-- First run fetches ~2 MB of directory data (~30 s); subsequent starts reuse the cache and are up in seconds
-- Onion address computed fully in-process using the v3 spec (SHA3-256 + base32)
-- Each inbound Tor connection is bridged to the local HTTP listener via `tokio::io::copy_bidirectional`
-- **Port synchronised via `oneshot` channel** — the Tor subsystem always receives the actual bound port, eliminating a race condition that could cause silent connection failures
-- **`TorStatus` reflects mid-session failures** — if the onion service stream terminates unexpectedly, the dashboard transitions to `FAILED (reason)` and clears the displayed `.onion` address
-- Participates in **graceful shutdown** — the run loop watches the shutdown signal via `tokio::select!` and exits cleanly
-- Can be disabled entirely with `[tor] enabled = false`
+---
 
-### 🖥️ Interactive Terminal Dashboard
-- Full-screen raw-mode TUI built with [crossterm](https://github.com/crossterm-rs/crossterm) — no TUI framework
-- Three screens, all keyboard-navigable:
+## Why Arti instead of the regular Tor?
 
-  | Key | Screen |
-  |-----|--------|
-  | *(default)* | **Dashboard** — live status, endpoints, site stats, request/error counters |
-  | `L` | **Log view** — last 40 log lines with optional timestamps |
-  | `H` | **Help overlay** — key binding reference |
-  | `R` | Reload site file count & size without restart |
-  | `Q` | Graceful shutdown |
+When most people think of Tor, they think of the `tor` binary — a program written in C that you install separately and talk to via a config file called `torrc`. That works fine, but it means your application depends on an external process you don't control.
 
-- **Skip-on-idle rendering** — the terminal is only written when the rendered output changes, eliminating unnecessary writes on quiet servers
-- `TorStatus::Failed` displays a human-readable reason string (e.g. `FAILED (stream ended)`) rather than a bare error indicator
-- Keyboard input task failure is detected and reported; the process remains killable via Ctrl-C
-- **Terminal fully restored on all exit paths** — panic hook and error handler both call `console::cleanup()` before exiting, ensuring `LeaveAlternateScreen`, `cursor::Show`, and `disable_raw_mode` always run
-- Configurable refresh rate (default 500 ms); headless mode available for `systemd` / piped deployments
+**Arti** is the [official Tor Project rewrite of Tor in Rust](https://gitlab.torproject.org/tpo/core/arti). RustHost uses it as a library — Tor runs *inside* the same process as your server, with no external daemon.
 
-### ⚙️ Configuration
-- TOML file at `rusthost-data/settings.toml`, auto-generated with inline comments on first run
-- Six sections: `[server]`, `[site]`, `[tor]`, `[logging]`, `[console]`, `[identity]`
-- **`#[serde(deny_unknown_fields)]`** on all structs — typos in key names are rejected at startup with a clear error
-- **Typed config fields** — `bind` is `IpAddr`, `log level` is a `LogLevel` enum; invalid values are caught at deserialisation time
-- Startup validation with clear, multi-error messages — nothing starts until config is clean
-- Config and data directory paths overridable via **`--config <path>`** and **`--data-dir <path>`** CLI flags
+Here's a plain-English comparison:
 
-### 📝 Logging
-- Custom `log::Log` implementation; dual output — append-mode log file + in-memory ring buffer (1 000 lines)
-- Ring buffer feeds the dashboard log view with zero file I/O per render tick
-- **Dependency log filtering** — Arti and Tokio internals at `Info` and below are suppressed by default, keeping the log focused on application events (configurable via `filter_dependencies`)
-- Log file explicitly flushed on graceful shutdown
-- Configurable level (`trace` → `error`) and optional full disable for minimal-overhead deployments
+| | Classic `tor` binary | Arti (what RustHost uses) |
+|---|---|---|
+| Language | C | Rust |
+| Memory safety | Manual (prone to CVEs) | Guaranteed by the compiler |
+| Distribution | Separate install required | Compiled into the binary |
+| Config | `torrc` file, separate process | Code-level API, no config file |
+| Maturity | 20+ years, battle-tested | Newer, actively developed |
+| Embeddability | Hard — subprocess + socket | Easy — just a library call |
 
-### 🧪 Testing & CI
-- Unit tests for all security-critical functions: `percent_decode`, `resolve_path`, `validate`, `strip_timestamp`, `hsid_to_onion_address`
-- Integration tests (`tests/http_integration.rs`) covering all HTTP core flows via raw `TcpStream`
-- `cargo deny check` runs in CI, enforcing the SPDX license allowlist and advisory database; `audit.toml` consolidated into `deny.toml`
+**Honest tradeoffs:** Arti is still maturing. Some advanced Tor features (bridges, pluggable transports) are not yet stable in Arti. If you need those, the classic `tor` binary is the right tool. For straightforward onion hosting, Arti works well and gives you a much simpler setup.
+
+The Rust memory-safety guarantee matters here specifically because Tor handles untrusted network traffic. A buffer overflow or use-after-free in a C-based Tor implementation is a real historical risk. With Arti in Rust, that entire class of bug is eliminated by the language.
 
 ---
 
 ## Quick Start
 
-### 1. Build
+> **Need help with prerequisites?** See [SETUP.md](SETUP.md) for step-by-step install instructions.
 
 ```bash
+# 1. Clone and build
 git clone https://github.com/yourname/rusthost
 cd rusthost
 cargo build --release
-```
 
-> **Minimum Rust version: 1.86** (required by `arti-client 0.40`)
+# 2. First run — sets up the data directory and exits
+./target/release/rusthost
 
-### 2. First run — initialise your data directory
-
-```bash
+# 3. Put your files in rusthost-data/site/, then run again
 ./target/release/rusthost
 ```
 
-On first run, RustHost detects that `rusthost-data/settings.toml` is missing, scaffolds the data directory, writes a default config and a placeholder `index.html`, prints a getting-started guide, and exits. Nothing is daemonised yet.
+That's it. Your site is live at `http://localhost:8080`. The `.onion` address appears in the dashboard after about 30 seconds while Tor bootstraps in the background.
 
-```
-rusthost-data/
-├── settings.toml       ← your config (edit freely)
-├── site/
-│   └── index.html      ← placeholder, replace with your files
-├── logs/
-│   └── rusthost.log
-├── arti_cache/         ← Tor directory consensus (auto-managed)
-└── arti_state/         ← your stable .onion keypair (back this up!)
-```
+> **Your stable `.onion` address** is stored in `rusthost-data/arti_state/`. Back this directory up — it contains your keypair. Delete it only if you want a new address.
 
-### 3. Serve
+---
+
+## Full Setup Reference
+
+For detailed install instructions, OS-specific steps, common errors, and how to verify everything is working, see **[SETUP.md](SETUP.md)**.
+
+---
+
+## Usage Examples
+
+### Serve a specific directory without a config file
 
 ```bash
-./target/release/rusthost
+./target/release/rusthost --serve ./my-website
 ```
 
-The dashboard appears. Your site is live on `http://localhost:8080`. Tor bootstraps in the background — your `.onion` address appears in the **Endpoints** panel once ready (~30 s on first run).
+Good for quick one-off serving. Skips first-run setup entirely.
 
-### CLI flags
+### Run with a custom config location
+
+```bash
+./target/release/rusthost --config /etc/rusthost/settings.toml --data-dir /var/rusthost
+```
+
+Useful for running multiple instances or deploying under systemd.
+
+### Run headless (no terminal UI)
+
+Set `interactive = false` in `settings.toml`:
+
+```toml
+[console]
+interactive = false
+```
+
+RustHost will print the URL to stdout and log everything to the log file. Perfect for running as a background service.
+
+### Disable Tor entirely
+
+```toml
+[tor]
+enabled = false
+```
+
+Useful if you just want a fast local HTTP server and don't need the `.onion` address.
+
+### Enable SPA routing (React, Vue, Svelte)
+
+```toml
+[site]
+spa_routing = true
+```
+
+Unknown paths fall back to `index.html` instead of returning 404. This is what client-side routers expect.
+
+---
+
+## All CLI Flags
 
 ```
 rusthost [OPTIONS]
 
 Options:
+  --serve <dir>        Serve a directory directly, no settings.toml needed
   --config <path>      Path to settings.toml (default: rusthost-data/settings.toml)
-  --data-dir <path>    Path to data directory (default: rusthost-data/ next to binary)
+  --data-dir <path>    Path to the data directory (default: ./rusthost-data/)
   --version            Print version and exit
   --help               Print this help and exit
 ```
 
 ---
 
-## Configuration Reference
+## Configuration
+
+The config file lives at `rusthost-data/settings.toml` and is created automatically on first run with comments explaining every option.
 
 ```toml
 [server]
-port                   = 8080
-bind                   = "127.0.0.1"          # set "0.0.0.0" to expose on LAN (logs a warning)
-index_file             = "index.html"
-directory_listing      = false
-auto_port_fallback     = true
-max_connections        = 256                   # semaphore cap on concurrent connections
-request_timeout_secs   = 30                   # seconds before idle connection receives 408
-content_security_policy = "default-src 'self'" # applied to HTML responses only
+port                    = 8080
+bind                    = "127.0.0.1"           # use "0.0.0.0" to expose on your LAN
+index_file              = "index.html"
+directory_listing       = false                 # show file lists for directories
+auto_port_fallback      = true                  # try next port if 8080 is taken
+max_connections         = 256                   # max simultaneous connections
+request_timeout_secs    = 30                    # seconds before an idle connection gets 408
+content_security_policy = "default-src 'self'"  # applied to HTML responses only
 
 [site]
-root = "rusthost-data/site"
+root         = "rusthost-data/site"
+spa_routing  = false                            # set true for React/Vue/Svelte apps
+error_404    = ""                               # path to a custom 404.html
+error_503    = ""                               # path to a custom 503.html
 
 [tor]
-enabled = true                                 # set false to skip Tor entirely
+enabled = true                                  # set false to skip Tor entirely
 
 [logging]
-enabled              = true
-level                = "info"                  # trace | debug | info | warn | error
-path                 = "logs/rusthost.log"
-filter_dependencies  = true                    # suppress Arti/Tokio noise at info and below
+enabled             = true
+level               = "info"                    # trace | debug | info | warn | error
+path                = "logs/rusthost.log"
+filter_dependencies = true                      # suppress Arti/Tokio noise at info level
 
 [console]
-interactive           = true                   # false for systemd / piped deployments
-refresh_ms            = 500                    # minimum 100
+interactive           = true                    # false for systemd / background use
+refresh_ms            = 500
 show_timestamps       = false
 open_browser_on_start = false
 
 [identity]
-name = "RustHost"                              # 1–32 chars, shown in dashboard header
+name = "RustHost"                               # shown in the dashboard header (max 32 chars)
+```
+
+> Typos in key names are caught at startup. If you write `bund = "127.0.0.1"` instead of `bind`, RustHost will tell you exactly which field is unknown and exit before starting.
+
+---
+
+## Project Structure
+
+After first run, your directory will look like this:
+
+```
+rusthost-data/
+├── settings.toml       Your config file — edit this freely
+├── site/               Drop your website files here
+│   └── index.html      Placeholder — replace with your own
+├── logs/
+│   └── rusthost.log    Rotating access and event log (owner-read only)
+├── arti_cache/         Tor directory data — auto-managed, safe to delete
+└── arti_state/         Your .onion keypair — BACK THIS UP
+```
+
+And in the repo:
+
+```
+src/
+├── config/             Config loading and validation
+├── console/            Terminal dashboard (crossterm)
+├── logging/            Log file + in-memory ring buffer
+├── runtime/            Startup, shutdown, and event loop
+├── server/             HTTP server (handler, MIME types, path resolution)
+└── tor/                Arti integration and onion service bridge
 ```
 
 ---
 
 ## Built-in MIME Types
 
-No external dependency. RustHost ships with a handwritten extension map covering:
+RustHost ships a handwritten MIME map — no external lookup or database.
 
 | Category | Extensions |
-|----------|-----------|
+|----------|------------|
 | Text | `html` `htm` `css` `js` `mjs` `txt` `csv` `xml` `md` |
-| Data | `json` `jsonld` `pdf` `wasm` `zip` |
-| Images | `png` `jpg/jpeg` `gif` `webp` `svg` `ico` `bmp` `avif` |
+| Data | `json` `jsonld` `pdf` `wasm` `zip` `ndjson` |
+| Images | `png` `jpg` `jpeg` `gif` `webp` `svg` `ico` `bmp` `avif` |
 | Fonts | `woff` `woff2` `ttf` `otf` |
-| Audio | `mp3` `ogg` `wav` |
+| Audio | `mp3` `ogg` `wav` `opus` `flac` |
 | Video | `mp4` `webm` |
+| 3D | `glb` |
+| PWA | `webmanifest` |
 
-Unknown extensions fall back to `application/octet-stream`.
+Anything not in this list gets `application/octet-stream`.
+
+---
+
+## Security
+
+A quick summary of what RustHost does to keep things safe:
+
+| Threat | What RustHost does |
+|--------|-------------------|
+| Path traversal (e.g. `/../etc/passwd`) | Every path is resolved with `canonicalize` and checked against the site root. Escapes get a `403`. |
+| XSS via crafted filenames in directory listings | Filenames are HTML-escaped in link text and percent-encoded in `href` attributes. |
+| Slow-loris DoS (deliberately slow clients) | 30-second request timeout — connections that don't send headers in time get a `408`. |
+| Connection exhaustion | Semaphore cap at 256 concurrent connections by default. |
+| Header injection | `sanitize_header_value` strips all control characters from values (not just CR/LF). |
+| Large file memory exhaustion | Files are streamed with `tokio::io::copy` — memory per connection is bounded by the socket buffer. |
+| `.onion` address leakage | `Referrer-Policy: no-referrer` prevents your `.onion` URL from appearing in `Referer` headers. |
+| Config typos silently using defaults | `#[serde(deny_unknown_fields)]` on all config structs — unknown keys are a hard startup error. |
+| Terminal injection via instance name | The `name` field is validated against all control characters at startup. |
+
+**Note on RUSTSEC-2023-0071 (RSA Marvin timing attack):** This advisory is acknowledged and suppressed in `deny.toml` with a documented rationale. The `rsa` crate comes in as a transitive dependency of `arti-client` and is used only for *verifying* RSA signatures on Tor directory documents — not for decryption. The Marvin attack requires a decryption oracle, which is not present here.
 
 ---
 
@@ -246,35 +315,21 @@ Unknown extensions fall back to `application/octet-stream`.
                 └─────────────────────────────────────┘
 ```
 
-All subsystems share state through `Arc<RwLock<AppState>>`. Hot-path request and error counters use a separate `Arc<Metrics>` backed by atomics — the HTTP handler **never acquires a lock per request**.
+All subsystems share state through `Arc<RwLock<AppState>>`. Hot-path counters (request counts, error counts) live in a separate `Arc<Metrics>` backed by atomics, so the HTTP handler never acquires a lock per request.
 
-The HTTP server and Tor subsystem share a `tokio::sync::Semaphore` that caps concurrent connections. The bound port is communicated to Tor via a `oneshot` channel before the accept loop begins, eliminating the startup race condition present in earlier versions.
-
-Shutdown is coordinated via a `watch` channel: `[Q]`, `SIGINT`, or `SIGTERM` signals all subsystems simultaneously. In-flight HTTP connections are tracked in a `JoinSet` and given up to 5 seconds to complete. The log file is explicitly flushed before the process exits.
+Shutdown is coordinated via a `watch` channel. `[Q]`, `SIGINT`, and `SIGTERM` all signal every subsystem at the same time. In-flight connections are tracked in a `JoinSet` and given up to 5 seconds to finish before the process exits.
 
 ---
 
-## Security
+## Contributing
 
-| Concern | Mitigation |
-|---------|-----------|
-| Path traversal (requests) | `std::fs::canonicalize` + descendant check per request; `403` on escape |
-| Path traversal (config) | `site.directory` and `logging.file` validated against `..`, absolute paths, and path separators at startup |
-| Directory listing XSS | Filenames HTML-entity-escaped in link text; percent-encoded in `href` attributes |
-| Header overflow | 8 KiB hard cap; oversized requests rejected immediately |
-| Slow-loris DoS | 30-second request timeout; `408` sent on expiry |
-| Connection exhaustion | Semaphore cap (default 256); excess connections queue at OS level |
-| Memory exhaustion (large files) | Files streamed via `tokio::io::copy`; per-connection memory bounded by socket buffer |
-| Bind exposure | Defaults to loopback (`127.0.0.1`); warns loudly on `0.0.0.0` |
-| ANSI/terminal injection | `instance_name` validated against all control characters (`is_control`) at startup |
-| Security response headers | `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy: no-referrer`, `Permissions-Policy`, configurable `Content-Security-Policy` |
-| `.onion` URL leakage | `Referrer-Policy: no-referrer` prevents the `.onion` address from appearing in `Referer` headers sent to third-party resources |
-| Tor port race | Bound port delivered to Tor via `oneshot` channel before accept loop starts |
-| Silent Tor failure | `TorStatus` transitions to `Failed(reason)` and onion address is cleared when the service stream ends |
-| Percent-decode correctness | Multi-byte UTF-8 sequences decoded correctly; null bytes (`%00`) never decoded |
-| Config typos | `#[serde(deny_unknown_fields)]` on all structs |
-| License compliance | `cargo-deny` enforces SPDX allowlist at CI time |
-| [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071) | Suppressed with rationale in `deny.toml`: the `rsa` crate is a transitive dep of `arti-client` used **only** for signature *verification* on Tor directory documents — the Marvin timing attack's threat model (decryption oracle) does not apply |
+Contributions are welcome. A few things worth knowing before you start:
+
+- The lint gates are strict: `clippy::all`, `clippy::pedantic`, and `clippy::nursery`. Run `cargo clippy --all-targets -- -D warnings` before opening a PR.
+- Run the full test suite with `cargo test --all`.
+- All code paths should be covered by the existing tests, or new tests added for anything new.
+- See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, architecture notes, and PR checklist.
+- To report a security issue privately, see [SECURITY.md](SECURITY.md).
 
 ---
 
