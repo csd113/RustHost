@@ -116,6 +116,34 @@ impl CspLevel {
 
 // ─── Config structs ──────────────────────────────────────────────────────────
 
+/// A single URL redirect or rewrite rule, matched before filesystem resolution.
+///
+/// Addresses M-13 — allows operators to declare redirects in `settings.toml`
+/// without modifying server code.
+///
+/// Example `settings.toml` entry:
+/// ```toml
+/// [[redirects]]
+/// from = "/old-page"
+/// to = "/new-page"
+/// status = 301
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedirectRule {
+    /// Source URL path to match (exact match).
+    pub from: String,
+    /// Destination URL (may be a relative path or absolute URL).
+    pub to: String,
+    /// HTTP status code — 301 for permanent, 302 for temporary.
+    #[serde(default = "default_redirect_status")]
+    pub status: u16,
+}
+
+const fn default_redirect_status() -> u16 {
+    301
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -125,6 +153,11 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub console: ConsoleConfig,
     pub identity: IdentityConfig,
+    /// URL redirect/rewrite rules evaluated before filesystem resolution.
+    /// Declared as `[[redirects]]` array-of-tables in `settings.toml`.
+    /// Addresses M-13.
+    #[serde(default)]
+    pub redirects: Vec<RedirectRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,11 +179,31 @@ pub struct ServerConfig {
     pub open_browser_on_start: bool,
     pub max_connections: u32,
 
+    /// Maximum concurrent connections from a single IP address.
+    ///
+    /// Prevents a single client from monopolising the connection pool (C-4).
+    /// When the limit is reached the connection is dropped at the TCP level —
+    /// the OS sends a RST so no HTTP overhead is incurred.
+    ///
+    /// Must be ≥ 1 and ≤ `max_connections`.  Validated in `loader.rs`.
+    /// Defaults to 16, which is generous for browsers (typically 6–8 parallel
+    /// connections) while preventing trivial single-client exhaustion attacks.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: u32,
+
     /// Content-Security-Policy preset.  See [`CspLevel`] for available values
     /// (`"off"`, `"relaxed"`, `"strict"`) and the header each one sends.
     /// Defaults to `"off"` — no CSP header, maximum browser compatibility.
     #[serde(default)]
     pub csp_level: CspLevel,
+}
+
+/// Default per-IP connection limit.
+///
+/// 16 is generous for browsers (6–8 parallel connections per origin) while
+/// making single-client denial-of-service attacks impractical without many IPs.
+const fn default_max_connections_per_ip() -> u32 {
+    16
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +217,26 @@ pub struct SiteConfig {
     /// accidentally served (fix H-10).
     #[serde(default)]
     pub expose_dotfiles: bool,
+
+    /// When `true`, requests for paths that don't match any file are served
+    /// `index.html` (with status 200) instead of a 404.
+    /// Required for single-page applications with client-side routing
+    /// (`React Router`, `Vue Router`, `SvelteKit`, etc.).
+    /// Addresses C-6 — React/Vue/Svelte apps silently 404 without this.
+    #[serde(default)]
+    pub spa_routing: bool,
+
+    /// Optional custom 404 page path, relative to the site directory.
+    /// When set and the file exists, it is served with status 404 for all
+    /// requests that resolve to `NotFound`.  Addresses H-10.
+    #[serde(default)]
+    pub error_404: Option<String>,
+
+    /// Optional custom 500/503 page path, relative to the site directory.
+    /// Served with status 503 when the server cannot fulfil the request due
+    /// to internal errors.  Addresses H-10.
+    #[serde(default)]
+    pub error_503: Option<String>,
 }
 
 /// Controls Tor integration.
@@ -229,6 +302,7 @@ impl Default for Config {
                 auto_port_fallback: true,
                 open_browser_on_start: false,
                 max_connections: 256,
+                max_connections_per_ip: default_max_connections_per_ip(),
                 csp_level: CspLevel::Strict,
             },
             site: SiteConfig {
@@ -236,6 +310,9 @@ impl Default for Config {
                 index_file: "index.html".into(),
                 enable_directory_listing: false,
                 expose_dotfiles: false,
+                spa_routing: false,
+                error_404: None,
+                error_503: None,
             },
             tor: TorConfig { enabled: true },
             logging: LoggingConfig {
@@ -252,6 +329,7 @@ impl Default for Config {
             identity: IdentityConfig {
                 instance_name: "RustHost".into(),
             },
+            redirects: Vec::new(),
         }
     }
 }

@@ -27,6 +27,120 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 
 use crate::{config::LoggingConfig, AppError, Result};
 
+// ─── Structured access log (M-16) ────────────────────────────────────────────
+
+/// An HTTP access log record in Combined Log Format (CLF).
+///
+/// CLF format:
+/// `<host> - - [<time>] "<method> <path> <proto>" <status> <bytes> "<referer>" "<ua>"`
+///
+/// Write one record per request via [`log_access`].  The access log is
+/// separate from the application logger so CLF output has no level/timestamp
+/// prefixes and can be consumed by standard log-analysis tools (e.g. `GoAccess`, `AWStats`).
+pub struct AccessRecord<'a> {
+    pub remote_addr: std::net::IpAddr,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub protocol: &'a str,
+    pub status: u16,
+    pub bytes_sent: u64,
+    pub user_agent: Option<&'a str>,
+    pub referer: Option<&'a str>,
+}
+
+impl std::fmt::Display for AccessRecord<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let now = chrono::Local::now().format("%d/%b/%Y:%H:%M:%S %z");
+        let ua = self.user_agent.unwrap_or("-");
+        let referer = self.referer.unwrap_or("-");
+        write!(
+            f,
+            "{} - - [{now}] \"{} {} {}\" {} {} \"{}\" \"{}\"",
+            self.remote_addr,
+            self.method,
+            self.path,
+            self.protocol,
+            self.status,
+            self.bytes_sent,
+            referer,
+            ua,
+        )
+    }
+}
+
+/// Global access log writer.  Initialised by [`init_access_log`]; no-op until then.
+static ACCESS_LOG: OnceLock<Mutex<LogFile>> = OnceLock::new();
+
+/// Initialise the access log file.
+///
+/// Call once after [`init`], passing the same `data_dir`.  The access log is
+/// written to `<data_dir>/logs/access.log`.  Rotation follows the same
+/// `MAX_LOG_BYTES` limit as the application log.
+///
+/// Safe to call even when `logging.enabled = false`; the access log is
+/// always written when this function succeeds.
+///
+/// # Errors
+///
+/// Returns [`AppError::Io`] if the log directory cannot be created or the
+/// file cannot be opened.
+pub fn init_access_log(data_dir: &Path) -> Result<()> {
+    let log_path = data_dir.join("logs/access.log");
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    #[cfg(unix)]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log_path)
+            .map_err(|e| {
+                AppError::LogInit(format!(
+                    "Cannot open access log {}: {e}",
+                    log_path.display()
+                ))
+            })?
+    };
+    #[cfg(not(unix))]
+    let f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| {
+            AppError::LogInit(format!(
+                "Cannot open access log {}: {e}",
+                log_path.display()
+            ))
+        })?;
+
+    let _ = ACCESS_LOG.set(Mutex::new(LogFile {
+        file: f,
+        path: log_path,
+    }));
+    Ok(())
+}
+
+/// Write one access log record to `access.log`.
+///
+/// No-op if [`init_access_log`] has not been called.  Thread-safe; acquires
+/// the file mutex for the duration of the write only.
+pub fn log_access(record: &AccessRecord<'_>) {
+    if let Some(log) = ACCESS_LOG.get() {
+        if let Ok(mut lf) = log.lock() {
+            lf.write_line(&record.to_string());
+        }
+    }
+}
+
 // ─── Global ring buffer ──────────────────────────────────────────────────────
 
 /// Global in-memory ring buffer shared between the logger and the console
@@ -209,6 +323,28 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
             {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
+            // Phase 2 (H-5) — enforce owner-only access on Windows as well.
+            // Default directory creation on Windows inherits the parent ACL,
+            // which is typically world-readable on consumer machines.
+            // `icacls /inheritance:r` removes inherited ACEs; the `/grant:r`
+            // grants Full Control only to the current user.
+            #[cfg(windows)]
+            {
+                if let Ok(whoami_out) = std::process::Command::new("whoami").output() {
+                    let user = String::from_utf8_lossy(&whoami_out.stdout)
+                        .trim()
+                        .to_owned();
+                    let path_str = parent.to_string_lossy();
+                    let _ = std::process::Command::new("icacls")
+                        .args([
+                            path_str.as_ref(),
+                            "/inheritance:r",
+                            "/grant:r",
+                            &format!("{user}:(OI)(CI)F"),
+                        ])
+                        .output();
+                }
             }
         }
 
