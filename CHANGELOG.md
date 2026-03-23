@@ -1,11 +1,10 @@
 # Changelog
 
 All notable changes to RustHost are documented here.
-This project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [0.2.0] — Remediation Release
+## [0.1.0] — Initial Release
 
 This release resolves all 40 issues identified in the 2026-03-20 comprehensive security and reliability audit. Changes are grouped by the audit's five severity phases.
 
@@ -190,8 +189,6 @@ This release resolves all 40 issues identified in the 2026-03-20 comprehensive s
 `deny.toml`, CI — `audit.toml` (which suppressed `RUSTSEC-2023-0071` without a documented rationale) has been removed. Advisory suppression is now managed exclusively in `deny.toml`, which carries the full justification. CI now runs `cargo deny check` as a required step, subsuming the advisory check. The existing rationale for `RUSTSEC-2023-0071` is unchanged: the `rsa` crate is used only for signature verification on Tor directory documents, not for decryption; the Marvin timing attack's threat model does not apply.
 
 ---
-
-## [0.1.0] — Initial Release
 
 ### HTTP Server
 

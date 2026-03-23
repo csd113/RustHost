@@ -43,6 +43,15 @@ pub struct CliArgs {
     pub config_path: Option<PathBuf>,
     /// Explicit data-directory root; overrides `<exe-dir>/rusthost-data/`.
     pub data_dir: Option<PathBuf>,
+    /// When `Some`, skip first-run setup and serve this directory directly.
+    /// Addresses M-15 — `--serve <dir>` one-shot CLI mode.
+    pub serve_dir: Option<PathBuf>,
+    /// Port to use in `--serve` mode.  Ignored when `serve_dir` is `None`.
+    pub serve_port: u16,
+    /// Disable Tor in `--serve` mode.
+    pub no_tor: bool,
+    /// Disable the interactive console (useful for headless / CI use).
+    pub headless: bool,
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -58,6 +67,12 @@ pub struct CliArgs {
 /// initialised, or any other fatal startup condition occurs.
 /// Path overrides are supplied via [`CliArgs`].
 pub async fn run(args: CliArgs) -> Result<()> {
+    // M-15 — if --serve <dir> was passed, bypass settings.toml entirely and
+    // spin up a minimal server pointed at the given directory.
+    if let Some(dir) = args.serve_dir {
+        return one_shot_serve(dir, args.serve_port, !args.no_tor, args.headless).await;
+    }
+
     // 4.4 + 5.5 — data_dir is computed exactly once and threaded everywhere.
     // A CLI override takes precedence; the default is relative to current_exe().
     let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
@@ -72,6 +87,76 @@ pub async fn run(args: CliArgs) -> Result<()> {
         first_run_setup(&data_dir, &settings_path)?;
     }
     Ok(())
+}
+
+/// Serve `dir` directly with minimal configuration — no `settings.toml` needed.
+///
+/// Builds a `Config` in memory with sensible defaults, skips first-run setup,
+/// and calls [`normal_run`].  Addresses M-15.
+async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bool) -> Result<()> {
+    use crate::config::{
+        ConsoleConfig, CspLevel, IdentityConfig, LogLevel, LoggingConfig, ServerConfig, SiteConfig,
+        TorConfig,
+    };
+    use std::num::NonZeroU16;
+
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    // Use the parent of `dir` as the data_dir so relative paths stay sane.
+    let data_dir = dir
+        .canonicalize()
+        .unwrap_or_else(|_| dir.clone())
+        .parent()
+        .map_or_else(|| dir.clone(), Path::to_path_buf);
+
+    // Write a minimal in-memory settings.toml-equivalent path so `normal_run`
+    // can be reused unchanged.  We create a temporary settings file in a tmpdir
+    // rather than duplicating all of normal_run's startup steps.
+    //
+    // Simpler approach: build a Config directly and pass it to normal_run's inner
+    // logic via a secondary entry point that accepts an Arc<Config>.
+    let config = Arc::new(crate::config::Config {
+        server: ServerConfig {
+            port: NonZeroU16::new(port).unwrap_or(NonZeroU16::MIN),
+            bind: "127.0.0.1"
+                .parse()
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            auto_port_fallback: true,
+            open_browser_on_start: false,
+            max_connections: 256,
+            max_connections_per_ip: 16,
+            csp_level: CspLevel::Off,
+        },
+        site: SiteConfig {
+            directory: dir_str,
+            index_file: "index.html".into(),
+            enable_directory_listing: true,
+            expose_dotfiles: false,
+            spa_routing: false,
+            error_404: None,
+            error_503: None,
+        },
+        tor: TorConfig {
+            enabled: tor_enabled,
+        },
+        logging: LoggingConfig {
+            enabled: false,
+            level: LogLevel::Info,
+            file: "rusthost.log".into(),
+            filter_dependencies: true,
+        },
+        console: ConsoleConfig {
+            interactive: !headless,
+            refresh_rate_ms: 500,
+            show_timestamps: false,
+        },
+        identity: IdentityConfig {
+            instance_name: "RustHost".into(),
+        },
+        redirects: Vec::new(),
+    });
+
+    normal_run_with_config(data_dir, config).await
 }
 
 /// Compute the default data directory (`<exe-dir>/rusthost-data/`).
@@ -128,11 +213,21 @@ fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
 // ─── Normal Run ──────────────────────────────────────────────────────────────
 
 async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
-    // 1. Load and validate config.
     let config = Arc::new(config::loader::load(settings_path)?);
+    normal_run_with_config(data_dir, config).await
+}
 
+/// Core server startup given an already-built `Config`.
+///
+/// Shared by the standard settings.toml path and the `--serve` one-shot mode.
+async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Result<()> {
     // 2. Initialise logging.
     logging::init(&config.logging, &data_dir)?;
+    // M-16 — initialise the structured access log (Combined Log Format).
+    // Best-effort: a failure here is logged but does not abort startup.
+    if let Err(e) = logging::init_access_log(&data_dir) {
+        log::warn!("Could not initialise access log: {e}");
+    }
     log::info!("RustHost starting — version {}", env!("CARGO_PKG_VERSION"));
 
     // 4.2 — config.server.bind is now IpAddr; use is_unspecified() instead of
@@ -179,7 +274,9 @@ async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
     // 7. Start HTTP server task.
     let (port_tx, port_rx) = oneshot::channel::<u16>();
     // 2.10 — keep the JoinHandle so we can await the server during shutdown drain.
-    let server_handle = spawn_server(
+    // H-2  — root_tx lets the [R] reload handler push a new canonical_root to the
+    //         accept loop without restarting the server.
+    let (server_handle, root_tx) = spawn_server(
         &config,
         &state,
         &metrics,
@@ -252,9 +349,23 @@ async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
     }
 
     // 11. Event dispatch loop.
-    event_loop(key_rx, &config, &state, &metrics, data_dir).await?;
+    // H-2 — root_tx is passed so the [R] reload handler can push a new
+    // canonical_root to the accept loop without restarting the server.
+    event_loop(key_rx, &config, &state, &metrics, data_dir, root_tx).await?;
 
     // 12. Graceful shutdown.
+    graceful_shutdown(shutdown_tx, server_handle, tor_handle).await;
+    Ok(())
+}
+
+/// Signal shutdown, then await the server and Tor tasks with a shared 8-second
+/// deadline.  Extracted from [`normal_run_with_config`] to stay within the
+/// 100-line function-length limit.
+async fn graceful_shutdown(
+    shutdown_tx: watch::Sender<bool>,
+    server_handle: tokio::task::JoinHandle<()>,
+    tor_handle: Option<tokio::task::JoinHandle<()>>,
+) {
     log::info!("Shutting down…");
     let _ = shutdown_tx.send(true);
 
@@ -273,14 +384,15 @@ async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
     log::info!("RustHost shut down cleanly.");
     logging::flush();
     console::cleanup();
-
-    Ok(())
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Spawn the HTTP server task and return its `JoinHandle` so the shutdown
 /// sequence can await the connection drain (fix 2.10).
+///
+/// Returns the `JoinHandle` and the `watch::Sender` used to push a new
+/// `canonical_root` to the accept loop when the operator presses `[R]`.
 fn spawn_server(
     config: &Arc<Config>,
     state: &SharedState,
@@ -288,14 +400,26 @@ fn spawn_server(
     shutdown: &watch::Receiver<bool>,
     port_tx: oneshot::Sender<u16>,
     data_dir: PathBuf,
-) -> tokio::task::JoinHandle<()> {
+) -> (
+    tokio::task::JoinHandle<()>,
+    watch::Sender<Arc<std::path::Path>>,
+) {
+    // Resolve initial canonical root for the watch channel seed value.
+    let initial_root: Arc<std::path::Path> = {
+        let site_path = data_dir.join(&config.site.directory);
+        let resolved = site_path.canonicalize().unwrap_or(site_path);
+        Arc::from(resolved.as_path())
+    };
+    let (root_tx, root_rx) = watch::channel(initial_root);
+
     let cfg = Arc::clone(config);
     let st = Arc::clone(state);
     let met = Arc::clone(metrics);
     let shut = shutdown.clone();
-    tokio::spawn(async move {
-        server::run(cfg, st, met, data_dir, shut, port_tx).await;
-    })
+    let handle = tokio::spawn(async move {
+        server::run(cfg, st, met, data_dir, shut, port_tx, root_rx).await;
+    });
+    (handle, root_tx)
 }
 
 async fn start_console(
@@ -378,6 +502,7 @@ async fn event_loop(
     state: &SharedState,
     metrics: &SharedMetrics,
     data_dir: PathBuf,
+    root_tx: watch::Sender<Arc<std::path::Path>>,
 ) -> Result<()> {
     // 2.8 — mutable so we can set to None when the channel closes.
     let mut key_rx = key_rx;
@@ -426,6 +551,7 @@ async fn event_loop(
                         Arc::clone(state),
                         Arc::clone(metrics),
                         data_dir.clone(),
+                        &root_tx,
                     ).await?;
                     if quit { break; }
                 } else {

@@ -36,13 +36,13 @@ pub fn for_extension(ext: &str) -> &'static str {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" | "mjs" => "text/javascript; charset=utf-8",
-        "txt" => "text/plain; charset=utf-8",
+        "txt" | "wat" => "text/plain; charset=utf-8",
         "csv" => "text/csv; charset=utf-8",
         "xml" => "text/xml; charset=utf-8",
         "md" => "text/markdown; charset=utf-8",
 
         // Data
-        "json" => "application/json",
+        "json" | "map" => "application/json",
         "jsonld" => "application/ld+json",
         "pdf" => "application/pdf",
         "wasm" => "application/wasm",
@@ -68,8 +68,33 @@ pub fn for_extension(ext: &str) -> &'static str {
         "mp3" => "audio/mpeg",
         "ogg" => "audio/ogg",
         "wav" => "audio/wav",
-        "mp4" => "video/mp4",
+        "mp4" | "m4v" => "video/mp4",
         "webm" => "video/webm",
+        // Modern audio (M-14)
+        "opus" => "audio/opus",
+        "flac" => "audio/flac",
+        "aac" => "audio/aac",
+        "m4a" => "audio/mp4",
+        // Modern video (M-14)
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+
+        // Web app manifest — required for PWA installation (M-14)
+        "webmanifest" => "application/manifest+json",
+
+        // 3D / WebGL (M-14)
+        "glb" => "model/gltf-binary",
+        "gltf" => "model/gltf+json",
+
+        // Data formats (M-14)
+        "ndjson" => "application/x-ndjson",
+        "geojson" => "application/geo+json",
+        "toml" => "application/toml",
+        "yaml" | "yml" => "application/yaml",
+
+        // Web fonts — additional (M-14)
+        "eot" => "application/vnd.ms-fontobject",
 
         // Fallback
         _ => "application/octet-stream",

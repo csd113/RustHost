@@ -124,6 +124,9 @@ struct ServerContext {
     csp_header: Arc<str>,
     dir_list: bool,
     expose_dots: bool,
+    spa_routing: bool,
+    error_404_path: Option<std::path::PathBuf>,
+    redirects: Arc<Vec<crate::config::RedirectRule>>,
     semaphore: Arc<Semaphore>,
     per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
     max_conns: usize,
@@ -147,16 +150,22 @@ impl ServerContext {
                 return None;
             }
         };
-        // `u32 as usize`: usize ≥ 32 bits on every supported target, so this
-        // cast is always lossless.
         #[allow(clippy::cast_possible_truncation)]
         let max_conns = config.server.max_connections as usize;
+
+        // H-10 / C-6 — resolve custom error page paths once at startup.
+        let site_dir = data_dir.join(&config.site.directory);
+        let error_404_path = config.site.error_404.as_deref().map(|p| site_dir.join(p));
+
         Some(Self {
             canonical_root,
             index_file: Arc::from(config.site.index_file.as_str()),
             csp_header: Arc::from(config.server.csp_level.as_header_value()),
             dir_list: config.site.enable_directory_listing,
             expose_dots: config.site.expose_dotfiles,
+            spa_routing: config.site.spa_routing,
+            error_404_path,
+            redirects: Arc::new(config.redirects.clone()),
             semaphore: Arc::new(Semaphore::new(max_conns)),
             per_ip_map: Arc::new(DashMap::new()),
             max_conns,
@@ -201,11 +210,25 @@ impl ServerContext {
         let csp = Arc::clone(&self.csp_header);
         let dir_list = self.dir_list;
         let expose_dots = self.expose_dots;
+        let spa_routing = self.spa_routing;
+        let e404 = self.error_404_path.clone();
+        let redirects = Arc::clone(&self.redirects);
         join_set.spawn(async move {
             let _permit = permit;
             let _ip_guard = ip_guard;
-            if let Err(e) =
-                handler::handle(stream, site, idx, dir_list, expose_dots, met, csp).await
+            if let Err(e) = handler::handle(
+                stream,
+                site,
+                idx,
+                dir_list,
+                expose_dots,
+                met,
+                csp,
+                spa_routing,
+                e404,
+                redirects,
+            )
+            .await
             {
                 log::debug!("Handler error: {e}");
             }
@@ -238,6 +261,7 @@ pub async fn run(
     data_dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
     port_tx: oneshot::Sender<u16>,
+    mut root_watch: watch::Receiver<Arc<Path>>,
 ) {
     let bind_addr = config.server.bind;
     let base_port = config.server.port.get();
@@ -261,13 +285,23 @@ pub async fn run(
     let _ = port_tx.send(bound_port);
     log::info!("HTTP server listening on {bind_addr}:{bound_port}");
 
-    let Some(ctx) = ServerContext::new(&config, &data_dir) else {
+    let Some(mut ctx) = ServerContext::new(&config, &data_dir) else {
         return;
     };
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
 
     loop {
+        // H-2 — Non-blocking check for a new canonical_root sent by the [R]
+        // reload handler in events.rs.  `has_changed` is true if a value was
+        // sent since the last `borrow_and_update`, so we only update when there
+        // is actually a new root to apply.
+        if root_watch.has_changed().unwrap_or(false) {
+            let new_root = Arc::clone(&root_watch.borrow_and_update());
+            log::info!("Site root refreshed: {}", new_root.display());
+            ctx.canonical_root = new_root;
+        }
+
         tokio::select! {
             result = listener.accept() => {
                 match result {

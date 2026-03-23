@@ -63,7 +63,21 @@ pub async fn handle(
     expose_dotfiles: bool,
     metrics: SharedMetrics,
     csp: Arc<str>,
+    spa_routing: bool,
+    error_404_path: Option<std::path::PathBuf>,
+    redirects: Arc<Vec<crate::config::RedirectRule>>,
 ) -> Result<()> {
+    let cfg = Arc::new(RouteConfig {
+        canonical_root,
+        index_file,
+        csp,
+        dir_listing,
+        expose_dotfiles,
+        spa_routing,
+        error_404_path,
+        redirects,
+    });
+
     let io = TokioIo::new(stream);
 
     hyper::server::conn::http1::Builder::new()
@@ -71,40 +85,52 @@ pub async fn handle(
         .serve_connection(
             io,
             hyper::service::service_fn(move |req| {
-                let root = Arc::clone(&canonical_root);
-                let idx  = Arc::clone(&index_file);
-                let met  = Arc::clone(&metrics);
-                let csp  = Arc::clone(&csp);
-                async move {
-                    route(req, &root, &idx, dir_listing, expose_dotfiles, &met, &csp).await
-                }
+                let cfg = Arc::clone(&cfg);
+                let met = Arc::clone(&metrics);
+                async move { route(req, &cfg, &met).await }
             }),
         )
         .await
-        .map_err(|e| {
-            crate::AppError::Io(std::io::Error::other(e.to_string()))
-        })
+        .map_err(|e| crate::AppError::Io(std::io::Error::other(e.to_string())))
 }
 
 // ─── Router ──────────────────────────────────────────────────────────────────
 
-async fn route(
-    req: Request<Incoming>,
-    canonical_root: &Path,
-    index_file: &str,
+/// Configuration that every request handler needs but that doesn't change
+/// between requests on the same connection.
+///
+/// Passed into [`route`] by value so each `service_fn` closure captures one
+/// `Arc<RouteConfig>` rather than many individual `Arc<str>` / `bool` fields.
+#[derive(Clone)]
+struct RouteConfig {
+    canonical_root: Arc<Path>,
+    index_file: Arc<str>,
+    csp: Arc<str>,
     dir_listing: bool,
     expose_dotfiles: bool,
+    spa_routing: bool,
+    error_404_path: Option<std::path::PathBuf>,
+    /// Operator redirect/rewrite rules (M-13), checked before filesystem resolution.
+    redirects: Arc<Vec<crate::config::RedirectRule>>,
+}
+
+async fn route(
+    req: Request<Incoming>,
+    cfg: &RouteConfig,
     metrics: &SharedMetrics,
-    csp: &str,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
     match req.method() {
         &Method::OPTIONS => {
             metrics.add_request();
-            return Ok(options_response());
+            let resp = options_response();
+            log_request(&req, resp.status().as_u16(), 0);
+            return Ok(resp);
         }
         m if m != Method::GET && m != Method::HEAD => {
             metrics.add_error();
-            return Ok(method_not_allowed());
+            let resp = method_not_allowed();
+            log_request(&req, resp.status().as_u16(), 0);
+            return Ok(resp);
         }
         _ => {}
     }
@@ -113,52 +139,165 @@ async fn route(
     let raw_path = req.uri().path();
     let decoded = percent_decode(raw_path.split('?').next().unwrap_or("/"));
 
-    match resolve_path(
-        canonical_root,
+    // M-13 — check operator redirect rules before any filesystem access.
+    for rule in cfg.redirects.iter() {
+        if decoded == rule.from {
+            let safe = sanitize_header_value(&rule.to);
+            let status = rule.status;
+            metrics.add_request();
+            let resp = external_redirect_response(&safe, status, &cfg.csp);
+            log_request(&req, resp.status().as_u16(), 0);
+            return Ok(resp);
+        }
+    }
+
+    let opts = ResolveOptions {
+        canonical_root: &cfg.canonical_root,
+        url_path: &decoded,
+        index_file: &cfg.index_file,
+        dir_listing: cfg.dir_listing,
+        expose_dotfiles: cfg.expose_dotfiles,
+        spa_routing: cfg.spa_routing,
+        error_404_path: cfg.error_404_path.clone(),
+    };
+
+    let resp = dispatch_resolved(
+        resolve_path(&opts),
+        &req,
+        is_head,
+        metrics,
+        &cfg.csp,
         &decoded,
-        index_file,
-        dir_listing,
-        expose_dotfiles,
-    ) {
-        Resolved::File(abs_path) => serve_file(&req, &abs_path, is_head, metrics, csp).await,
+        cfg.expose_dotfiles,
+    )
+    .await?;
+
+    // M-16 — write one Combined Log Format line per request.
+    log_request(&req, resp.status().as_u16(), 0);
+    Ok(resp)
+}
+
+/// Map a [`Resolved`] value to an HTTP response.
+///
+/// Extracted from [`route`] to keep that function within the 100-line limit.
+async fn dispatch_resolved(
+    resolved: Resolved,
+    req: &Request<Incoming>,
+    is_head: bool,
+    metrics: &SharedMetrics,
+    csp: &str,
+    decoded: &str,
+    expose_dotfiles: bool,
+) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    Ok(match resolved {
+        Resolved::File(abs_path) => serve_file(req, &abs_path, is_head, metrics, csp).await?,
         Resolved::NotFound => {
             log::debug!("404 Not Found: {decoded}");
             metrics.add_request();
-            Ok(text_response(StatusCode::NOT_FOUND, "Not Found", csp, ""))
+            text_response(StatusCode::NOT_FOUND, "Not Found", csp, "")
         }
         Resolved::Redirect(location) => {
             let safe = sanitize_header_value(&location);
             metrics.add_request();
-            Ok(redirect_response(&safe, csp))
+            redirect_response(&safe, csp)
         }
         Resolved::Fallback => {
             metrics.add_request();
-            Ok(html_response(
+            html_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 fallback::NO_SITE_HTML,
                 is_head,
                 csp,
                 "",
-            ))
+            )
         }
         Resolved::Forbidden => {
             log::warn!("403 Forbidden: {decoded}");
             metrics.add_error();
-            Ok(text_response(StatusCode::FORBIDDEN, "Forbidden", csp, ""))
+            text_response(StatusCode::FORBIDDEN, "Forbidden", csp, "")
         }
         Resolved::DirectoryListing(dir_path) => {
-            let decoded_clone = decoded.clone();
-            let expose_dots_inner = expose_dotfiles;
+            let decoded_owned = decoded.to_owned();
             let html = tokio::task::spawn_blocking(move || {
-                build_directory_listing(&dir_path, &decoded_clone, expose_dots_inner)
+                build_directory_listing(&dir_path, &decoded_owned, expose_dotfiles)
             })
             .await
             .map_err(|e| std::io::Error::other(format!("directory listing task panicked: {e}")))?;
-
             metrics.add_request();
-            Ok(html_response(StatusCode::OK, &html, is_head, csp, &decoded))
+            html_response(StatusCode::OK, &html, is_head, csp, decoded)
         }
-    }
+        // H-10 / 4.1 — custom error page
+        Resolved::CustomError { path, status } => match tokio::fs::read_to_string(&path).await {
+            Ok(body) => {
+                metrics.add_request();
+                let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                html_response(sc, &body, is_head, csp, "")
+            }
+            Err(e) => {
+                log::warn!("Could not read custom error page {}: {e}", path.display());
+                metrics.add_error();
+                text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                    csp,
+                    "",
+                )
+            }
+        },
+    })
+}
+
+/// Emit one access-log line.  `bytes_sent` is 0 for HEAD / redirects where
+/// we don't track the body size; a future improvement could measure it.
+fn log_request<B>(req: &Request<B>, status: u16, bytes_sent: u64) {
+    // Only emit if the access logger has been initialised.
+    use crate::logging::{log_access, AccessRecord};
+    // Extract the peer address from the forwarded headers if available,
+    // otherwise fall back to 127.0.0.1 (we don't have socket addr here).
+    let remote = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+
+    let ua = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    let referer = req
+        .headers()
+        .get(header::REFERER)
+        .and_then(|v| v.to_str().ok());
+
+    log_access(&AccessRecord {
+        remote_addr: remote,
+        method: req.method().as_str(),
+        path: req.uri().path(),
+        protocol: "HTTP/1.1",
+        status,
+        bytes_sent,
+        user_agent: ua,
+        referer,
+    });
+}
+
+/// Build a redirect response for operator-configured rules (M-13).
+///
+/// Uses the `status` from the rule (301 or 302) rather than always 301.
+fn external_redirect_response(location: &str, status: u16, csp: &str) -> Response<BoxBody> {
+    let body = format!("Redirecting to {location}");
+    let data: Bytes = Bytes::copy_from_slice(body.as_bytes());
+    let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::MOVED_PERMANENTLY);
+    let mut builder = Response::builder()
+        .status(sc)
+        .header(header::LOCATION, location)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, data.len())
+        .header("Cache-Control", "no-cache");
+    builder = security_headers(builder, csp, "text/plain");
+    builder.body(full_body(data)).unwrap_or_default()
 }
 
 // ─── File serving ─────────────────────────────────────────────────────────────
@@ -645,18 +784,46 @@ pub(crate) enum Resolved {
     Fallback,
     Forbidden,
     DirectoryListing(std::path::PathBuf),
-    /// 301 redirect to the given Location URL.
+    /// Trailing-slash 301 redirect produced by the filesystem resolver.
     Redirect(String),
+    /// Custom error page (H-10 / 4.1): serve the file at `path` with `status`.
+    CustomError {
+        path: std::path::PathBuf,
+        status: u16,
+    },
+}
+
+/// Parameters for path resolution.
+///
+/// Grouped into a struct to avoid a 7-argument function that would trip
+/// `clippy::too_many_arguments`.
+pub(crate) struct ResolveOptions<'a> {
+    pub canonical_root: &'a Path,
+    pub url_path: &'a str,
+    pub index_file: &'a str,
+    pub dir_listing: bool,
+    pub expose_dotfiles: bool,
+    /// When `true`, unresolved paths fall back to `index.html` (C-6 SPA mode).
+    pub spa_routing: bool,
+    /// Absolute path to a custom 404 page, if operator configured one (H-10).
+    pub error_404_path: Option<std::path::PathBuf>,
 }
 
 #[must_use]
-pub(crate) fn resolve_path(
-    canonical_root: &Path,
-    url_path: &str,
-    index_file: &str,
-    dir_listing: bool,
-    expose_dotfiles: bool,
-) -> Resolved {
+pub(crate) fn resolve_path(opts: &ResolveOptions<'_>) -> Resolved {
+    let ResolveOptions {
+        canonical_root,
+        url_path,
+        index_file,
+        dir_listing,
+        expose_dotfiles,
+        spa_routing,
+        error_404_path,
+    } = opts;
+    // Deref the bool references produced by destructuring a borrowed struct.
+    let dir_listing = *dir_listing;
+    let expose_dotfiles = *expose_dotfiles;
+    let spa_routing = *spa_routing;
     // Block direct requests for dot-files unless operator opts in (H-10 / M-2).
     if !expose_dotfiles {
         for component in std::path::Path::new(url_path).components() {
@@ -693,7 +860,13 @@ pub(crate) fn resolve_path(
         }
         let normalized = normalize_path(&target);
         return if normalized.starts_with(canonical_root) {
-            Resolved::NotFound
+            // File genuinely not found — apply SPA fallback or custom 404.
+            resolve_not_found(
+                canonical_root,
+                index_file,
+                spa_routing,
+                error_404_path.as_ref(),
+            )
         } else {
             Resolved::Forbidden
         };
@@ -709,6 +882,36 @@ pub(crate) fn resolve_path(
     }
 
     Resolved::File(canonical)
+}
+
+/// Apply SPA fallback or custom-404 logic for a path that resolved to nothing.
+///
+/// Called from both `NotFound` branches in [`resolve_path`] so the logic is
+/// defined in exactly one place.
+fn resolve_not_found(
+    canonical_root: &Path,
+    index_file: &str,
+    spa_routing: bool,
+    error_404_path: Option<&std::path::PathBuf>,
+) -> Resolved {
+    // C-6 — SPA mode: serve index.html for all unresolved paths.
+    if spa_routing {
+        let spa_index = canonical_root.join(index_file);
+        if spa_index.exists() {
+            let resolved = spa_index.canonicalize().unwrap_or(spa_index);
+            return Resolved::File(resolved);
+        }
+    }
+    // H-10 — custom 404 page.
+    if let Some(p404) = error_404_path {
+        if p404.exists() {
+            return Resolved::CustomError {
+                path: p404.clone(),
+                status: 404,
+            };
+        }
+    }
+    Resolved::NotFound
 }
 
 // ─── Header value sanitisation ───────────────────────────────────────────────
@@ -931,7 +1134,15 @@ mod tests {
     #[test]
     fn resolve_path_happy_path() {
         let (_tmp, root) = make_test_tree();
-        let result = resolve_path(&root, "/index.html", "index.html", false, false);
+        let result = resolve_path(&super::ResolveOptions {
+            canonical_root: &root,
+            url_path: "/index.html",
+            index_file: "index.html",
+            dir_listing: false,
+            expose_dotfiles: false,
+            spa_routing: false,
+            error_404_path: None,
+        });
         assert!(
             matches!(result, Resolved::File(_)),
             "expected Resolved::File, got {result:?}"
@@ -942,7 +1153,15 @@ mod tests {
     fn resolve_path_directory_traversal() {
         let (tmp, root) = make_test_tree();
         let _ = tmp;
-        let result = resolve_path(&root, "/../secret.txt", "index.html", false, false);
+        let result = resolve_path(&super::ResolveOptions {
+            canonical_root: &root,
+            url_path: "/../secret.txt",
+            index_file: "index.html",
+            dir_listing: false,
+            expose_dotfiles: false,
+            spa_routing: false,
+            error_404_path: None,
+        });
         assert_eq!(result, Resolved::Forbidden);
     }
 
@@ -951,21 +1170,45 @@ mod tests {
         let (tmp, root) = make_test_tree();
         let decoded = super::percent_decode("/../secret.txt");
         let _ = tmp;
-        let result = resolve_path(&root, &decoded, "index.html", false, false);
+        let result = resolve_path(&super::ResolveOptions {
+            canonical_root: &root,
+            url_path: &decoded,
+            index_file: "index.html",
+            dir_listing: false,
+            expose_dotfiles: false,
+            spa_routing: false,
+            error_404_path: None,
+        });
         assert_eq!(result, Resolved::Forbidden);
     }
 
     #[test]
     fn resolve_path_missing_file_returns_not_found() {
         let (_tmp, root) = make_test_tree();
-        let result = resolve_path(&root, "/does_not_exist.txt", "index.html", false, false);
+        let result = resolve_path(&super::ResolveOptions {
+            canonical_root: &root,
+            url_path: "/does_not_exist.txt",
+            index_file: "index.html",
+            dir_listing: false,
+            expose_dotfiles: false,
+            spa_routing: false,
+            error_404_path: None,
+        });
         assert_eq!(result, Resolved::NotFound);
     }
 
     #[test]
     fn resolve_path_missing_root_returns_fallback() {
         let missing_root = Path::new("/nonexistent/root/that/does/not/exist");
-        let result = resolve_path(missing_root, "/index.html", "index.html", false, false);
+        let result = resolve_path(&super::ResolveOptions {
+            canonical_root: missing_root,
+            url_path: "/index.html",
+            index_file: "index.html",
+            dir_listing: false,
+            expose_dotfiles: false,
+            spa_routing: false,
+            error_404_path: None,
+        });
         assert_eq!(result, Resolved::Fallback);
     }
 }
