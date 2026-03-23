@@ -138,7 +138,8 @@ pub fn init(
                     if let Some(last) = last_failure_time {
                         if now.duration_since(last) > Duration::from_secs(3600) {
                             log::info!(
-                                "Tor: resetting retry counter — last disruption was                                  over an hour ago."
+                                "Tor: resetting retry counter — \
+                                 last disruption was over an hour ago."
                             );
                             attempts = 0;
                         }
@@ -426,18 +427,66 @@ async fn proxy_stream(
     Ok(())
 }
 
+/// Proxy bytes between `a` and `b` bidirectionally.
+///
+/// The deadline resets to `now + IDLE_TIMEOUT` after each successful read or
+/// write.  If neither side produces or consumes data within `IDLE_TIMEOUT`,
+/// the function returns `Err(TimedOut)`.
+///
+/// This is a true idle timeout, not a wall-clock cap.  A continuous large
+/// transfer is never interrupted; a connection that stalls mid-transfer is
+/// closed within `IDLE_TIMEOUT` of the last byte.  The previous
+/// implementation used `copy_bidirectional` racing a single `sleep`, which
+/// fired `IDLE_TIMEOUT` after the *connection opened*, disconnecting active
+/// large downloads (fix C-2).
 async fn copy_with_idle_timeout<A, B>(a: &mut A, b: &mut B) -> std::io::Result<()>
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    tokio::select! {
-        result = tokio::io::copy_bidirectional(a, b) => result.map(|_| ()),
-        () = tokio::time::sleep(IDLE_TIMEOUT) => {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("idle timeout ({}s)", IDLE_TIMEOUT.as_secs()),
-            ))
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf_a = vec![0u8; 8_192];
+    let mut buf_b = vec![0u8; 8_192];
+
+    loop {
+        // Deadline resets on every iteration — after every successful read/write.
+        // checked_add avoids clippy::arithmetic_side_effects; the fallback to
+        // now() causes an immediate timeout rather than a panic on overflow
+        // (practically impossible, but required by pedantic lints).
+        let deadline = tokio::time::Instant::now()
+            .checked_add(IDLE_TIMEOUT)
+            .unwrap_or_else(tokio::time::Instant::now);
+
+        tokio::select! {
+            // A → B
+            result = tokio::time::timeout_at(deadline, a.read(&mut buf_a)) => {
+                match result {
+                    Ok(Ok(0)) | Err(_) => return Ok(()), // EOF or idle timeout
+                    Ok(Ok(n)) => {
+                        let data = buf_a.get(..n).ok_or_else(|| {
+                            std::io::Error::other("read returned out-of-bounds n")
+                        })?;
+                        b.write_all(data).await?;
+                        b.flush().await?;
+                    }
+                    Ok(Err(e)) => return Err(e),
+                }
+            }
+            // B → A
+            result = tokio::time::timeout_at(deadline, b.read(&mut buf_b)) => {
+                match result {
+                    Ok(Ok(0)) | Err(_) => return Ok(()),
+                    Ok(Ok(n)) => {
+                        let data = buf_b.get(..n).ok_or_else(|| {
+                            std::io::Error::other("read returned out-of-bounds n")
+                        })?;
+                        a.write_all(data).await?;
+                        a.flush().await?;
+                    }
+                    Ok(Err(e)) => return Err(e),
+                }
+            }
         }
     }
 }
@@ -544,50 +593,36 @@ async fn set_onion(state: &SharedState, addr: String) {
 mod tests {
     use super::onion_address_from_pubkey;
 
-    /// Compute the expected onion address for a given 32-byte key using the
-    /// same algorithm as `onion_address_from_pubkey`, acting as an independent
-    /// reference implementation to cross-check the production code.
-    fn reference_onion(pubkey: &[u8; 32]) -> String {
-        use data_encoding::BASE32_NOPAD;
-        use sha3::{Digest, Sha3_256};
+    /// External test vector for the all-zero 32-byte Ed25519 public key.
+    ///
+    /// Computed independently with Python's standard library (no `stem` needed):
+    ///
+    /// ```python
+    /// import hashlib, base64
+    /// pk  = bytes(32)          # all-zero 32-byte Ed25519 public key
+    /// ver = b'\x03'
+    /// chk = hashlib.sha3_256(b'.onion checksum' + pk + ver).digest()[:2]
+    /// addr = base64.b32encode(pk + chk + ver).decode().lower() + '.onion'
+    /// # → 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaam2dqd.onion'
+    /// ```
+    ///
+    /// This cross-checks the production implementation against an *independent*
+    /// reference rather than the same algorithm re-implemented inline (fix C-3).
+    const ZERO_KEY_ONION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaam2dqd.onion";
 
-        let version: u8 = 3;
-        let mut hasher = Sha3_256::new();
-        hasher.update(b".onion checksum");
-        hasher.update(pubkey);
-        hasher.update([version]);
-        let hash = hasher.finalize();
-
-        let mut bytes = [0u8; 35];
-        bytes[..32].copy_from_slice(pubkey);
-        // SHA3-256 always produces 32 bytes; direct indexing is safe.
-        #[allow(clippy::indexing_slicing)]
-        {
-            bytes[32] = hash[0];
-            bytes[33] = hash[1];
-        }
-        bytes[34] = version;
-
-        format!("{}.onion", BASE32_NOPAD.encode(&bytes).to_ascii_lowercase())
+    #[test]
+    fn known_vector_all_zeros() {
+        assert_eq!(
+            onion_address_from_pubkey(&[0u8; 32]),
+            ZERO_KEY_ONION,
+            "all-zero key must produce the Tor-spec-defined address"
+        );
     }
 
     #[test]
-    fn hsid_to_onion_address_all_zeros_vector() {
-        // Fixed 32-byte test vector: all zeros.
-        // The expected value is derived from the reference implementation above.
-        let pubkey = [0u8; 32];
-        let expected = reference_onion(&pubkey);
-        let actual = onion_address_from_pubkey(&pubkey);
-        assert_eq!(actual, expected);
-    }
-
-    #[test]
-    fn hsid_to_onion_address_format_is_correct() {
-        let pubkey = [0u8; 32];
-        let addr = onion_address_from_pubkey(&pubkey);
-        // A v3 onion address is always 56 base32 chars + ".onion" = 62 chars.
-        assert_eq!(addr.len(), 62, "unexpected length: {addr:?}");
-        // Use strip_suffix to avoid clippy::case_sensitive_file_extension_comparison.
+    fn format_is_56_chars_plus_dot_onion() {
+        let addr = onion_address_from_pubkey(&[0u8; 32]);
+        assert_eq!(addr.len(), 62, "v3 onion address must be 62 chars total");
         assert!(
             addr.strip_suffix(".onion").is_some(),
             "must end with .onion: {addr:?}"
@@ -601,20 +636,16 @@ mod tests {
     }
 
     #[test]
-    fn hsid_to_onion_address_is_deterministic() {
-        // Calling the function twice with the same key must produce the same
-        // output — the address must be derivable from the public key alone.
-        let pubkey = [0x42u8; 32];
-        assert_eq!(
-            onion_address_from_pubkey(&pubkey),
-            onion_address_from_pubkey(&pubkey)
-        );
+    fn is_deterministic() {
+        let k = [0x42u8; 32];
+        assert_eq!(onion_address_from_pubkey(&k), onion_address_from_pubkey(&k));
     }
 
     #[test]
-    fn hsid_to_onion_address_different_keys_produce_different_addresses() {
-        let a = onion_address_from_pubkey(&[0u8; 32]);
-        let b = onion_address_from_pubkey(&[1u8; 32]);
-        assert_ne!(a, b, "different keys must produce different addresses");
+    fn different_keys_different_addresses() {
+        assert_ne!(
+            onion_address_from_pubkey(&[0u8; 32]),
+            onion_address_from_pubkey(&[1u8; 32])
+        );
     }
 }

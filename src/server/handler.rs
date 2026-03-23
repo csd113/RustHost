@@ -622,27 +622,67 @@ async fn write_response(
     Ok(())
 }
 
-/// Write only the response status line and all headers, followed by the blank
-/// line separating headers from body.
+/// Write all HTTP header *fields* (no status line) followed by the blank line.
 ///
-/// ## Security headers (task 5.3)
+/// Called by both [`write_headers`] (after emitting the status line) and
+/// [`write_redirect`] (after emitting `301 + Location`).  Centralising the
+/// security-header set here means any future addition is made in exactly one
+/// place — the previous arrangement required identical edits in both functions,
+/// an invariant that was already violated when `Content-Security-Policy` was
+/// added only to `write_headers` (fix H-1).
 ///
-/// The following headers are added to **every** response:
+/// ## Security headers emitted on every response
 ///
-/// | Header                 | Value                                      |
-/// |------------------------|--------------------------------------------|
-/// | `X-Content-Type-Options` | `nosniff`                                |
-/// | `X-Frame-Options`      | `SAMEORIGIN`                               |
-/// | `Referrer-Policy`      | `no-referrer`                              |
-/// | `Permissions-Policy`   | `camera=(), microphone=(), geolocation=()` |
+/// | Header                   | Value                                       |
+/// |--------------------------|---------------------------------------------|
+/// | `X-Content-Type-Options` | `nosniff`                                   |
+/// | `X-Frame-Options`        | `SAMEORIGIN`                                |
+/// | `Referrer-Policy`        | `no-referrer`                               |
+/// | `Permissions-Policy`     | `camera=(), microphone=(), geolocation=()`  |
 ///
-/// For **HTML** responses (`content_type` starts with `"text/html"`), the
-/// `Content-Security-Policy` header is also emitted using `csp` as the value.
+/// For HTML responses, `Content-Security-Policy` is also emitted.
+/// `Referrer-Policy: no-referrer` is critical for the Tor hidden-service case:
+/// without it the `.onion` URL leaks in the `Referer` header sent to any
+/// third-party resource embedded in a served HTML page.
+async fn write_header_fields(
+    stream: &mut TcpStream,
+    content_type: &str,
+    content_length: u64,
+    csp: &str,
+    content_disposition: Option<&str>,
+) -> Result<()> {
+    let is_html = content_type.starts_with("text/html");
+    // fix H-3 — strip CR/LF from the CSP value before embedding it in a header.
+    let safe_csp = sanitize_header_value(csp);
+    let csp_line = if is_html && !safe_csp.is_empty() {
+        format!("Content-Security-Policy: {safe_csp}\r\n")
+    } else {
+        String::new()
+    };
+    let cd_line =
+        content_disposition.map_or_else(String::new, |cd| format!("Content-Disposition: {cd}\r\n"));
+
+    let fields = format!(
+        "Content-Type: {content_type}\r\n\
+         Content-Length: {content_length}\r\n\
+         Connection: close\r\n\
+         Cache-Control: no-store\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: SAMEORIGIN\r\n\
+         Referrer-Policy: no-referrer\r\n\
+         Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n\
+         {cd_line}\
+         {csp_line}\
+         \r\n"
+    );
+    stream.write_all(fields.as_bytes()).await?;
+    Ok(())
+}
+
+/// Write a complete HTTP response status line and all headers.
 ///
-/// `Referrer-Policy: no-referrer` is especially important for the Tor hidden
-/// service use case: without it, the `.onion` URL leaks in the `Referer`
-/// header sent to any third-party resource (CDN, fonts, analytics) embedded
-/// in a served HTML page. (See [`write_redirect`] for redirect responses.)
+/// Delegates the header fields (including all security headers) to
+/// [`write_header_fields`] so the security-header set is defined in one place.
 ///
 /// # Errors
 ///
@@ -656,69 +696,50 @@ async fn write_headers(
     csp: &str,
     content_disposition: Option<&str>, // fix H-5: pass Some("attachment") for SVG
 ) -> Result<()> {
-    let is_html = content_type.starts_with("text/html");
-    // fix H-3 — strip CR/LF from the CSP value before embedding it in a header.
-    let safe_csp = sanitize_header_value(csp);
-    let csp_line = if is_html && !safe_csp.is_empty() {
-        format!("Content-Security-Policy: {safe_csp}\r\n")
-    } else {
-        String::new()
-    };
-    let cd_line =
-        content_disposition.map_or_else(String::new, |cd| format!("Content-Disposition: {cd}\r\n"));
-
-    let header = format!(
-        "HTTP/1.1 {status} {reason}\r\n\
-         Content-Type: {content_type}\r\n\
-         Content-Length: {content_length}\r\n\
-         Connection: close\r\n\
-         Cache-Control: no-store\r\n\
-         X-Content-Type-Options: nosniff\r\n\
-         X-Frame-Options: SAMEORIGIN\r\n\
-         Referrer-Policy: no-referrer\r\n\
-         Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n\
-         {cd_line}\
-         {csp_line}\
-         \r\n"
-    );
-    stream.write_all(header.as_bytes()).await?;
-    Ok(())
+    stream
+        .write_all(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes())
+        .await?;
+    // write_headers emits all security headers from one place; write_redirect delegates here
+    write_header_fields(
+        stream,
+        content_type,
+        content_length,
+        csp,
+        content_disposition,
+    )
+    .await
 }
 
-/// Write a 301 redirect with all security headers (fix H-9).
+/// Write a `301 Moved Permanently` response with all security headers.
 ///
-/// Previously the redirect arm constructed its own raw header string, bypassing
-/// `write_headers` entirely. This meant the 301 carried none of the security
-/// headers — critically missing `Referrer-Policy: no-referrer`, which would
-/// leak the .onion address to the redirect destination as a Referer header.
+/// Delegates to [`write_header_fields`] so security headers are emitted from
+/// a single location — previously this function duplicated every header in
+/// `write_headers`, meaning any future security-header addition had to be
+/// applied in two places (fix H-1).
+///
+/// `Referrer-Policy: no-referrer` on the redirect prevents the `.onion`
+/// address leaking in the `Referer` header sent to the redirect destination
+/// (fix H-9).
 async fn write_redirect(
     stream: &mut TcpStream,
     location: &str,
     body_len: u64,
     csp: &str,
 ) -> Result<()> {
-    let safe_csp = sanitize_header_value(csp);
-    let csp_line = if safe_csp.is_empty() {
-        String::new()
-    } else {
-        format!("Content-Security-Policy: {safe_csp}\r\n")
-    };
-    let header = format!(
-        "HTTP/1.1 301 Moved Permanently\r\n\
-         Location: {location}\r\n\
-         Content-Type: text/plain\r\n\
-         Content-Length: {body_len}\r\n\
-         Connection: close\r\n\
-         Cache-Control: no-store\r\n\
-         X-Content-Type-Options: nosniff\r\n\
-         X-Frame-Options: SAMEORIGIN\r\n\
-         Referrer-Policy: no-referrer\r\n\
-         Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n\
-         {csp_line}\
-         \r\n"
-    );
-    stream.write_all(header.as_bytes()).await?;
-    Ok(())
+    // Location is already sanitized by the caller, but guard here too so this
+    // function is safe regardless of call site.
+    let safe_location = sanitize_header_value(location);
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 301 Moved Permanently\r\n\
+                 Location: {safe_location}\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    // write_headers emits all security headers from one place; write_redirect delegates here
+    write_header_fields(stream, "text/plain", body_len, csp, None).await
 }
 
 // ─── Directory listing ───────────────────────────────────────────────────────

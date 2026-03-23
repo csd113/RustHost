@@ -89,7 +89,8 @@ fn default_data_dir() -> PathBuf {
         ),
         Err(e) => {
             eprintln!(
-                "Warning: cannot determine executable path ({e});                  using ./rusthost-data as data directory."
+                "Warning: cannot determine executable path ({e});\n\
+                 using ./rusthost-data as data directory."
             );
             PathBuf::from("rusthost-data")
         }

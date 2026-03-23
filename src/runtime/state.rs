@@ -58,6 +58,7 @@ pub enum ConsoleMode {
 ///
 /// Read-heavy; guarded by a [`tokio::sync::RwLock`] so multiple readers
 /// (render loop, key handler) never block each other.
+#[derive(Debug, Clone)]
 pub struct AppState {
     /// Port the HTTP server is actually listening on (may differ from config
     /// if `auto_port_fallback` kicked in).

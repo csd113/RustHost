@@ -56,7 +56,7 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
 
     let tor_str = match &state.tor_status {
         TorStatus::Disabled => dim("DISABLED"),
-        TorStatus::Starting => yellow("STARTING — polling for .onion address…"),
+        TorStatus::Starting => yellow("STARTING — bootstrapping Tor network…"),
         TorStatus::Ready => green("READY"),
         TorStatus::Failed(reason) => red(&format!("FAILED ({reason}) — see log for details")),
     };
