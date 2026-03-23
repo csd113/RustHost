@@ -85,6 +85,19 @@ rusqlite     = { version = "*", features = ["bundled"] }
 # the single global Mutex that would serialise every accept() call.
 dashmap      = "6"
 
+# Phase 3 (C-1, H-8, H-9, H-13) — HTTP/1.1 keep-alive, ETag, Range, compression.
+# hyper provides a correct HTTP/1.1 connection loop with keep-alive; replacing
+# the hand-rolled single-shot parser eliminates the 30-45 s Tor page-load
+# penalty caused by Connection: close on every response.
+hyper            = { version = "1", features = ["http1", "server"] }
+hyper-util       = { version = "0.1", features = ["tokio"] }
+http-body-util   = "0.1"
+bytes            = "1"
+# async-compression provides Brotli and Gzip stream encoders.  Brotli gives
+# significantly better compression ratios than Gzip, which matters a lot for
+# Tor users who pay per-byte in latency.
+async-compression = { version = "0.4", features = ["tokio", "brotli", "gzip"] }
+
 [dev-dependencies]
 tempfile = "3"
 

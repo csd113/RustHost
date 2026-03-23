@@ -2,9 +2,17 @@
 //!
 //! **Directory:** `src/server/`
 //!
-//! Handles a single TCP connection: reads the HTTP/1.1 request line,
-//! resolves the path safely within the site root, serves the file (or a
-//! built-in fallback), and writes a complete HTTP response.
+//! Handles HTTP connections using [`hyper`]'s HTTP/1.1 connection loop,
+//! which provides keep-alive transparently (Phase 3, C-1).
+//!
+//! Each connection is kept alive across multiple request/response cycles —
+//! eliminating the 30–45 s Tor page-load penalty that the previous
+//! single-shot, `Connection: close` design imposed.
+//!
+//! Additional Phase 3 features layered on top of hyper:
+//! - **`ETag` / conditional `GET`** (`H-9`): weak `ETag` headers; `304` on match.
+//! - **Range requests** (H-13): `bytes=N-M` single-range support; 206/416.
+//! - **Brotli / Gzip compression** (H-8): negotiated via `Accept-Encoding`.
 //!
 //! Security: every resolved path is checked to be a descendant of the
 //! configured site root via [`std::fs::canonicalize`]. Any attempt to
@@ -14,527 +22,601 @@
 
 use std::{fmt::Write as _, path::Path, sync::Arc};
 
-use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::TcpStream,
-    time::timeout,
-};
+use bytes::Bytes;
+use http_body_util::{BodyExt as _, Full};
+use hyper::{body::Incoming, header, Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpStream;
 
 use super::{fallback, mime};
 use crate::{runtime::state::SharedMetrics, Result};
 
+// ─── Body type alias ─────────────────────────────────────────────────────────
+
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
+
+fn full_body(data: impl Into<Bytes>) -> BoxBody {
+    Full::new(data.into()).map_err(|e| match e {}).boxed()
+}
+
+fn empty_body() -> BoxBody {
+    full_body(Bytes::new())
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
-/// Outcome of the initial request-reading phase.
+/// Serve one HTTP connection to completion.
 ///
-/// Returned by [`receive_request`] to communicate what happened to the caller
-/// without requiring `handle` to inspect raw error kinds directly.
-enum RequestOutcome {
-    /// The request was read and parsed successfully.
-    ///
-    /// Carries the raw header block, the recovered stream, and the boolean
-    /// `is_head` flag derived from the method.
-    Ready {
-        is_head: bool,
-        raw_path: String,
-        stream: TcpStream,
-    },
-    /// A complete error response has already been written to the stream.
-    /// `handle` should return `Ok(())` immediately.
-    Responded,
-}
-
-/// Read and parse one HTTP request from `stream`, returning [`RequestOutcome`].
-///
-/// Handles the 30-second slow-loris timeout, the 8 KiB header limit, and
-/// method validation, writing the appropriate error response in each failure
-/// case so that `handle` stays focused on routing.
+/// Uses [`hyper`]'s HTTP/1.1 connection loop with keep-alive enabled (C-1).
+/// Previously the server sent `Connection: close` on every response and
+/// terminated the TCP connection immediately — this caused Tor pages to take
+/// 30–45 s to load because each asset required a fresh Tor circuit setup.
 ///
 /// # Errors
 ///
-/// Propagates I/O errors from writing error responses (e.g. `400`, `408`).
-async fn receive_request(
-    stream: TcpStream,
-    csp: &str,
-    metrics: &SharedMetrics,
-) -> Result<RequestOutcome> {
-    let mut reader = BufReader::new(stream);
-
-    // 1.5 — 30-second timeout prevents slow-loris DoS.
-    let request = match timeout(
-        std::time::Duration::from_secs(30),
-        read_request(&mut reader),
-    )
-    .await
-    {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
-            // 5.2 — Send 400 on any read failure (oversized headers, reset, etc.)
-            log::warn!("Failed to read request headers: {e}");
-            let mut stream = reader.into_inner();
-            write_response(
-                &mut stream,
-                400,
-                "Bad Request",
-                "text/plain",
-                b"Bad Request",
-                false,
-                csp,
-            )
-            .await?;
-            metrics.add_error();
-            return Ok(RequestOutcome::Responded);
-        }
-        Err(_elapsed) => {
-            log::warn!("Request timeout — sending 408");
-            let mut stream = reader.into_inner();
-            write_response(
-                &mut stream,
-                408,
-                "Request Timeout",
-                "text/plain",
-                b"Request Timeout",
-                false,
-                csp,
-            )
-            .await?;
-            metrics.add_error();
-            return Ok(RequestOutcome::Responded);
-        }
-    };
-
-    let mut stream = reader.into_inner();
-
-    // 1.4 — parse_path extracts (method, path); returns None for non-GET/HEAD.
-    // H-4: use ParseResult to distinguish malformed request from disallowed method.
-    match parse_path(&request) {
-        ParseResult::Ok { method, path } => Ok(RequestOutcome::Ready {
-            is_head: method == "HEAD",
-            raw_path: path.to_owned(),
-            stream,
-        }),
-        ParseResult::MethodNotAllowed { method } => {
-            if method == "OPTIONS" {
-                // Browsers send OPTIONS preflight requests automatically; respond
-                // with 200 + Allow so they can proceed without counting as errors.
-                stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\n\
-                          Allow: GET, HEAD, OPTIONS\r\n\
-                          Content-Length: 0\r\n\
-                          Connection: close\r\n\
-                          \r\n",
-                    )
-                    .await?;
-                metrics.add_request();
-            } else {
-                // RFC 9110 §15.5.6: 405 with Allow header listing supported methods.
-                log::warn!("405 Method Not Allowed: {method}");
-                stream
-                    .write_all(
-                        b"HTTP/1.1 405 Method Not Allowed\r\n\
-                          Allow: GET, HEAD, OPTIONS\r\n\
-                          Content-Length: 0\r\n\
-                          Connection: close\r\n\
-                          \r\n",
-                    )
-                    .await?;
-                metrics.add_error();
-            }
-            Ok(RequestOutcome::Responded)
-        }
-        ParseResult::BadRequest => {
-            log::warn!("400 Bad Request — malformed request line");
-            write_response(
-                &mut stream,
-                400,
-                "Bad Request",
-                "text/plain",
-                b"Bad Request",
-                false,
-                csp,
-            )
-            .await?;
-            metrics.add_error();
-            Ok(RequestOutcome::Responded)
-        }
-    }
-}
-
-/// Handle one HTTP connection to completion.
-///
-/// # Errors
-///
-/// Propagates I/O errors from writing response headers or body.  Read errors
-/// (e.g. connection reset during header read) are converted to a `400 Bad
-/// Request` response rather than being surfaced as errors.
+/// Propagates I/O errors from hyper's connection driver.
 pub async fn handle(
     stream: TcpStream,
     canonical_root: Arc<Path>,
     index_file: Arc<str>,
     dir_listing: bool,
-    expose_dotfiles: bool, // fix H-10: when false, hide dot-files from directory listings
+    expose_dotfiles: bool,
     metrics: SharedMetrics,
     csp: Arc<str>,
 ) -> Result<()> {
-    let RequestOutcome::Ready {
-        is_head,
-        raw_path,
-        mut stream,
-    } = receive_request(stream, &csp, &metrics).await?
-    else {
-        return Ok(());
-    };
+    let io = TokioIo::new(stream);
 
-    // Strip query string / fragment then percent-decode.
-    let path_only = raw_path.split('?').next().unwrap_or("/");
-    let decoded = percent_decode(path_only);
+    hyper::server::conn::http1::Builder::new()
+        .keep_alive(true)
+        .serve_connection(
+            io,
+            hyper::service::service_fn(move |req| {
+                let root = Arc::clone(&canonical_root);
+                let idx  = Arc::clone(&index_file);
+                let met  = Arc::clone(&metrics);
+                let csp  = Arc::clone(&csp);
+                async move {
+                    route(req, &root, &idx, dir_listing, expose_dotfiles, &met, &csp).await
+                }
+            }),
+        )
+        .await
+        .map_err(|e| {
+            crate::AppError::Io(std::io::Error::other(e.to_string()))
+        })
+}
+
+// ─── Router ──────────────────────────────────────────────────────────────────
+
+async fn route(
+    req: Request<Incoming>,
+    canonical_root: &Path,
+    index_file: &str,
+    dir_listing: bool,
+    expose_dotfiles: bool,
+    metrics: &SharedMetrics,
+    csp: &str,
+) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    match req.method() {
+        &Method::OPTIONS => {
+            metrics.add_request();
+            return Ok(options_response());
+        }
+        m if m != Method::GET && m != Method::HEAD => {
+            metrics.add_error();
+            return Ok(method_not_allowed());
+        }
+        _ => {}
+    }
+
+    let is_head = req.method() == Method::HEAD;
+    let raw_path = req.uri().path();
+    let decoded = percent_decode(raw_path.split('?').next().unwrap_or("/"));
 
     match resolve_path(
-        &canonical_root,
+        canonical_root,
         &decoded,
-        &index_file,
+        index_file,
         dir_listing,
         expose_dotfiles,
     ) {
-        Resolved::File(abs_path) => {
-            serve_file(&mut stream, &abs_path, is_head, &metrics, &csp).await?;
-        }
+        Resolved::File(abs_path) => serve_file(&req, &abs_path, is_head, metrics, csp).await,
         Resolved::NotFound => {
             log::debug!("404 Not Found: {decoded}");
-            write_response(
-                &mut stream,
-                404,
-                "Not Found",
-                "text/plain",
-                b"Not Found",
-                false,
-                &csp,
-            )
-            .await?;
             metrics.add_request();
+            Ok(text_response(StatusCode::NOT_FOUND, "Not Found", csp, ""))
         }
         Resolved::Redirect(location) => {
-            // fix H-3 — sanitize CR/LF from location to prevent CRLF injection.
-            // fix H-9 — emit all security headers (especially Referrer-Policy:
-            // no-referrer) on the 301; previously this response bypassed
-            // write_headers entirely, leaking the .onion URL as a Referer.
-            let safe_location = sanitize_header_value(&location);
-            let body = format!("Redirecting to {safe_location}");
-            let body_len = body.len() as u64;
-            write_redirect(&mut stream, &safe_location, body_len, &csp).await?;
-            if !is_head {
-                stream.write_all(body.as_bytes()).await?;
-            }
-            stream.flush().await?;
+            let safe = sanitize_header_value(&location);
             metrics.add_request();
+            Ok(redirect_response(&safe, csp))
         }
         Resolved::Fallback => {
-            // fix S-2 — 503 Service Unavailable accurately represents "no content
-            // configured yet" and prevents the fallback page being cached or indexed
-            // as a working endpoint.  Previously returned 200 which could be cached.
-            write_response(
-                &mut stream,
-                503,
-                "Service Unavailable",
-                "text/html; charset=utf-8",
-                fallback::NO_SITE_HTML.as_bytes(),
-                is_head,
-                &csp,
-            )
-            .await?;
             metrics.add_request();
+            Ok(html_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                fallback::NO_SITE_HTML,
+                is_head,
+                csp,
+                "",
+            ))
         }
         Resolved::Forbidden => {
             log::warn!("403 Forbidden: {decoded}");
-            write_response(
-                &mut stream,
-                403,
-                "Forbidden",
-                "text/plain",
-                b"Forbidden",
-                false,
-                &csp,
-            )
-            .await?;
             metrics.add_error();
+            Ok(text_response(StatusCode::FORBIDDEN, "Forbidden", csp, ""))
         }
         Resolved::DirectoryListing(dir_path) => {
-            // fix H-1 — std::fs::read_dir is a blocking syscall; calling it
-            // directly on a Tokio worker thread starves other tasks.  For large
-            // directories this can block all workers simultaneously under load.
             let decoded_clone = decoded.clone();
-            let expose_dotfiles_inner = expose_dotfiles;
+            let expose_dots_inner = expose_dotfiles;
             let html = tokio::task::spawn_blocking(move || {
-                build_directory_listing(&dir_path, &decoded_clone, expose_dotfiles_inner)
+                build_directory_listing(&dir_path, &decoded_clone, expose_dots_inner)
             })
             .await
-            .map_err(|e| {
-                crate::AppError::Io(std::io::Error::other(format!(
-                    "directory listing task panicked: {e}"
-                )))
-            })?;
-            write_response(
-                &mut stream,
-                200,
-                "OK",
-                "text/html; charset=utf-8",
-                html.as_bytes(),
-                is_head,
-                &csp,
-            )
-            .await?;
+            .map_err(|e| std::io::Error::other(format!("directory listing task panicked: {e}")))?;
+
             metrics.add_request();
+            Ok(html_response(StatusCode::OK, &html, is_head, csp, &decoded))
         }
     }
-
-    Ok(())
 }
 
 // ─── File serving ─────────────────────────────────────────────────────────────
 
-/// Open `abs_path`, send headers + streamed body (or headers only for HEAD).
-///
-/// # Errors
-///
-/// Propagates I/O errors from opening the file, reading metadata, or writing
-/// the response to the stream.
-/// Write the body of an already-opened file to `stream`, with a 120 s timeout.
-///
-/// Separated from [`serve_file`] to keep that function under the line limit.
-async fn send_file_body(stream: &mut TcpStream, file: &mut tokio::fs::File) -> Result<()> {
-    // A slow reader holds a semaphore permit for an unbounded time without a
-    // write timeout.  120 s is generous for Tor while still ejecting idle
-    // connections.
-    const RESPONSE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-    tokio::time::timeout(RESPONSE_WRITE_TIMEOUT, tokio::io::copy(file, stream))
-        .await
-        .map_err(|_| {
-            crate::AppError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "response write timed out — client too slow",
-            ))
-        })??;
-    Ok(())
-}
-
-/// Write the appropriate error response when `File::open` fails.
-///
-/// Separated from [`serve_file`] to keep that function under the line limit.
-async fn serve_open_error(
-    stream: &mut TcpStream,
+/// Serve a file, honouring conditional GET (H-9), Range (H-13), and
+/// Accept-Encoding compression (H-8).
+async fn serve_file(
+    req: &Request<Incoming>,
     abs_path: &std::path::Path,
-    e: std::io::Error,
+    is_head: bool,
     metrics: &SharedMetrics,
     csp: &str,
-) -> Result<()> {
+) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    let mut file = match tokio::fs::File::open(abs_path).await {
+        Ok(f) => f,
+        Err(e) => return Ok(open_error_response(abs_path, &e, metrics, csp)),
+    };
+
+    let metadata = match file.metadata().await {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("Failed to read metadata for {}: {e}", abs_path.display());
+            metrics.add_error();
+            return Ok(text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                csp,
+                "",
+            ));
+        }
+    };
+
+    let file_len = metadata.len();
+    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let content_type = mime::for_extension(ext);
+    let path_str = abs_path.to_str().unwrap_or("");
+    let etag = weak_etag(&metadata);
+
+    // ── ETag / conditional GET (H-9) ─────────────────────────────────────────
+    if client_etag_matches(req, &etag) {
+        metrics.add_request();
+        let resp = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", &etag)
+            .header("Cache-Control", cache_control_for(content_type, path_str))
+            .body(empty_body())
+            .unwrap_or_default();
+        return Ok(resp);
+    }
+
+    // ── Range request (H-13) ─────────────────────────────────────────────────
+    if let Some(range_result) = parse_range(req, file_len) {
+        return if let Ok(range) = range_result {
+            use tokio::io::AsyncSeekExt as _;
+            file.seek(std::io::SeekFrom::Start(range.start)).await?;
+            // saturating_add(1): end is guaranteed < file_len by parse_range,
+            // so end - start + 1 cannot actually overflow, but pedantic requires
+            // every arithmetic operation to be explicitly overflow-safe.
+            let send_len = range.end.saturating_sub(range.start).saturating_add(1);
+
+            let encoding = best_encoding(req);
+            let (body, content_encoding) = if is_head {
+                (empty_body(), None)
+            } else {
+                compress_body(file, send_len, encoding).await?
+            };
+
+            let mut builder = Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(
+                    "Content-Range",
+                    format!("bytes {}-{}/{}", range.start, range.end, file_len),
+                )
+                .header("Accept-Ranges", "bytes")
+                .header("ETag", &etag)
+                .header("Cache-Control", cache_control_for(content_type, path_str))
+                .header(header::CONTENT_TYPE, content_type);
+            builder = security_headers(builder, csp, content_type);
+            if let Some(enc) = content_encoding {
+                builder = builder
+                    .header("Content-Encoding", enc)
+                    .header("Vary", "Accept-Encoding");
+            } else {
+                builder = builder.header(header::CONTENT_LENGTH, send_len);
+            }
+            metrics.add_request();
+            Ok(builder.body(body).unwrap_or_default())
+        } else {
+            metrics.add_error();
+            Ok(Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header("Content-Range", format!("bytes */{file_len}"))
+                .body(empty_body())
+                .unwrap_or_default())
+        };
+    }
+
+    // ── Full-file response ────────────────────────────────────────────────────
+    let encoding = best_encoding(req);
+    let (body, content_encoding) = if is_head {
+        (empty_body(), None)
+    } else {
+        compress_body(file, file_len, encoding).await?
+    };
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header("Accept-Ranges", "bytes")
+        .header("ETag", &etag)
+        .header("Cache-Control", cache_control_for(content_type, path_str));
+    builder = security_headers(builder, csp, content_type);
+    if let Some(enc) = content_encoding {
+        builder = builder
+            .header("Content-Encoding", enc)
+            .header("Vary", "Accept-Encoding");
+    } else {
+        builder = builder.header(header::CONTENT_LENGTH, file_len);
+    }
+
+    metrics.add_request();
+    Ok(builder.body(body).unwrap_or_default())
+}
+
+// ─── Compression (H-8) ───────────────────────────────────────────────────────
+
+/// Encoding negotiated from `Accept-Encoding`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Encoding {
+    Brotli,
+    Gzip,
+    Identity,
+}
+
+/// Choose the best encoding the client accepts.
+///
+/// Prefers Brotli (superior compression ratio) over Gzip.
+/// Returns `Identity` when neither is offered or the header is absent.
+pub fn best_encoding<B>(req: &Request<B>) -> Encoding {
+    let Some(accept) = req.headers().get(header::ACCEPT_ENCODING) else {
+        return Encoding::Identity;
+    };
+    let Ok(s) = accept.to_str() else {
+        return Encoding::Identity;
+    };
+    let has = |name: &str| {
+        s.split(',').any(|part| {
+            part.trim()
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case(name)
+        })
+    };
+    if has("br") {
+        Encoding::Brotli
+    } else if has("gzip") {
+        Encoding::Gzip
+    } else {
+        Encoding::Identity
+    }
+}
+
+/// Read up to `len` bytes from `file`, compressing according to `encoding`.
+///
+/// Returns `(body, Some("br"|"gzip"))` when compression is applied, or
+/// `(body, None)` for identity encoding.
+///
+/// The `len` cap respects Range requests — only the requested slice is read.
+async fn compress_body(
+    mut file: tokio::fs::File,
+    len: u64,
+    encoding: Encoding,
+) -> std::io::Result<(BoxBody, Option<&'static str>)> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut handle = (&mut file).take(len);
+
+    match encoding {
+        Encoding::Brotli => {
+            use async_compression::tokio::bufread::BrotliEncoder;
+            use tokio::io::BufReader;
+            let mut enc = BrotliEncoder::new(BufReader::new(handle));
+            let mut buf = Vec::new();
+            enc.read_to_end(&mut buf).await?;
+            Ok((full_body(buf), Some("br")))
+        }
+        Encoding::Gzip => {
+            use async_compression::tokio::bufread::GzipEncoder;
+            use tokio::io::BufReader;
+            let mut enc = GzipEncoder::new(BufReader::new(handle));
+            let mut buf = Vec::new();
+            enc.read_to_end(&mut buf).await?;
+            Ok((full_body(buf), Some("gzip")))
+        }
+        Encoding::Identity => {
+            let mut buf = Vec::new();
+            handle.read_to_end(&mut buf).await?;
+            Ok((full_body(buf), None))
+        }
+    }
+}
+
+// ─── ETag helpers (H-9) ──────────────────────────────────────────────────────
+
+/// Compute a weak `ETag` from file metadata without reading file content.
+///
+/// Format: `W/"<mtime_secs>-<size>"`.
+/// Weak because mtime resolution means two different writes can share a value
+/// on some filesystems.  Sufficient for conditional `GET` — prevents unnecessary
+/// full transfers on subsequent page loads.
+fn weak_etag(metadata: &std::fs::Metadata) -> String {
+    use std::time::UNIX_EPOCH;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    format!("W/\"{}-{}\"", mtime, metadata.len())
+}
+
+/// Return `true` when the client's `If-None-Match` header matches `etag`.
+fn client_etag_matches<B>(req: &Request<B>, etag: &str) -> bool {
+    req.headers()
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|client_etag| {
+            // Promote to a plain `fn` so the compiler can express the
+            // `for<'a> fn(&'a str) -> &'a str` bound that a closure cannot.
+            fn strip(s: &str) -> &str {
+                s.trim().trim_start_matches("W/").trim_matches('"')
+            }
+            strip(client_etag) == strip(etag) || client_etag == "*"
+        })
+}
+
+// ─── Range request parsing (H-13) ────────────────────────────────────────────
+
+/// A parsed byte range from `Range: bytes=<start>-<end>`.
+#[derive(Debug, Clone, Copy)]
+pub struct ByteRange {
+    pub start: u64,
+    pub end: u64, // inclusive
+}
+
+/// Parse `Range: bytes=N-M` from the request.
+///
+/// - `None` — no `Range` header present; serve the full file.
+/// - `Some(Ok(range))` — valid single range.
+/// - `Some(Err(()))` — invalid / out-of-bounds / multi-range; respond with 416.
+pub fn parse_range<B>(
+    req: &Request<B>,
+    file_len: u64,
+) -> Option<std::result::Result<ByteRange, ()>> {
+    let raw = req.headers().get(header::RANGE)?.to_str().ok()?;
+    let bytes = raw.strip_prefix("bytes=")?;
+
+    // Multi-range rejected — not worth the implementation cost.
+    if bytes.contains(',') {
+        return Some(Err(()));
+    }
+
+    let (start_str, end_str) = bytes.split_once('-')?;
+
+    let (start, end) = if start_str.is_empty() {
+        // Suffix range: bytes=-N  (last N bytes)
+        let suffix: u64 = end_str.parse().ok()?;
+        let start = file_len.saturating_sub(suffix);
+        (start, file_len.saturating_sub(1))
+    } else {
+        let start: u64 = start_str.parse().ok()?;
+        let end = if end_str.is_empty() {
+            file_len.saturating_sub(1)
+        } else {
+            end_str.parse().ok()?
+        };
+        (start, end)
+    };
+
+    if start > end || end >= file_len {
+        return Some(Err(()));
+    }
+    Some(Ok(ByteRange { start, end }))
+}
+
+// ─── Response builders ───────────────────────────────────────────────────────
+
+/// Apply the full security-header set to a response builder.
+///
+/// Single definition of the security headers (H-1).  Every response path —
+/// 200, 206, 301, 304, 400, 404, 500 — goes through here so additions never
+/// need to be applied in multiple places.
+fn security_headers(
+    mut builder: hyper::http::response::Builder,
+    csp: &str,
+    content_type: &str,
+) -> hyper::http::response::Builder {
+    builder = builder
+        .header("X-Content-Type-Options", "nosniff")
+        .header("X-Frame-Options", "SAMEORIGIN")
+        .header("Referrer-Policy", "no-referrer")
+        .header(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=()",
+        );
+    if content_type.starts_with("text/html") && !csp.is_empty() {
+        let safe = sanitize_header_value(csp);
+        builder = builder.header("Content-Security-Policy", safe.as_ref());
+    }
+    builder
+}
+
+fn text_response(
+    status: StatusCode,
+    body: &'static str,
+    csp: &str,
+    url_path: &str,
+) -> Response<BoxBody> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, body.len())
+        .header("Cache-Control", cache_control_for("text/plain", url_path));
+    builder = security_headers(builder, csp, "text/plain");
+    builder.body(full_body(body)).unwrap_or_default()
+}
+
+fn html_response(
+    status: StatusCode,
+    body: &str,
+    suppress: bool,
+    csp: &str,
+    url_path: &str,
+) -> Response<BoxBody> {
+    const CT: &str = "text/html; charset=utf-8";
+    let data: Bytes = Bytes::copy_from_slice(body.as_bytes());
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, CT)
+        .header(header::CONTENT_LENGTH, data.len())
+        .header("Cache-Control", cache_control_for(CT, url_path));
+    builder = security_headers(builder, csp, CT);
+    let body = if suppress {
+        empty_body()
+    } else {
+        full_body(data)
+    };
+    builder.body(body).unwrap_or_default()
+}
+
+fn redirect_response(location: &str, csp: &str) -> Response<BoxBody> {
+    // Emit security headers on 301 so the .onion address does not leak via
+    // Referer when the browser follows the redirect (H-9 / write_headers emits
+    // all security headers from one place; write_redirect delegates here).
+    let body = format!("Redirecting to {location}");
+    let data: Bytes = Bytes::copy_from_slice(body.as_bytes());
+    let mut builder = Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY)
+        .header(header::LOCATION, location)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, data.len())
+        .header("Cache-Control", "no-cache");
+    builder = security_headers(builder, csp, "text/plain");
+    builder.body(full_body(data)).unwrap_or_default()
+}
+
+fn method_not_allowed() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header(header::ALLOW, "GET, HEAD, OPTIONS")
+        .header(header::CONTENT_LENGTH, "0")
+        .body(empty_body())
+        .unwrap_or_default()
+}
+
+fn options_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::ALLOW, "GET, HEAD, OPTIONS")
+        .header(header::CONTENT_LENGTH, "0")
+        .body(empty_body())
+        .unwrap_or_default()
+}
+
+fn open_error_response(
+    abs_path: &std::path::Path,
+    e: &std::io::Error,
+    metrics: &SharedMetrics,
+    csp: &str,
+) -> Response<BoxBody> {
+    metrics.add_error();
     match e.kind() {
         std::io::ErrorKind::PermissionDenied => {
             log::warn!("403 Forbidden (permission denied): {}", abs_path.display());
-            write_response(
-                stream,
-                403,
-                "Forbidden",
-                "text/plain",
-                b"Forbidden",
-                false,
-                csp,
-            )
-            .await?;
-            metrics.add_error();
+            text_response(StatusCode::FORBIDDEN, "Forbidden", csp, "")
         }
         std::io::ErrorKind::NotFound => {
             log::warn!(
                 "404 Not Found (file disappeared after resolve): {}",
                 abs_path.display()
             );
-            write_response(
-                stream,
-                404,
-                "Not Found",
-                "text/plain",
-                b"Not Found",
-                false,
-                csp,
-            )
-            .await?;
-            metrics.add_error();
+            text_response(StatusCode::NOT_FOUND, "Not Found", csp, "")
         }
         _ => {
             log::error!("Unexpected error opening {}: {e}", abs_path.display());
-            write_response(
-                stream,
-                500,
+            text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
-                "text/plain",
-                b"Internal Server Error",
-                false,
                 csp,
+                "",
             )
-            .await?;
-            metrics.add_error();
         }
     }
-    Ok(())
 }
 
-async fn serve_file(
-    stream: &mut TcpStream,
-    abs_path: &std::path::Path,
-    is_head: bool,
-    metrics: &SharedMetrics,
-    csp: &str,
-) -> Result<()> {
-    // Distinguish error kinds so the client gets the right status code:
-    //   PermissionDenied → 403 Forbidden
-    //   NotFound         → 404 Not Found
-    //   anything else    → 500 Internal Server Error (also logged)
-    let mut file = match tokio::fs::File::open(abs_path).await {
-        Ok(f) => f,
-        Err(e) => return serve_open_error(stream, abs_path, e, metrics, csp).await,
-    };
+// ─── Cache-Control classification (M-17) ─────────────────────────────────────
 
-    let file_len = match file.metadata().await {
-        Ok(m) => m.len(),
-        Err(e) => {
-            log::warn!(
-                "Failed to read file metadata for {}: {e}",
-                abs_path.display()
-            );
-            write_response(
-                stream,
-                500,
-                "Internal Server Error",
-                "text/plain",
-                b"Internal Server Error",
-                false,
-                csp,
-            )
-            .await?;
-            metrics.add_error();
-            return Ok(());
-        }
-    };
-
-    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let content_type = mime::for_extension(ext);
-    // Phase 2 (M-17) — pass the actual path so cache_control_for can give
-    // hashed assets immutable caching.
-    let path_str = abs_path.to_str().unwrap_or("");
-    write_headers(
-        stream,
-        200,
-        "OK",
-        content_type,
-        file_len,
-        csp,
-        None,
-        path_str,
-    )
-    .await?;
-    if !is_head {
-        send_file_body(stream, &mut file).await?;
+/// Classify a URL path into the appropriate `Cache-Control` value.
+///
+/// - HTML: `no-store` — prevents .onion address leaking via HTTP caches.
+/// - Hashed assets (e.g. `app.a1b2c3d4.js`): `max-age=31536000, immutable`.
+/// - Everything else: `no-cache` — revalidate but allow conditional GET.
+fn cache_control_for(content_type: &str, path: &str) -> &'static str {
+    if content_type.starts_with("text/html") {
+        return "no-store";
     }
-    stream.flush().await?;
-    metrics.add_request();
-    Ok(())
-}
-
-// ─── Request reading ─────────────────────────────────────────────────────────
-
-/// Read HTTP request headers from a buffered stream, line by line.
-///
-/// Stops at the blank line that terminates the HTTP header section
-/// (`\r\n` or bare `\n`). Enforces an 8 KiB total limit.
-///
-/// # Errors
-///
-/// - [`std::io::ErrorKind::InvalidData`] when the total header block exceeds
-///   8 KiB — the caller maps this to `400 Bad Request`.
-/// - [`std::io::ErrorKind::Other`] when the connection closes before the
-///   blank terminating line is received.
-/// - Any underlying [`std::io::Error`] from the network layer.
-async fn read_request(reader: &mut BufReader<TcpStream>) -> Result<String> {
-    let mut request = String::with_capacity(512);
-    let mut total = 0usize;
-
-    loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Err(
-                std::io::Error::other("Connection closed before headers were complete").into(),
-            );
-        }
-        total = total.saturating_add(n);
-        if total > 8_192 {
-            // Use InvalidData so the caller can distinguish "too large" from
-            // other I/O errors and respond with 400 rather than dropping the
-            // connection silently.
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Request header too large (> 8 KiB)",
-            )
-            .into());
-        }
-        request.push_str(&line);
-        // Both `\r\n` (CRLF, RFC 7230 §3) and bare `\n` terminate the headers.
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if is_hashed_asset(file_name) {
+        "max-age=31536000, immutable"
+    } else {
+        "no-cache"
     }
-
-    Ok(request)
 }
 
-/// Outcome of parsing the HTTP request line.
-///
-/// Separates "bad syntax" from "disallowed method" so the caller can return
-/// the RFC 9110-correct status code in each case (fix H-4).
-enum ParseResult<'a> {
-    Ok { method: &'a str, path: &'a str },
-    MethodNotAllowed { method: &'a str },
-    BadRequest,
-}
-
-/// Extract the method and URL path from `GET /path HTTP/1.1`.
-fn parse_path(request: &str) -> ParseResult<'_> {
-    let Some(first) = request.lines().next() else {
-        return ParseResult::BadRequest;
-    };
-    let mut it = first.splitn(3, ' ');
-    let Some(method) = it.next() else {
-        return ParseResult::BadRequest;
-    };
-    if method != "GET" && method != "HEAD" {
-        return ParseResult::MethodNotAllowed { method };
-    }
-    let Some(path) = it.next() else {
-        return ParseResult::BadRequest;
-    };
-    ParseResult::Ok { method, path }
+/// Return `true` when `name` contains a dot-delimited segment of 8–16
+/// lowercase hex characters (bundler content-hash pattern).
+fn is_hashed_asset(name: &str) -> bool {
+    name.split('.')
+        .any(|seg| (8..=16).contains(&seg.len()) && seg.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 // ─── Path resolution ─────────────────────────────────────────────────────────
 
-/// Resolve `.` and `..` components in `path` lexically, without any
-/// filesystem calls.  The result is an absolute path with the same prefix
-/// as `path` but with all `..` hops applied to the accumulated component stack.
-///
-/// Unlike [`std::fs::canonicalize`] this works on paths whose final component
-/// does not yet exist on disk, which is exactly what we need when checking
-/// whether a requested-but-missing file would fall inside the site root.
+/// Resolve `.` and `..` in `path` lexically, without filesystem calls.
 fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
     let mut stack: Vec<std::path::Component<'_>> = Vec::new();
     for component in path.components() {
         match component {
             std::path::Component::ParentDir => {
-                // Only pop a normal component; never pop a root or prefix.
                 if matches!(stack.last(), Some(std::path::Component::Normal(_))) {
                     stack.pop();
                 }
             }
-            std::path::Component::CurDir => { /* skip — no-op */ }
+            std::path::Component::CurDir => {}
             c => stack.push(c),
         }
     }
@@ -543,11 +625,8 @@ fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
 
 /// Return `true` when any component of `resolved` relative to `root` starts with `.`.
 ///
-/// Called *after* `canonicalize()` so symlinks are fully resolved (M-2).
-/// The URL-path check that ran before `canonicalize()` could be bypassed by a
-/// symlink whose link name does not start with `.` but whose target path does
-/// (e.g. a symlink named `public` pointing to `.git/`).  Checking the
-/// canonicalized path closes that gap because the resolved component IS `.git`.
+/// Called after `canonicalize()` to catch symlinks whose link name does not
+/// start with `.` but whose target path does (M-2).
 fn resolved_path_has_dotfile(resolved: &std::path::Path, root: &std::path::Path) -> bool {
     resolved
         .strip_prefix(root)
@@ -566,7 +645,7 @@ pub(crate) enum Resolved {
     Fallback,
     Forbidden,
     DirectoryListing(std::path::PathBuf),
-    /// 301 redirect to the given Location URL (used to append a trailing slash).
+    /// 301 redirect to the given Location URL.
     Redirect(String),
 }
 
@@ -576,11 +655,9 @@ pub(crate) fn resolve_path(
     url_path: &str,
     index_file: &str,
     dir_listing: bool,
-    expose_dotfiles: bool, // fix H-10: when false, 403 on direct requests to dot-files
+    expose_dotfiles: bool,
 ) -> Resolved {
-    // fix H-10 — block direct requests for dot-files (e.g. /.git/config, /.env)
-    // regardless of whether they exist, unless the operator explicitly opts in.
-    // Directory listing filtering is handled in build_directory_listing.
+    // Block direct requests for dot-files unless operator opts in (H-10 / M-2).
     if !expose_dotfiles {
         for component in std::path::Path::new(url_path).components() {
             if let std::path::Component::Normal(name) = component {
@@ -596,8 +673,7 @@ pub(crate) fn resolve_path(
 
     let target = if candidate.is_dir() {
         if !url_path.ends_with('/') {
-            let redirect_to = format!("{url_path}/");
-            return Resolved::Redirect(redirect_to);
+            return Resolved::Redirect(format!("{url_path}/"));
         }
         let idx = candidate.join(index_file);
         if idx.exists() {
@@ -627,11 +703,7 @@ pub(crate) fn resolve_path(
         return Resolved::Forbidden;
     }
 
-    // Phase 2 (M-2) — re-check for dot-file components on the *canonicalized*
-    // path.  The URL-path check above catches obvious cases like `/.git/config`
-    // but a symlink whose link name is `public` pointing to `.git/` would pass
-    // that check because "public" does not start with `.`.  After canonicalize()
-    // the resolved path contains `.git` directly, so this check catches it.
+    // Post-canonicalize dot-file check (M-2).
     if !expose_dotfiles && resolved_path_has_dotfile(&canonical, canonical_root) {
         return Resolved::Forbidden;
     }
@@ -639,253 +711,19 @@ pub(crate) fn resolve_path(
     Resolved::File(canonical)
 }
 
-// ─── Response writing ────────────────────────────────────────────────────────
+// ─── Header value sanitisation ───────────────────────────────────────────────
 
-/// Strip all ASCII control characters from a string destined for an HTTP header value.
+/// Strip all ASCII control characters from a value destined for an HTTP header.
 ///
-/// RFC 9110 §5.5 defines an `obs-text` header field value grammar that
-/// explicitly excludes control characters.  The previous implementation only
-/// stripped CR (`\r`) and LF (`\n`), which prevented response splitting but
-/// still permitted null bytes (U+0000) and other C0 controls that can confuse
-/// downstream proxies and logging systems (M-1).
-///
-/// The filter retains:
-/// - Printable ASCII (U+0020–U+007E)
-/// - Non-ASCII Unicode (U+0080 and above) — legal in obs-text
-///
-/// It removes:
-/// - All C0 controls (U+0000–U+001F) including NUL, CR, LF, TAB, ESC
-/// - DEL (U+007F)
-///
-/// Returns `Cow::Borrowed` when no characters need stripping to avoid a heap
-/// allocation on the common (clean) path.
+/// Retains printable ASCII (U+0020–U+007E) and non-ASCII Unicode.
+/// Removes C0 controls (U+0000–U+001F, including NUL/CR/LF/TAB/ESC) and DEL.
+/// Returns `Cow::Borrowed` on the common (clean) path to avoid heap allocation.
 fn sanitize_header_value(s: &str) -> std::borrow::Cow<'_, str> {
     if s.chars().any(|c| c.is_ascii_control()) {
         std::borrow::Cow::Owned(s.chars().filter(|c| !c.is_ascii_control()).collect())
     } else {
         std::borrow::Cow::Borrowed(s)
     }
-}
-
-/// Write a complete HTTP response, optionally suppressing the body (for HEAD).
-///
-/// The `Content-Length` header always reflects the full body size, even when
-/// the body is suppressed, as required by RFC 7231 §4.3.2.
-///
-/// # Errors
-///
-/// Propagates any [`std::io::Error`] from writing to the stream.
-async fn write_response(
-    stream: &mut TcpStream,
-    status: u16,
-    reason: &str,
-    content_type: &str,
-    body: &[u8],
-    suppress_body: bool,
-    csp: &str,
-) -> Result<()> {
-    // `usize as u64`: on all supported targets usize ≤ 64 bits, so this cast
-    // is always lossless.  The allow suppresses clippy::cast_possible_truncation
-    // at the narrowest possible scope.
-    #[allow(clippy::cast_possible_truncation)]
-    let body_len: u64 = body.len() as u64;
-    // Error and fallback pages are not tied to a URL for caching — pass "" so
-    // cache_control_for returns "no-cache" rather than accidentally applying
-    // "immutable" to a synthetic body.
-    write_headers(
-        stream,
-        status,
-        reason,
-        content_type,
-        body_len,
-        csp,
-        None,
-        "",
-    )
-    .await?;
-    if !suppress_body {
-        stream.write_all(body).await?;
-    }
-    stream.flush().await?;
-    Ok(())
-}
-
-// ─── Cache-Control classification (M-17) ─────────────────────────────────────
-
-/// Classify a URL path into the appropriate `Cache-Control` value.
-///
-/// Rules:
-/// - HTML documents: `no-store` (prevent Tor onion address from leaking via
-///   HTTP caches or browser history — HTML may contain the address inline).
-/// - Paths containing a 8-16 hex-char hash segment (hashed assets produced by
-///   bundlers such as Vite/webpack): `max-age=31536000, immutable`.  Content-
-///   addressed filenames cannot change without the URL changing, so a permanent
-///   cache is safe.
-/// - Everything else: `no-cache` (revalidate on every request but allow
-///   conditional GET, improving performance for unchanged resources).
-///
-/// Previously `no-store` was applied to every response, which meant large JS
-/// and CSS files were re-fetched in full on every page load — painful over Tor
-/// (M-17).
-fn cache_control_for(content_type: &str, path: &str) -> &'static str {
-    if content_type.starts_with("text/html") {
-        return "no-store";
-    }
-    let file_name = std::path::Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-
-    if is_hashed_asset(file_name) {
-        "max-age=31536000, immutable"
-    } else {
-        "no-cache"
-    }
-}
-
-/// Return `true` when `name` contains a segment that looks like a content hash.
-///
-/// Matches bundler output patterns such as `app.a1b2c3d4.js` and
-/// `main.deadbeef01234567.css` — a dot-delimited segment of 8–16 lowercase hex
-/// characters surrounded by at least one other segment.
-fn is_hashed_asset(name: &str) -> bool {
-    name.split('.')
-        .any(|seg| (8..=16).contains(&seg.len()) && seg.chars().all(|c| c.is_ascii_hexdigit()))
-}
-
-///
-/// Called by both [`write_headers`] (after emitting the status line) and
-/// [`write_redirect`] (after emitting `301 + Location`).  Centralising the
-/// security-header set here means any future addition is made in exactly one
-/// place — the previous arrangement required identical edits in both functions,
-/// an invariant that was already violated when `Content-Security-Policy` was
-/// added only to `write_headers` (fix H-1).
-///
-/// The `url_path` parameter is used to compute the `Cache-Control` value via
-/// [`cache_control_for`].  Pass `""` for responses that are not tied to a
-/// specific URL (redirects, error pages) — they will receive `no-cache`.
-///
-/// ## Security headers emitted on every response
-///
-/// | Header                   | Value                                       |
-/// |--------------------------|---------------------------------------------|
-/// | `X-Content-Type-Options` | `nosniff`                                   |
-/// | `X-Frame-Options`        | `SAMEORIGIN`                                |
-/// | `Referrer-Policy`        | `no-referrer`                               |
-/// | `Permissions-Policy`     | `camera=(), microphone=(), geolocation=()`  |
-///
-/// For HTML responses, `Content-Security-Policy` is also emitted.
-/// `Referrer-Policy: no-referrer` is critical for the Tor hidden-service case:
-/// without it the `.onion` URL leaks in the `Referer` header sent to any
-/// third-party resource embedded in a served HTML page.
-async fn write_header_fields(
-    stream: &mut TcpStream,
-    content_type: &str,
-    content_length: u64,
-    csp: &str,
-    content_disposition: Option<&str>,
-    url_path: &str,
-) -> Result<()> {
-    let is_html = content_type.starts_with("text/html");
-    // Phase 2 (M-1) — strip ALL ASCII control chars, not just CR/LF.
-    let safe_csp = sanitize_header_value(csp);
-    let csp_line = if is_html && !safe_csp.is_empty() {
-        format!("Content-Security-Policy: {safe_csp}\r\n")
-    } else {
-        String::new()
-    };
-    let cd_line =
-        content_disposition.map_or_else(String::new, |cd| format!("Content-Disposition: {cd}\r\n"));
-
-    // Phase 2 (M-17) — smart Cache-Control instead of blanket no-store.
-    let cache_control = cache_control_for(content_type, url_path);
-
-    let fields = format!(
-        "Content-Type: {content_type}\r\n\
-         Content-Length: {content_length}\r\n\
-         Connection: close\r\n\
-         Cache-Control: {cache_control}\r\n\
-         X-Content-Type-Options: nosniff\r\n\
-         X-Frame-Options: SAMEORIGIN\r\n\
-         Referrer-Policy: no-referrer\r\n\
-         Permissions-Policy: camera=(), microphone=(), geolocation=()\r\n\
-         {cd_line}\
-         {csp_line}\
-         \r\n"
-    );
-    stream.write_all(fields.as_bytes()).await?;
-    Ok(())
-}
-
-/// Write a complete HTTP response status line and all headers.
-///
-/// Delegates the header fields (including all security headers) to
-/// [`write_header_fields`] so the security-header set is defined in one place.
-///
-/// `url_path` is forwarded to [`cache_control_for`] so assets with content-hash
-/// filenames receive `immutable` caching while HTML keeps `no-store`.  Pass `""`
-/// for synthetic responses (error pages, fallback page) — they receive `no-cache`.
-///
-/// # Errors
-///
-/// Propagates any [`std::io::Error`] from writing to the stream.
-async fn write_headers(
-    stream: &mut TcpStream,
-    status: u16,
-    reason: &str,
-    content_type: &str,
-    content_length: u64,
-    csp: &str,
-    content_disposition: Option<&str>, // fix H-5: pass Some("attachment") for SVG
-    url_path: &str,
-) -> Result<()> {
-    stream
-        .write_all(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes())
-        .await?;
-    // write_headers emits all security headers from one place; write_redirect delegates here
-    write_header_fields(
-        stream,
-        content_type,
-        content_length,
-        csp,
-        content_disposition,
-        url_path,
-    )
-    .await
-}
-
-/// Write a `301 Moved Permanently` response with all security headers.
-///
-/// Delegates to [`write_header_fields`] so security headers are emitted from
-/// a single location — previously this function duplicated every header in
-/// `write_headers`, meaning any future security-header addition had to be
-/// applied in two places (fix H-1).
-///
-/// `Referrer-Policy: no-referrer` on the redirect prevents the `.onion`
-/// address leaking in the `Referer` header sent to the redirect destination
-/// (fix H-9).
-async fn write_redirect(
-    stream: &mut TcpStream,
-    location: &str,
-    body_len: u64,
-    csp: &str,
-) -> Result<()> {
-    // Location is already sanitized by the caller, but guard here too so this
-    // function is safe regardless of call site.
-    let safe_location = sanitize_header_value(location);
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 301 Moved Permanently\r\n\
-                 Location: {safe_location}\r\n"
-            )
-            .as_bytes(),
-        )
-        .await?;
-    // write_headers emits all security headers from one place; write_redirect delegates here
-    // Redirects are not tied to a specific URL for caching purposes — pass ""
-    // so cache_control_for returns "no-cache" rather than "no-store".
-    write_header_fields(stream, "text/plain", body_len, csp, None, "").await
 }
 
 // ─── Directory listing ───────────────────────────────────────────────────────
@@ -898,9 +736,7 @@ fn build_directory_listing(dir: &Path, url_path: &str, expose_dotfiles: bool) ->
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().into_string().ok()?;
-                // fix H-10 — hide dot-files (e.g. .git, .env, .htpasswd) by default.
-                // These are almost always unintentional and can expose credentials or
-                // full repository history to anyone with directory listing enabled.
+                // Hide dot-files (e.g. .git, .env, .htpasswd) by default (H-10).
                 if expose_dotfiles || !name.starts_with('.') {
                     Some(name)
                 } else {
@@ -910,10 +746,7 @@ fn build_directory_listing(dir: &Path, url_path: &str, expose_dotfiles: bool) ->
             .collect();
         names.sort();
 
-        // fix H-8 — html_escape(base) prevents XSS via a crafted directory name
-        // containing characters like `"` or `>` that would break the href attribute
-        // context.  Without escaping, a directory named `"onmouseover=alert(1)/`
-        // produces a raw href that executes JavaScript in the .onion origin.
+        // HTML-escape to prevent XSS via crafted directory names (H-8).
         let base = html_escape(url_path.trim_end_matches('/'));
         for name in &names {
             let encoded_name = percent_encode_path(name);
@@ -948,8 +781,6 @@ fn build_directory_listing(dir: &Path, url_path: &str, expose_dotfiles: bool) ->
     )
 }
 
-/// HTML-entity-escape a string for safe insertion into HTML content or
-/// attribute values.
 fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -965,17 +796,11 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-/// Percent-encode a filename component for safe use in a URL path segment.
-///
-/// Encodes all bytes that are not unreserved URI characters (RFC 3986).
 fn percent_encode_path(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
         match byte {
-            // Unreserved characters: ALPHA / DIGIT / "-" / "." / "_" / "~"
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                // All matched bytes are ASCII; `char::from` is the
-                // clippy-pedantic-clean alternative to `byte as char`.
                 out.push(char::from(byte));
             }
             b => {
@@ -988,22 +813,14 @@ fn percent_encode_path(s: &str) -> String {
 
 // ─── Percent decoding ────────────────────────────────────────────────────────
 
-/// Decode percent-encoded characters in a URL path (e.g. `%20` → ` `).
+/// Decode percent-encoded characters in a URL path (`%20` → ` `).
 ///
-/// # Correctness (fix 4.5)
-///
-/// Accumulates consecutive percent-decoded bytes into a buffer and converts to
-/// UTF-8 via `String::from_utf8_lossy` only when a literal character (or
-/// end-of-input) breaks the run.  This correctly handles multi-byte sequences
-/// split across adjacent `%XX` tokens (e.g. `%C3%A9` → `é`).
-///
-/// Null bytes (`%00`) are never decoded — they are passed through as the
-/// literal string `%00` to prevent null-byte path injection attacks.
+/// Accumulates consecutive decoded bytes and converts as UTF-8 so multi-byte
+/// sequences split across `%XX` tokens are handled correctly (`%C3%A9` → `é`).
+/// Null bytes (`%00`) are never decoded — passed through as the literal `%00`.
 #[must_use]
 pub(crate) fn percent_decode(input: &str) -> String {
     let mut output = String::with_capacity(input.len());
-    // Buffer for consecutive percent-decoded bytes that may form a multi-byte
-    // UTF-8 character together.
     let mut byte_buf: Vec<u8> = Vec::new();
 
     let src = input.as_bytes();
@@ -1011,15 +828,11 @@ pub(crate) fn percent_decode(input: &str) -> String {
 
     while i < src.len() {
         if src.get(i).copied() == Some(b'%') {
-            // fix H-7 / clippy::integer_arithmetic — use saturating arithmetic
-            // throughout; the loop guard ensures these never actually saturate,
-            // but the lint requires every addition to be explicitly guarded.
             let h1 = src.get(i.saturating_add(1)).copied().and_then(hex_digit);
             let h2 = src.get(i.saturating_add(2)).copied().and_then(hex_digit);
             if let (Some(hi), Some(lo)) = (h1, h2) {
                 let byte = (hi << 4) | lo;
                 if byte == 0x00 {
-                    // 4.5 — null byte: do not decode, emit literal %00.
                     flush_byte_buf(&mut byte_buf, &mut output);
                     output.push_str("%00");
                 } else {
@@ -1027,7 +840,6 @@ pub(crate) fn percent_decode(input: &str) -> String {
                 }
                 i = i.saturating_add(3);
             } else {
-                // Incomplete or invalid %XX — pass through literal `%`.
                 flush_byte_buf(&mut byte_buf, &mut output);
                 output.push('%');
                 i = i.saturating_add(1);
@@ -1042,12 +854,10 @@ pub(crate) fn percent_decode(input: &str) -> String {
             i = i.saturating_add(ch.len_utf8());
         }
     }
-    // Flush any trailing percent-decoded bytes at end-of-input.
     flush_byte_buf(&mut byte_buf, &mut output);
     output
 }
 
-/// Convert a single ASCII hex digit byte to its numeric value, or `None`.
 const fn hex_digit(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b.wrapping_sub(b'0')),
@@ -1057,8 +867,6 @@ const fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-/// Interpret `buf` as UTF-8 (with lossy replacement for invalid sequences),
-/// append to `out`, then clear `buf`.
 fn flush_byte_buf(buf: &mut Vec<u8>, out: &mut String) {
     if !buf.is_empty() {
         out.push_str(&String::from_utf8_lossy(buf));
@@ -1070,15 +878,20 @@ fn flush_byte_buf(buf: &mut Vec<u8>, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    // `expect()` in test helpers is idiomatic and intentional — a failure here
-    // means the test environment itself is broken, not the code under test.
     #![allow(clippy::expect_used)]
 
+    use super::{percent_decode, resolve_path, Resolved};
     use std::path::Path;
 
-    use super::{percent_decode, resolve_path, Resolved};
-
-    // ── percent_decode ────────────────────────────────────────────────────────
+    fn make_test_tree() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join("index.html"), b"hello").expect("write index");
+        std::fs::write(tmp.path().join("secret.txt"), b"secret").expect("write secret");
+        let canonical_root = root.canonicalize().expect("canonicalize root");
+        (tmp, canonical_root)
+    }
 
     #[test]
     fn percent_decode_ascii_passthrough() {
@@ -1092,60 +905,27 @@ mod tests {
 
     #[test]
     fn percent_decode_multibyte_utf8() {
-        // %C3%A9 is the UTF-8 encoding of 'é' (U+00E9).
-        // Regression test for fix 4.5: the old implementation decoded each
-        // %XX pair as an independent u8→char cast, yielding "Ã©" instead of "é".
         assert_eq!(percent_decode("/caf%C3%A9.html"), "/café.html");
     }
 
     #[test]
     fn percent_decode_null_byte_not_decoded() {
-        // %00 must never be decoded to a null byte (path injection attack).
-        // The literal string "%00" must appear in the output unchanged.
         let result = percent_decode("/foo%00/../secret");
         assert!(
             !result.contains('\x00'),
-            "null byte found in decoded output: {result:?}"
+            "null byte in decoded output: {result:?}"
         );
-        assert!(
-            result.contains("%00"),
-            "expected literal %00 in output, got: {result:?}"
-        );
+        assert!(result.contains("%00"), "expected literal %00: {result:?}");
     }
 
     #[test]
     fn percent_decode_incomplete_percent_sequence() {
-        // "/foo%2" — the `%2` is not followed by a second hex digit, so the
-        // `%` is passed through literally and the `2` is re-processed.
         assert_eq!(percent_decode("/foo%2"), "/foo%2");
     }
 
     #[test]
     fn percent_decode_invalid_hex() {
-        // "%ZZ" contains non-hex digits after `%`; output must be unchanged.
         assert_eq!(percent_decode("/foo%ZZ"), "/foo%ZZ");
-    }
-
-    // ── resolve_path ──────────────────────────────────────────────────────────
-    //
-    // All tests that exercise the file-system use a temporary directory so
-    // they are completely self-contained and leave no side effects.
-
-    /// Returns a canonical temp dir with the structure:
-    /// ```
-    /// <tmp>/
-    ///   root/
-    ///     index.html        ← served for happy-path tests
-    ///   secret.txt          ← outside root, for traversal tests
-    /// ```
-    fn make_test_tree() -> (tempfile::TempDir, std::path::PathBuf) {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().join("root");
-        std::fs::create_dir_all(&root).expect("create root");
-        std::fs::write(root.join("index.html"), b"hello").expect("write index");
-        std::fs::write(tmp.path().join("secret.txt"), b"secret").expect("write secret");
-        let canonical_root = root.canonicalize().expect("canonicalize root");
-        (tmp, canonical_root)
     }
 
     #[test]
@@ -1161,25 +941,15 @@ mod tests {
     #[test]
     fn resolve_path_directory_traversal() {
         let (tmp, root) = make_test_tree();
-        // secret.txt lives one level above `root`, so "/../secret.txt" would
-        // escape the root if the traversal check were absent.
-        // canonicalize() resolves `<root>/../secret.txt` → `<tmp>/secret.txt`
-        // which is a real file, but it does NOT start_with `root` → Forbidden.
-        let _ = tmp; // keep alive so secret.txt exists for canonicalize
+        let _ = tmp;
         let result = resolve_path(&root, "/../secret.txt", "index.html", false, false);
-        assert_eq!(
-            result,
-            Resolved::Forbidden,
-            "expected Resolved::Forbidden for traversal attempt"
-        );
+        assert_eq!(result, Resolved::Forbidden);
     }
 
     #[test]
     fn resolve_path_encoded_slash_traversal() {
-        // After percent-decoding, "/..%2Fsecret.txt" becomes "/../secret.txt"
-        // which is what is passed to resolve_path — same traversal as above.
         let (tmp, root) = make_test_tree();
-        let decoded = super::percent_decode("/../secret.txt"); // already decoded form
+        let decoded = super::percent_decode("/../secret.txt");
         let _ = tmp;
         let result = resolve_path(&root, &decoded, "index.html", false, false);
         assert_eq!(result, Resolved::Forbidden);
@@ -1194,16 +964,11 @@ mod tests {
 
     #[test]
     fn resolve_path_missing_root_returns_fallback() {
-        // Passing a non-existent root means every canonicalize() call fails.
         let missing_root = Path::new("/nonexistent/root/that/does/not/exist");
         let result = resolve_path(missing_root, "/index.html", "index.html", false, false);
         assert_eq!(result, Resolved::Fallback);
     }
 }
-
-// ── Phase 2 tests ─────────────────────────────────────────────────────────────
-
-// ── 2.3 sanitize_header_value ─────────────────────────────────────────────────
 
 #[cfg(test)]
 mod sanitize_tests {
@@ -1213,41 +978,29 @@ mod sanitize_tests {
     fn strips_crlf() {
         assert_eq!(sanitize_header_value("foo\r\nbar"), "foobar");
     }
-
     #[test]
     fn strips_null_byte() {
-        // M-1: null bytes were not stripped by the old CR/LF-only filter.
         assert_eq!(sanitize_header_value("foo\x00bar"), "foobar");
     }
-
     #[test]
     fn strips_esc() {
-        // M-1: ESC (U+001B) is a C0 control and must be stripped.
         assert_eq!(sanitize_header_value("foo\x1bbar"), "foobar");
     }
-
     #[test]
     fn strips_del() {
-        // M-1: DEL (U+007F) must be stripped.
         assert_eq!(sanitize_header_value("foo\x7fbar"), "foobar");
     }
-
     #[test]
     fn strips_tab() {
-        // M-1: TAB (U+0009) is a C0 control; strip it.
         assert_eq!(sanitize_header_value("foo\tbar"), "foobar");
     }
-
     #[test]
     fn preserves_unicode() {
-        // Non-ASCII Unicode must pass through unchanged (legal in obs-text).
         let input = "/café/page";
         assert_eq!(sanitize_header_value(input), input);
     }
-
     #[test]
     fn no_allocation_when_clean() {
-        // Fast path: clean strings must be returned as Borrowed (no heap alloc).
         let s = "/normal/path";
         assert!(matches!(
             sanitize_header_value(s),
@@ -1255,8 +1008,6 @@ mod sanitize_tests {
         ));
     }
 }
-
-// ── 2.5 cache_control_for / is_hashed_asset ───────────────────────────────────
 
 #[cfg(test)]
 mod cache_tests {
@@ -1269,16 +1020,13 @@ mod cache_tests {
             "no-store"
         );
     }
-
     #[test]
     fn hashed_js_gets_immutable() {
-        // 8-char hex hash segment → "immutable".
         assert_eq!(
             cache_control_for("text/javascript", "/app.a1b2c3d4.js"),
             "max-age=31536000, immutable"
         );
     }
-
     #[test]
     fn hashed_css_gets_immutable() {
         assert_eq!(
@@ -1286,53 +1034,39 @@ mod cache_tests {
             "max-age=31536000, immutable"
         );
     }
-
     #[test]
     fn plain_css_gets_no_cache() {
         assert_eq!(cache_control_for("text/css", "/style.css"), "no-cache");
     }
-
     #[test]
     fn plain_js_gets_no_cache() {
         assert_eq!(cache_control_for("text/javascript", "/main.js"), "no-cache");
     }
-
     #[test]
     fn empty_path_gets_no_cache() {
-        // Error / redirect responses pass "" — must not crash, returns no-cache.
         assert_eq!(cache_control_for("text/plain", ""), "no-cache");
     }
-
     #[test]
     fn is_hashed_asset_rejects_short_hex() {
-        // Only 3 hex chars — too short to be a content hash.
         assert!(!is_hashed_asset("app.abc.js"));
     }
-
     #[test]
     fn is_hashed_asset_accepts_exactly_8_hex() {
         assert!(is_hashed_asset("app.deadbeef.js"));
     }
-
     #[test]
     fn is_hashed_asset_accepts_16_hex() {
         assert!(is_hashed_asset("app.deadbeef01234567.js"));
     }
-
     #[test]
     fn is_hashed_asset_rejects_17_hex() {
-        // 17 chars exceeds the 8-16 range — should not match.
         assert!(!is_hashed_asset("app.deadbeef012345678.js"));
     }
-
     #[test]
     fn is_hashed_asset_rejects_non_hex_segment() {
-        // "ghijklmn" is 8 chars but contains non-hex characters.
         assert!(!is_hashed_asset("app.ghijklmn.js"));
     }
 }
-
-// ── 2.4 resolved_path_has_dotfile ─────────────────────────────────────────────
 
 #[cfg(test)]
 mod dotfile_tests {
@@ -1341,32 +1075,113 @@ mod dotfile_tests {
 
     #[test]
     fn detects_dotfile_component() {
-        let root = Path::new("/srv/site");
-        let resolved = Path::new("/srv/site/.git/config");
-        assert!(resolved_path_has_dotfile(resolved, root));
+        assert!(resolved_path_has_dotfile(
+            Path::new("/srv/site/.git/config"),
+            Path::new("/srv/site")
+        ));
     }
-
     #[test]
     fn allows_normal_component() {
-        let root = Path::new("/srv/site");
-        let resolved = Path::new("/srv/site/assets/main.js");
-        assert!(!resolved_path_has_dotfile(resolved, root));
+        assert!(!resolved_path_has_dotfile(
+            Path::new("/srv/site/assets/main.js"),
+            Path::new("/srv/site")
+        ));
     }
-
     #[test]
     fn detects_nested_dotfile() {
-        let root = Path::new("/srv/site");
-        let resolved = Path::new("/srv/site/sub/.env");
-        assert!(resolved_path_has_dotfile(resolved, root));
+        assert!(resolved_path_has_dotfile(
+            Path::new("/srv/site/sub/.env"),
+            Path::new("/srv/site")
+        ));
+    }
+    #[test]
+    fn allows_dotfile_outside_root_prefix() {
+        assert!(!resolved_path_has_dotfile(
+            Path::new("/srv/.hidden/site/index.html"),
+            Path::new("/srv/.hidden/site"),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    #![allow(clippy::expect_used)]
+    use super::parse_range;
+    use bytes::Bytes;
+    use http_body_util::Empty;
+
+    fn req_with_range(range: &str) -> hyper::Request<Empty<Bytes>> {
+        hyper::Request::builder()
+            .header(hyper::header::RANGE, range)
+            .body(Empty::new())
+            .expect("valid request builder")
     }
 
     #[test]
-    fn allows_dotfile_outside_root_prefix() {
-        // The function strips the root prefix before checking; a dotfile in
-        // the root itself (which is above the served tree) should not trigger.
-        let root = Path::new("/srv/.hidden/site");
-        let resolved = Path::new("/srv/.hidden/site/index.html");
-        // ".hidden" is in the root prefix, not in the relative path — not flagged.
-        assert!(!resolved_path_has_dotfile(resolved, root));
+    fn parse_range_start_end() {
+        let req = req_with_range("bytes=0-499");
+        let r = parse_range(&req, 1000).expect("Some").expect("Ok");
+        assert_eq!((r.start, r.end), (0, 499));
+    }
+
+    #[test]
+    fn parse_range_open_end() {
+        let req = req_with_range("bytes=500-");
+        let r = parse_range(&req, 1000).expect("Some").expect("Ok");
+        assert_eq!((r.start, r.end), (500, 999));
+    }
+
+    #[test]
+    fn parse_range_suffix() {
+        let req = req_with_range("bytes=-500");
+        let r = parse_range(&req, 1000).expect("Some").expect("Ok");
+        assert_eq!((r.start, r.end), (500, 999));
+    }
+
+    #[test]
+    fn parse_range_out_of_bounds() {
+        let req = req_with_range("bytes=900-1100");
+        assert!(parse_range(&req, 1000).expect("Some").is_err());
+    }
+
+    #[test]
+    fn parse_range_multi_range_rejected() {
+        let req = req_with_range("bytes=0-100,200-300");
+        assert!(parse_range(&req, 1000).expect("Some").is_err());
+    }
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    #![allow(clippy::expect_used)]
+    use super::{best_encoding, Encoding};
+    use bytes::Bytes;
+    use http_body_util::Empty;
+
+    fn req_with_ae(ae: &str) -> hyper::Request<Empty<Bytes>> {
+        hyper::Request::builder()
+            .header(hyper::header::ACCEPT_ENCODING, ae)
+            .body(Empty::new())
+            .expect("valid request builder")
+    }
+
+    #[test]
+    fn prefers_brotli_over_gzip() {
+        let req = req_with_ae("gzip, br");
+        assert_eq!(best_encoding(&req), Encoding::Brotli);
+    }
+
+    #[test]
+    fn falls_back_to_gzip() {
+        let req = req_with_ae("gzip, deflate");
+        assert_eq!(best_encoding(&req), Encoding::Gzip);
+    }
+
+    #[test]
+    fn identity_when_no_header() {
+        let req: hyper::Request<Empty<Bytes>> = hyper::Request::builder()
+            .body(Empty::new())
+            .expect("valid request builder");
+        assert_eq!(best_encoding(&req), Encoding::Identity);
     }
 }
