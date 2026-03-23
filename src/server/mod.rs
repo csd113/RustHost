@@ -2,8 +2,10 @@
 //!
 //! **Directory:** `src/server/`
 //!
-//! Provides a minimal, safe HTTP/1.1 static-file server built directly
-//! on [`tokio::net::TcpListener`] — no third-party HTTP framework.
+//! Provides a safe HTTP/1.1 static-file server.  Phase 3 migrated the
+//! per-connection handler from a hand-rolled single-shot parser to
+//! [`hyper`]'s keep-alive connection loop, eliminating the 30–45 s Tor
+//! page-load penalty caused by `Connection: close` on every response (C-1).
 //!
 //! Sub-modules:
 //! - [`handler`]  — per-connection request handling and file serving
