@@ -119,13 +119,21 @@ async fn render(
     metrics: &SharedMetrics,
     last_rendered: &mut String, // 3.3 — previous frame for change-detection
 ) -> Result<()> {
-    let mode = state.read().await.console_mode.clone();
+    // Acquire the lock ONCE and extract everything needed for this frame.
+    // Previously this function locked twice: once to read `console_mode`, then
+    // a second time inside the Dashboard branch to read the full state snapshot.
+    // The two-lock pattern is a TOCTOU hazard — `console_mode` could change
+    // between the first and second acquire — and also holds the lock for longer
+    // than necessary.
+    let (mode, state_snapshot) = {
+        let s = state.read().await;
+        (s.console_mode.clone(), s.clone())
+    };
 
     let output = match mode {
         ConsoleMode::Dashboard => {
-            let s = state.read().await;
             let (reqs, errs) = metrics.snapshot();
-            dashboard::render_dashboard(&s, reqs, errs, config)
+            dashboard::render_dashboard(&state_snapshot, reqs, errs, config)
         }
         ConsoleMode::LogView => dashboard::render_log_view(config.console.show_timestamps),
         ConsoleMode::Help => dashboard::render_help(),

@@ -34,12 +34,12 @@ fn validate(cfg: &Config) -> Result<()> {
     // bind: IpAddr     — invalid IPs are already rejected by serde at parse time (4.2).
     // level: LogLevel  — invalid levels are already rejected by serde at parse time (4.2).
 
-    // fix C-1 — a free-form CSP string with embedded CR/LF could inject
+    // a free-form CSP string with embedded CR/LF could inject
     // arbitrary headers.  The field is now a typed `CspLevel` enum so serde
     // rejects any value that isn't "off", "relaxed", or "strict" at parse time;
     // no runtime check is needed here.
 
-    // fix C-2 — max_connections = 0 deadlocks (semaphore never grants permits);
+    // max_connections = 0 deadlocks (semaphore never grants permits);
     // very large values defeat the connection limit entirely.
     if cfg.server.max_connections == 0 {
         errors.push("[server] max_connections must be at least 1".into());
@@ -48,6 +48,22 @@ fn validate(cfg: &Config) -> Result<()> {
         errors.push(format!(
             "[server] max_connections = {} exceeds the practical limit of 65535",
             cfg.server.max_connections
+        ));
+    }
+
+    // Phase 2 (C-4) — validate per-IP connection limit.
+    //
+    // max_connections_per_ip = 0 would make every connection fail immediately
+    // (the CAS loop can never increment past the limit of zero).
+    // max_connections_per_ip > max_connections means the per-IP guard can
+    // never be the binding constraint, making it useless.
+    if cfg.server.max_connections_per_ip == 0 {
+        errors.push("[server] max_connections_per_ip must be at least 1".into());
+    }
+    if cfg.server.max_connections_per_ip > cfg.server.max_connections {
+        errors.push(format!(
+            "[server] max_connections_per_ip ({}) must be ≤ max_connections ({})",
+            cfg.server.max_connections_per_ip, cfg.server.max_connections
         ));
     }
 
@@ -154,6 +170,41 @@ mod tests {
         assert!(validate(&valid()).is_ok());
     }
 
+    // ── validate — [server] max_connections_per_ip ───────────────────────────
+
+    #[test]
+    fn validate_max_connections_per_ip_zero_is_rejected() {
+        let mut cfg = valid();
+        cfg.server.max_connections_per_ip = 0;
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("max_connections_per_ip"))),
+            "expected ConfigValidation error mentioning max_connections_per_ip, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_max_connections_per_ip_exceeds_max_connections() {
+        let mut cfg = valid();
+        cfg.server.max_connections = 32;
+        cfg.server.max_connections_per_ip = 64; // > max_connections
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("max_connections_per_ip"))),
+            "expected ConfigValidation error mentioning max_connections_per_ip, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_max_connections_per_ip_equal_to_max_connections_is_ok() {
+        let mut cfg = valid();
+        cfg.server.max_connections = 32;
+        cfg.server.max_connections_per_ip = 32; // equal is permitted
+        assert!(validate(&cfg).is_ok());
+    }
+
     // ── validate — [site] directory ─────────────────────────────────────────
 
     #[test]
@@ -241,6 +292,7 @@ bind = "127.0.0.1"
 auto_port_fallback = true
 open_browser_on_start = false
 max_connections = 256
+max_connections_per_ip = 16
 csp_level = "off"
 {extra}
 

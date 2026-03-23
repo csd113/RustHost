@@ -8,6 +8,10 @@
 //! ```text
 //! --config   <path>   Override the path to settings.toml
 //! --data-dir <path>   Override the data-directory root
+//! --serve    <dir>    Serve a directory directly, no first-run setup needed
+//! --port     <n>      Port to use with --serve (default: 8080)
+//! --no-tor            Disable Tor when using --serve
+//! --headless          Disable the interactive console (CI / scripted use)
 //! --version           Print the crate version and exit
 //! --help              Print usage and exit
 //! ```
@@ -25,6 +29,10 @@ use rusthost::runtime::lifecycle::CliArgs;
 fn parse_args() -> CliArgs {
     let mut config_path: Option<PathBuf> = None;
     let mut data_dir: Option<PathBuf> = None;
+    let mut serve_dir: Option<PathBuf> = None;
+    let mut serve_port: u16 = 8080;
+    let mut no_tor = false;
+    let mut headless = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(flag) = args.next() {
@@ -49,6 +57,28 @@ fn parse_args() -> CliArgs {
                     std::process::exit(1);
                 })));
             }
+            "--serve" => {
+                serve_dir = Some(PathBuf::from(args.next().unwrap_or_else(|| {
+                    eprintln!("error: --serve requires a <dir> argument");
+                    std::process::exit(1);
+                })));
+            }
+            "--port" => {
+                let raw = args.next().unwrap_or_else(|| {
+                    eprintln!("error: --port requires a <n> argument");
+                    std::process::exit(1);
+                });
+                serve_port = raw.parse::<u16>().unwrap_or_else(|_| {
+                    eprintln!("error: --port value must be a valid port number (1–65535)");
+                    std::process::exit(1);
+                });
+            }
+            "--no-tor" => {
+                no_tor = true;
+            }
+            "--headless" => {
+                headless = true;
+            }
             unknown => {
                 eprintln!("error: unrecognised argument '{unknown}'");
                 eprintln!("       Run with --help for usage information.");
@@ -60,6 +90,10 @@ fn parse_args() -> CliArgs {
     CliArgs {
         config_path,
         data_dir,
+        serve_dir,
+        serve_port,
+        no_tor,
+        headless,
     }
 }
 
@@ -76,6 +110,11 @@ OPTIONS:
                         (default: <exe-dir>/rusthost-data/settings.toml)
     --data-dir <path>   Override the data-directory root
                         (default: <exe-dir>/rusthost-data/)
+    --serve    <dir>    Serve a directory directly — no first-run setup needed
+                        Example: rusthost-cli --serve ./docs --port 3000 --no-tor
+    --port     <n>      Port for --serve mode (default: 8080)
+    --no-tor            Disable Tor in --serve mode
+    --headless          Disable the interactive console (useful for CI / scripted use)
     --version           Print version and exit
     --help              Print this message and exit",
         ver = env!("CARGO_PKG_VERSION"),

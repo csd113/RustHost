@@ -47,7 +47,6 @@ impl From<LogLevel> for LevelFilter {
 ///
 /// Replaces the post-parse `.parse::<IpAddr>()` check in `loader.rs` with a
 /// parse-time error so an invalid IP is caught the moment the file is read
-/// (fix 4.2).
 fn deserialize_ip_addr<'de, D: Deserializer<'de>>(d: D) -> Result<IpAddr, D::Error> {
     let s = String::deserialize(d)?;
     s.parse().map_err(serde::de::Error::custom)
@@ -116,6 +115,31 @@ impl CspLevel {
 
 // ─── Config structs ──────────────────────────────────────────────────────────
 
+/// A single URL redirect or rewrite rule, matched before filesystem resolution.
+///
+/// Example `settings.toml` entry:
+/// ```toml
+/// [[redirects]]
+/// from = "/old-page"
+/// to = "/new-page"
+/// status = 301
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedirectRule {
+    /// Source URL path to match (exact match).
+    pub from: String,
+    /// Destination URL (may be a relative path or absolute URL).
+    pub to: String,
+    /// HTTP status code — 301 for permanent, 302 for temporary.
+    #[serde(default = "default_redirect_status")]
+    pub status: u16,
+}
+
+const fn default_redirect_status() -> u16 {
+    301
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -125,17 +149,22 @@ pub struct Config {
     pub logging: LoggingConfig,
     pub console: ConsoleConfig,
     pub identity: IdentityConfig,
+    /// URL redirect/rewrite rules evaluated before filesystem resolution.
+    /// Declared as `[[redirects]]` array-of-tables in `settings.toml`.
+    /// Addresses M-13.
+    #[serde(default)]
+    pub redirects: Vec<RedirectRule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Non-zero port number.  `NonZeroU16` prevents port 0 at the type level:
-    /// serde rejects a zero value during deserialisation (fix 4.2).
+    /// serde rejects a zero value during deserialisation.
     pub port: NonZeroU16,
 
     /// Network interface to bind to.  Parsed from TOML string at load time;
-    /// an invalid IP address is rejected immediately (fix 4.2).
+    /// an invalid IP address is rejected immediately.
     #[serde(
         deserialize_with = "deserialize_ip_addr",
         serialize_with = "serialize_ip_addr"
@@ -146,11 +175,31 @@ pub struct ServerConfig {
     pub open_browser_on_start: bool,
     pub max_connections: u32,
 
+    /// Maximum concurrent connections from a single IP address.
+    ///
+    /// Prevents a single client from monopolising the connection pool.
+    /// When the limit is reached the connection is dropped at the TCP level —
+    /// the OS sends a RST so no HTTP overhead is incurred.
+    ///
+    /// Must be ≥ 1 and ≤ `max_connections`.  Validated in `loader.rs`.
+    /// Defaults to 16, which is generous for browsers (typically 6–8 parallel
+    /// connections) while preventing trivial single-client exhaustion attacks.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: u32,
+
     /// Content-Security-Policy preset.  See [`CspLevel`] for available values
     /// (`"off"`, `"relaxed"`, `"strict"`) and the header each one sends.
     /// Defaults to `"off"` — no CSP header, maximum browser compatibility.
     #[serde(default)]
     pub csp_level: CspLevel,
+}
+
+/// Default per-IP connection limit.
+///
+/// 16 is generous for browsers (6–8 parallel connections per origin) while
+/// making single-client denial-of-service attacks impractical without many IPs.
+const fn default_max_connections_per_ip() -> u32 {
+    16
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,9 +210,29 @@ pub struct SiteConfig {
     pub enable_directory_listing: bool,
     /// When `true`, directory listings and direct requests expose dot-files
     /// (e.g. `.git/`, `.env`).  Defaults to `false` so hidden files are not
-    /// accidentally served (fix H-10).
+    /// accidentally served.
     #[serde(default)]
     pub expose_dotfiles: bool,
+
+    /// When `true`, requests for paths that don't match any file are served
+    /// `index.html` (with status 200) instead of a 404.
+    /// Required for single-page applications with client-side routing
+    /// (`React Router`, `Vue Router`, `SvelteKit`, etc.).
+    /// Addresses C-6 — React/Vue/Svelte apps silently 404 without this.
+    #[serde(default)]
+    pub spa_routing: bool,
+
+    /// Optional custom 404 page path, relative to the site directory.
+    /// When set and the file exists, it is served with status 404 for all
+    /// requests that resolve to `NotFound`.  Addresses H-10.
+    #[serde(default)]
+    pub error_404: Option<String>,
+
+    /// Optional custom 500/503 page path, relative to the site directory.
+    /// Served with status 503 when the server cannot fulfil the request due
+    /// to internal errors.
+    #[serde(default)]
+    pub error_503: Option<String>,
 }
 
 /// Controls Tor integration.
@@ -229,6 +298,7 @@ impl Default for Config {
                 auto_port_fallback: true,
                 open_browser_on_start: false,
                 max_connections: 256,
+                max_connections_per_ip: default_max_connections_per_ip(),
                 csp_level: CspLevel::Strict,
             },
             site: SiteConfig {
@@ -236,6 +306,9 @@ impl Default for Config {
                 index_file: "index.html".into(),
                 enable_directory_listing: false,
                 expose_dotfiles: false,
+                spa_routing: false,
+                error_404: None,
+                error_503: None,
             },
             tor: TorConfig { enabled: true },
             logging: LoggingConfig {
@@ -252,6 +325,7 @@ impl Default for Config {
             identity: IdentityConfig {
                 instance_name: "RustHost".into(),
             },
+            redirects: Vec::new(),
         }
     }
 }

@@ -66,25 +66,46 @@ chrono       = { version = "0.4", features = ["clock"] }
 # OS error codes used in the accept-loop backoff to distinguish EMFILE/ENFILE
 # (resource exhaustion → log error) from transient errors (log debug).
 libc         = "0.2"
-# Vendor OpenSSL source so the binary builds without system libssl-dev headers
-# on Linux.  native-tls (pulled transitively through arti-client → tor-rtcompat)
-# links against OpenSSL on Linux; without this feature flag the build fails on
-# any machine that lacks the -dev package.  macOS and Windows are unaffected
-# (they use Security.framework and SChannel respectively), but the `vendored`
-# feature is a no-op on those targets so there is no downside to enabling it
-# unconditionally.  Build-time cost is ~60 s on first compile; subsequent
-# incremental builds are fast because the OpenSSL objects are cached.
-openssl      = { version = "0.10", features = ["vendored"] }
 # Force rusqlite's bundled SQLite for cross-compilation targets.
 # arti-client pulls rusqlite transitively; declaring it here unifies the feature
 # across the whole dep tree so cross-compiling to Linux/Windows works without a
 # system sqlite3 library present on the host Mac.
 rusqlite     = { version = "*", features = ["bundled"] }
+# Per-IP connection tracking for rate limiting (Phase 2 — C-4).
+# DashMap is a concurrent hash map with fine-grained shard locking; it avoids
+# the single global Mutex that would serialise every accept() call.
+dashmap      = "6"
+
+# Phase 5 (M-8) — replace hand-rolled percent_decode with the audited upstream crate.
+# The crate handles incomplete escape sequences and non-ASCII bytes correctly;
+# the wrapper adds only the null-byte guard specific to filesystem path use.
+percent-encoding = "2"
+
+# Phase 3 (C-1, H-8, H-9, H-13) — HTTP/1.1 keep-alive, ETag, Range, compression.
+# hyper provides a correct HTTP/1.1 connection loop with keep-alive; replacing
+# the hand-rolled single-shot parser eliminates the 30-45 s Tor page-load
+# penalty caused by Connection: close on every response.
+hyper            = { version = "1", features = ["http1", "server"] }
+hyper-util       = { version = "0.1", features = ["tokio"] }
+http-body-util   = "0.1"
+bytes            = "1"
+# async-compression provides Brotli and Gzip stream encoders.  Brotli gives
+# significantly better compression ratios than Gzip, which matters a lot for
+# Tor users who pay per-byte in latency.
+async-compression = { version = "0.4", features = ["tokio", "brotli", "gzip"] }
 
 [dev-dependencies]
 tempfile = "3"
 
+[profile.dev.package."*"]
+opt-level = 1   # dependency builds: faster compile, smaller debug symbols
+
+[profile.dev]
+opt-level = 0
+debug     = true
+
 [profile.release]
-opt-level = 3
-lto        = true
-strip      = true
+opt-level       = 3
+lto             = true
+strip           = true
+codegen-units   = 1  # maximum optimisation; slower link but smaller/faster binary
