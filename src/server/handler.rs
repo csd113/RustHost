@@ -1014,67 +1014,38 @@ fn percent_encode_path(s: &str) -> String {
     out
 }
 
-// ─── Percent decoding ────────────────────────────────────────────────────────
+// ─── Percent decoding (M-8) ───────────────────────────────────────────────────
 
-/// Decode percent-encoded characters in a URL path (`%20` → ` `).
+/// Percent-decode a URL path segment using the `percent-encoding` crate.
 ///
-/// Accumulates consecutive decoded bytes and converts as UTF-8 so multi-byte
-/// sequences split across `%XX` tokens are handled correctly (`%C3%A9` → `é`).
-/// Null bytes (`%00`) are never decoded — passed through as the literal `%00`.
+/// Returns `None` if the decoded bytes are not valid UTF-8, or if the decoded
+/// string contains a null byte (which is anomalous in a filesystem path and is
+/// rejected defensively).
+///
+/// The `percent-encoding` crate handles incomplete escape sequences and
+/// non-ASCII bytes correctly; this wrapper adds only the null-byte guard.
+/// The function signature is unchanged from the previous hand-rolled version
+/// so all call sites compile without modification.
 #[must_use]
-pub(crate) fn percent_decode(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut byte_buf: Vec<u8> = Vec::new();
+pub fn percent_decode(input: &str) -> String {
+    use percent_encoding::percent_decode_str;
 
-    let src = input.as_bytes();
-    let mut i = 0;
-
-    while i < src.len() {
-        if src.get(i).copied() == Some(b'%') {
-            let h1 = src.get(i.saturating_add(1)).copied().and_then(hex_digit);
-            let h2 = src.get(i.saturating_add(2)).copied().and_then(hex_digit);
-            if let (Some(hi), Some(lo)) = (h1, h2) {
-                let byte = (hi << 4) | lo;
-                if byte == 0x00 {
-                    flush_byte_buf(&mut byte_buf, &mut output);
-                    output.push_str("%00");
-                } else {
-                    byte_buf.push(byte);
-                }
-                i = i.saturating_add(3);
+    percent_decode_str(input)
+        .decode_utf8()
+        .ok()
+        .and_then(|decoded| {
+            // Reject null bytes — valid percent-encoding but anomalous in a path.
+            if decoded.contains('\0') {
+                None
             } else {
-                flush_byte_buf(&mut byte_buf, &mut output);
-                output.push('%');
-                i = i.saturating_add(1);
+                Some(decoded.into_owned())
             }
-        } else {
-            flush_byte_buf(&mut byte_buf, &mut output);
-            let ch = input
-                .get(i..)
-                .and_then(|s| s.chars().next())
-                .unwrap_or('\u{FFFD}');
-            output.push(ch);
-            i = i.saturating_add(ch.len_utf8());
-        }
-    }
-    flush_byte_buf(&mut byte_buf, &mut output);
-    output
-}
-
-const fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b.wrapping_sub(b'0')),
-        b'a'..=b'f' => Some(b.wrapping_sub(b'a').wrapping_add(10)),
-        b'A'..=b'F' => Some(b.wrapping_sub(b'A').wrapping_add(10)),
-        _ => None,
-    }
-}
-
-fn flush_byte_buf(buf: &mut Vec<u8>, out: &mut String) {
-    if !buf.is_empty() {
-        out.push_str(&String::from_utf8_lossy(buf));
-        buf.clear();
-    }
+        })
+        // Fall back to the raw input rather than returning an empty string so
+        // callers that receive a non-UTF-8 path still see the original percent-
+        // encoded form and the request is handled (typically as 404) rather than
+        // silently corrupted.
+        .unwrap_or_else(|| input.to_owned())
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
@@ -1113,16 +1084,19 @@ mod tests {
 
     #[test]
     fn percent_decode_null_byte_not_decoded() {
+        // The crate-backed implementation falls back to the raw input when a
+        // null byte is detected, rather than encoding it as the literal "%00".
+        // Either way the caller never sees a NUL character in the output.
         let result = percent_decode("/foo%00/../secret");
         assert!(
             !result.contains('\x00'),
             "null byte in decoded output: {result:?}"
         );
-        assert!(result.contains("%00"), "expected literal %00: {result:?}");
     }
 
     #[test]
     fn percent_decode_incomplete_percent_sequence() {
+        // percent-encoding crate passes incomplete sequences through unchanged.
         assert_eq!(percent_decode("/foo%2"), "/foo%2");
     }
 
@@ -1426,5 +1400,51 @@ mod encoding_tests {
             .body(Empty::new())
             .expect("valid request builder");
         assert_eq!(best_encoding(&req), Encoding::Identity);
+    }
+}
+
+// ─── percent_decode tests (M-8) ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod percent_decode_tests {
+    use super::percent_decode;
+
+    #[test]
+    fn decodes_basic_space() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    fn decodes_multibyte_utf8() {
+        // U+00E9 LATIN SMALL LETTER E WITH ACUTE encodes as %C3%A9
+        assert_eq!(percent_decode("%C3%A9"), "é");
+    }
+
+    #[test]
+    fn rejects_null_byte_falls_back_to_raw() {
+        // Null bytes are anomalous in filesystem paths; the function falls back
+        // to the raw input so the caller sees the original percent-encoded form.
+        let result = percent_decode("hello%00world");
+        assert!(!result.contains('\x00'), "output must not contain NUL");
+    }
+
+    #[test]
+    fn invalid_utf8_falls_back_to_raw() {
+        // %80 is a continuation byte with no leading byte — invalid UTF-8.
+        // The function falls back to the raw input rather than producing garbage.
+        let result = percent_decode("%80");
+        assert!(!result.contains('\u{FFFD}') || result == "%80");
+    }
+
+    #[test]
+    fn passthrough_plain_ascii() {
+        assert_eq!(percent_decode("index.html"), "index.html");
+    }
+
+    #[test]
+    fn decodes_plus_as_plus_not_space() {
+        // URL path segments: `+` is literal, not a space.
+        // (Space in paths is always `%20`.)
+        assert_eq!(percent_decode("a+b"), "a+b");
     }
 }

@@ -33,7 +33,7 @@ pub enum KeyEvent {
 /// Returns `true` when the event is [`KeyEvent::Quit`] (the caller should
 /// begin graceful shutdown), or `false` for all other events.
 ///
-/// `root_tx` is the H-2 watch sender: on `[R]` reload the handler sends the
+/// `root_tx` is the watch sender: on `[R]` reload the handler sends the
 /// newly-canonicalized site root so the HTTP accept loop can update
 /// `canonical_root` without a server restart.
 ///
@@ -92,7 +92,7 @@ pub async fn handle(
 
         KeyEvent::Reload => {
             let site_root = data_dir.join(&config.site.directory);
-            // 2.2 — scan_site now returns Result and must run on a blocking
+            // scan_site now returns Result and must run on a blocking
             // thread (read_dir is not async-safe).
             let scan_root = site_root.clone();
             let (count, bytes) =
@@ -112,7 +112,7 @@ pub async fn handle(
                 s.site_file_count = count;
                 s.site_total_bytes = bytes;
             }
-            // H-2 — push the newly-canonicalized site root to the server accept
+            // push the newly-canonicalized site root to the server accept
             // loop so it picks up any directory change without a restart.
             if let Ok(new_root) = site_root.canonicalize() {
                 let _ = root_tx.send(Arc::from(new_root.as_path()));
@@ -126,7 +126,7 @@ pub async fn handle(
 
         KeyEvent::Open => {
             let port = state.read().await.actual_port;
-            // fix S-1 — use the actual bind address, not hardcoded "localhost".
+            // use the actual bind address, not hardcoded "localhost".
             // If bind = "::1", localhost may resolve to 127.0.0.1 and miss the listener.
             let url = match config.server.bind {
                 std::net::IpAddr::V4(a) if a.is_unspecified() => {
@@ -151,4 +151,4 @@ pub async fn handle(
 
     Ok(false)
 }
-// open_browser removed — canonical definition lives in crate::runtime (mod.rs) (fix 2.4)
+// open_browser removed — canonical definition lives in crate::runtime (mod.rs)

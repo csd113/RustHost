@@ -18,10 +18,10 @@
 //!
 //! 1. `init()` spawns a Tokio task and returns its `JoinHandle`.
 //!    The handle is awaited by lifecycle during graceful shutdown so active
-//!    Tor circuits get a chance to close cleanly (fix 3.1).
+//!    Tor circuits get a chance to close cleanly before the runtime exits.
 //! 2. `TorClient::create_bootstrapped()` connects to the Tor network.
 //!    A 120-second timeout prevents an indefinite hang on firewalled networks
-//!    (fix 3.3).  First run downloads ~2 MB of directory consensus (~30 s).
+//!    First run downloads ~2 MB of directory consensus (~30 s).
 //!    Subsequent runs reuse the cache in `rusthost-data/arti_cache/` and are fast.
 //! 3. `tor_client.launch_onion_service()` registers the hidden service.
 //!    The address is derived from the keypair and is available immediately.
@@ -33,11 +33,11 @@
 //! 5. Each `StreamRequest` is accepted and bridged to the local HTTP server
 //!    with `tokio::io::copy_bidirectional` in its own Tokio task.
 //!    Both the local connect and the bidirectional copy carry timeouts to
-//!    bound the lifetime of stalled connections (fix 3.1, fix 3.2).
+//!    bound the lifetime of stalled connections and release permits promptly.
 //! 6. When the `stream_requests` stream ends unexpectedly (transient network
 //!    disruption, Arti circuit reset) the module re-bootstraps with
 //!    exponential backoff up to `MAX_RETRIES` times before giving up
-//!    (fix 3.4).
+//!    before giving up.
 //! 7. `kill()` is a no-op — the `TorClient` is dropped when the task exits
 //!    during normal Tokio runtime shutdown, which closes all circuits cleanly.
 
@@ -70,11 +70,17 @@ const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// and the semaphore permit is released.  Using an idle timeout rather than
 /// a wall-clock cap avoids disconnecting legitimate large downloads while
 /// still evicting adversarially-idle connections that hold permits without
-/// sending data.  (fix T-6)
+/// sending data.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Base delay between re-bootstrap attempts (multiplied by attempt count).
+/// Base delay between re-bootstrap attempts.
 const RETRY_BASE_SECS: u64 = 30;
+
+/// Maximum delay between re-bootstrap attempts.
+///
+/// Caps the exponential growth so a long-running server with repeated failures
+/// never waits more than 5 minutes between attempts.
+const RETRY_MAX_SECS: u64 = 300;
 
 /// Maximum number of automatic re-bootstrap attempts after an unexpected
 /// stream-end before the module sets `TorStatus::Failed` permanently.
@@ -86,7 +92,7 @@ const MAX_RETRIES: u32 = 5;
 ///
 /// Spawns a Tokio task and returns its [`JoinHandle`].  The caller **must**
 /// await the handle (with a timeout) during graceful shutdown so active Tor
-/// circuits can close cleanly before the runtime exits (fix 3.1).
+/// circuits can close cleanly before the runtime exits.
 ///
 /// Tor status and the onion address are written into `state` as things
 /// progress.  `shutdown` is a watch channel whose `true` value triggers a
@@ -94,11 +100,11 @@ const MAX_RETRIES: u32 = 5;
 ///
 /// `bind_addr` must match `config.server.bind` so the local proxy connect
 /// uses the correct loopback address even when the server is bound to `::1`
-/// rather than `127.0.0.1` (fix 3.6).
+/// rather than `127.0.0.1`.
 /// Initialise Tor using the embedded Arti client.
 ///
 /// `max_connections` must match `config.server.max_connections` so the Tor
-/// semaphore is sized identically to the HTTP server's connection limit (fix T-2).
+/// semaphore is sized identically to the HTTP server's connection limit.
 pub fn init(
     data_dir: PathBuf,
     bind_port: u16,
@@ -109,8 +115,9 @@ pub fn init(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut attempts = 0u32;
-        // fix T-4 — track when the last failure occurred so we can reset the
-        // consecutive-failure counter after a sufficiently long stable period.
+        // Track when the last failure occurred so we can reset the consecutive-
+        // failure counter after a sufficiently long stable period — disruptions
+        // spaced more than an hour apart are not truly "consecutive" failures.
         let mut last_failure_time: Option<std::time::Instant> = None;
 
         loop {
@@ -131,9 +138,8 @@ pub fn init(
                 }
                 Ok(true) => {
                     // Stream ended unexpectedly (transient network disruption).
-                    // fix T-4 — reset consecutive failure counter if last failure was
-                    // more than an hour ago (disruptions spaced far apart are not
-                    // truly "consecutive" and should not permanently fail the service).
+                    // Reset the consecutive failure counter — disruptions spaced more
+                    // than an hour apart should not count against the MAX_RETRIES limit.
                     let now = std::time::Instant::now();
                     if let Some(last) = last_failure_time {
                         if now.duration_since(last) > Duration::from_secs(3600) {
@@ -159,8 +165,7 @@ pub fn init(
                         break;
                     }
 
-                    let delay =
-                        Duration::from_secs(RETRY_BASE_SECS.saturating_mul(u64::from(attempts)));
+                    let delay = backoff_delay(attempts, RETRY_BASE_SECS, RETRY_MAX_SECS);
                     log::warn!(
                         "Tor: stream ended; re-bootstrapping in {delay:?} \
                          (attempt {attempts}/{MAX_RETRIES})"
@@ -194,10 +199,9 @@ pub fn init(
     })
 }
 
-// `kill()` has been removed (fix 2.10): the `TorClient` is owned by the task
-// spawned in `init()` and is dropped when that task exits, which closes all
-// Tor circuits cleanly.  Graceful shutdown is now signalled through the
-// `shutdown` watch channel passed to `init()`.
+// `kill()` has been removed: the `TorClient` is owned by the task spawned in
+// `init()` and is dropped when that task exits, which closes all Tor circuits
+// cleanly.  Graceful shutdown is signalled through the `shutdown` watch channel.
 
 // ─── Core async logic ─────────────────────────────────────────────────────────
 
@@ -205,8 +209,9 @@ pub fn init(
 ///
 /// Kept as a named struct so `run` can destructure it without a large tuple.
 struct TorSession {
-    /// Must be kept alive — dropping de-registers the service from Tor (fix T-3).
-    /// `launch_onion_service` returns `Arc<RunningOnionService>`, so we store that.
+    /// Must be kept alive for the session lifetime — dropping it de-registers the
+    /// onion service from the Tor network.  Stored as an `Arc<RunningOnionService>`
+    /// returned by `launch_onion_service`.
     _onion_service_guard: std::sync::Arc<tor_hsservice::RunningOnionService>,
     stream_requests: futures::stream::BoxStream<'static, StreamRequest>,
     onion_name: String,
@@ -234,7 +239,8 @@ async fn bootstrap_and_launch(
 
     log::info!("Tor: bootstrapping — first run downloads ~2 MB of directory data (~30 s)");
 
-    // Honour shutdown during the up-to-120 s bootstrap window (fix T-5).
+    // Honour shutdown signals that arrive during the up-to-120 s bootstrap window
+    // so a long first-run does not block a clean exit.
     let tor_client = {
         let mut sd = shutdown.clone();
         tokio::select! {
@@ -263,7 +269,7 @@ async fn bootstrap_and_launch(
         .build()?;
 
     // Keep onion_service_guard alive for the session lifetime — dropping it
-    // de-registers the service from the Tor network (fix T-3).
+    // de-registers the service from the Tor network.
     let (onion_service_guard, rend_requests) = tor_client
         .launch_onion_service(svc_config)?
         .ok_or("Tor: onion service returned None (should not happen with in-code config)")?;
@@ -325,7 +331,8 @@ async fn run(
 
     set_onion(&state, onion_name).await;
 
-    // Size the Tor semaphore to match the HTTP server's connection limit (fix T-2).
+    // Size the Tor semaphore to match the HTTP server's connection limit so
+    // operators see consistent behaviour from both endpoints.
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
 
     loop {
@@ -380,18 +387,18 @@ async fn run(
 /// `tokio` feature is enabled on `arti-client`, so `copy_bidirectional`
 /// works with no adapter needed.
 ///
-/// fix 3.1 — both the local connect and the bidirectional copy are wrapped in
-/// timeouts to prevent stalled connections from holding semaphore permits
-/// indefinitely and exhausting the connection pool.
+/// Both the local connect and the bidirectional copy are wrapped in timeouts
+/// to prevent stalled connections from holding semaphore permits indefinitely
+/// and exhausting the connection pool.
 async fn proxy_stream(
     stream_req: StreamRequest,
     local_addr: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut tor_stream = stream_req.accept(Connected::new_empty()).await?;
 
-    // fix 3.1a — bound the time spent waiting for the local server to accept.
-    // If the HTTP server is wedged or still starting, we release the permit
-    // quickly rather than holding it until the OS TCP timeout fires.
+    // Bound the time spent waiting for the local server to accept a connection.
+    // If the HTTP server is wedged or still starting, the permit is released
+    // promptly rather than held until the OS TCP timeout fires.
     let mut local = tokio::time::timeout(LOCAL_CONNECT_TIMEOUT, TcpStream::connect(local_addr))
         .await
         .map_err(|_| {
@@ -403,7 +410,8 @@ async fn proxy_stream(
         })?
         .map_err(|e| format!("local connect to {local_addr} failed: {e}"))?;
 
-    // fix T-6 — idle timeout instead of wall-clock cap (see copy_with_idle_timeout)
+    // Use idle timeout rather than a wall-clock cap — active transfers are
+    // never interrupted; only truly idle connections are evicted.
     copy_with_idle_timeout(&mut tor_stream, &mut local)
         .await
         .map_err(|e| format!("stream proxy error: {e}"))?;
@@ -419,10 +427,7 @@ async fn proxy_stream(
 ///
 /// This is a true idle timeout, not a wall-clock cap.  A continuous large
 /// transfer is never interrupted; a connection that stalls mid-transfer is
-/// closed within `IDLE_TIMEOUT` of the last byte.  The previous
-/// implementation used `copy_bidirectional` racing a single `sleep`, which
-/// fired `IDLE_TIMEOUT` after the *connection opened*, disconnecting active
-/// large downloads (fix C-2).
+/// closed within `IDLE_TIMEOUT` of the last byte.
 async fn copy_with_idle_timeout<A, B>(a: &mut A, b: &mut B) -> std::io::Result<()>
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -500,7 +505,7 @@ fn hsid_to_onion_address(hsid: HsId) -> String {
 /// Separated from [`hsid_to_onion_address`] so that tests can supply an
 /// arbitrary 32-byte key without constructing an `HsId`.
 #[must_use]
-pub(crate) fn onion_address_from_pubkey(pubkey: &[u8; 32]) -> String {
+pub fn onion_address_from_pubkey(pubkey: &[u8; 32]) -> String {
     use sha3::{Digest, Sha3_256};
 
     let version: u8 = 3;
@@ -516,7 +521,7 @@ pub(crate) fn onion_address_from_pubkey(pubkey: &[u8; 32]) -> String {
     let mut address_bytes = [0u8; 35];
     address_bytes[..32].copy_from_slice(pubkey);
 
-    // fix 3.8 — index hash directly rather than via a fallible iterator.
+    // Index hash directly rather than via a fallible iterator.
     // SHA3-256 always produces exactly 32 bytes; the GenericArray is
     // guaranteed to have indices 0 and 1.  The `indexing_slicing` lint
     // fires here because clippy cannot prove the length at compile time for
@@ -536,12 +541,40 @@ pub(crate) fn onion_address_from_pubkey(pubkey: &[u8; 32]) -> String {
     format!("{encoded}.onion")
 }
 
+// ─── Backoff helper ───────────────────────────────────────────────────────────
+
+/// Compute the exponential backoff delay for attempt `n` (1-indexed).
+///
+/// Formula: `base * 2^(n-1)`, capped at `max_secs`.
+/// ```text
+/// Attempt 1 →  30 s
+/// Attempt 2 →  60 s
+/// Attempt 3 → 120 s
+/// Attempt 4 → 240 s
+/// Attempt 5 → 300 s (capped)
+/// ```
+///
+/// Uses saturating arithmetic throughout so extreme values of `attempt` do not
+/// panic under `clippy::pedantic`.
+fn backoff_delay(attempt: u32, base_secs: u64, max_secs: u64) -> Duration {
+    // Attempt 0 means "no previous failures" — no delay.
+    let Some(exp) = attempt.checked_sub(1) else {
+        return Duration::ZERO;
+    };
+    // `checked_shl` returns None when the shift count is >= 64; cap at 63 so
+    // we always get a valid power-of-two.  Any exponent >= 63 already exceeds
+    // `max_secs` after the multiply, so the `.min(max_secs)` cap handles it.
+    let multiplier = 1u64.checked_shl(exp.min(63)).unwrap_or(u64::MAX);
+    let secs = base_secs.saturating_mul(multiplier);
+    Duration::from_secs(secs.min(max_secs))
+}
+
 // ─── State helpers ────────────────────────────────────────────────────────────
 //
 // These must appear BEFORE the #[cfg(test)] module; items after a test module
 // trigger the `clippy::items_after_test_module` lint.
 
-/// Format a bind address as a valid socket-address string (fix T-1).
+/// Format a bind address as a valid socket-address string.
 /// IPv6 addresses need square brackets: `[::1]:8080`, not `::1:8080`.
 fn format_local_addr(addr: IpAddr, port: u16) -> String {
     match addr {
@@ -550,7 +583,7 @@ fn format_local_addr(addr: IpAddr, port: u16) -> String {
     }
 }
 
-/// Create a directory that is readable only by the current user (fix T-7, H-4).
+/// Create a directory that is readable only by the current user.
 ///
 /// On Unix this applies mode 0o700 (owner rwx, no group/other access).
 /// On Windows this shells out to `icacls` to apply a DACL that grants Full
@@ -603,6 +636,37 @@ async fn set_onion(state: &SharedState, addr: String) {
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod backoff_tests {
+    use super::backoff_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn attempt_1_is_base() {
+        assert_eq!(backoff_delay(1, 30, 300), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn attempt_2_doubles() {
+        assert_eq!(backoff_delay(2, 30, 300), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn attempt_3_doubles_again() {
+        assert_eq!(backoff_delay(3, 30, 300), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn caps_at_max() {
+        assert_eq!(backoff_delay(10, 30, 300), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn attempt_0_is_zero() {
+        assert_eq!(backoff_delay(0, 30, 300), Duration::from_secs(0));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::onion_address_from_pubkey;
 
@@ -620,7 +684,7 @@ mod tests {
     /// ```
     ///
     /// This cross-checks the production implementation against an *independent*
-    /// reference rather than the same algorithm re-implemented inline (fix C-3).
+    /// external reference rather than the same algorithm re-implemented inline.
     const ZERO_KEY_ONION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaam2dqd.onion";
 
     #[test]

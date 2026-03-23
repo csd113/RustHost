@@ -1,6 +1,6 @@
 # cargo-audit configuration for rusthost
 #
-# fix G-3 — previously this file contained a bare `ignore` entry with no
+# previously this file contained a bare `ignore` entry with no
 # rationale, creating a silent suppression that future developers could not
 # evaluate.  Rationale is now documented here to match deny.toml.
 #

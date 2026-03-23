@@ -1,4 +1,4 @@
-//! # HTTP Server Integration Tests (task 5.2)
+//! # HTTP Server Integration Tests
 //!
 //! Each test spins up an isolated [`rusthost::server::run`] instance, connects
 //! to it via [`tokio::net::TcpStream`], sends raw HTTP/1.1, and inspects the
@@ -71,7 +71,7 @@ impl TestServer {
             let st = Arc::clone(&state);
             let met = Arc::clone(&metrics);
             let shut = shutdown_rx;
-            // H-2 — server::run now takes a root_watch receiver so the accept
+            // server::run now takes a root_watch receiver so the accept
             // loop can refresh canonical_root on [R] reload without restarting.
             // In tests we seed it with the site root and never send updates.
             let site_root_arc: Arc<Path> =
@@ -280,7 +280,7 @@ async fn read_one_response(stream: &mut TcpStream) -> Result<String, Box<dyn std
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-// ─── Core HTTP flow tests (task 5.2) ─────────────────────────────────────────
+// ─── Core HTTP flow tests ─────────────────────────────────────────
 
 #[tokio::test]
 async fn get_index_html_returns_200() -> Result<(), Box<dyn std::error::Error>> {
@@ -390,7 +390,7 @@ async fn get_nonexistent_file_returns_404() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-// fix H-11 — this test previously asserted status 400 for a POST request,
+// this test previously asserted status 400 for a POST request,
 // which encoded the *incorrect* behaviour (RFC 9110 §15.5.6 requires 405 +
 // Allow header for known-but-disallowed methods).  The old assertion would
 // pass when the bug was present and fail when it was fixed, causing developers
