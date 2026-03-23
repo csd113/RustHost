@@ -358,9 +358,37 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     Ok(())
 }
 
-/// Signal shutdown, then await the server and Tor tasks with a shared 8-second
-/// deadline.  Extracted from [`normal_run_with_config`] to stay within the
-/// 100-line function-length limit.
+// Shutdown drain budget constants (M-7).
+//
+// Previously the two drains (HTTP + Tor) shared a single 8-second wall-clock
+// budget.  If the HTTP drain ran long, Tor circuits received whatever
+// milliseconds were left — far too little for active streams to flush.
+// The fix gives each drain its own independently-bounded timeout.
+
+/// Shutdown budget (seconds) when Tor is **disabled**.
+const DRAIN_HTTP_ONLY_SECS: u64 = 8;
+
+/// Shutdown budget (seconds) for the HTTP drain when Tor is **enabled**.
+///
+/// Tor circuits need their own separate window after this.
+const DRAIN_HTTP_WITH_TOR_SECS: u64 = 5;
+
+/// Shutdown budget (seconds) for Tor circuit teardown.
+///
+/// Arti closes circuits asynchronously; waiting up to this long gives active
+/// Tor streams a chance to flush their final bytes before the process exits.
+const DRAIN_TOR_SECS: u64 = 10;
+
+/// Signal shutdown, then drain the HTTP server and (if Tor is enabled) the Tor
+/// circuits with separate, independently-bounded timeouts.
+///
+/// - **HTTP only** (Tor disabled): full [`DRAIN_HTTP_ONLY_SECS`] seconds.
+/// - **HTTP + Tor**: [`DRAIN_HTTP_WITH_TOR_SECS`] seconds for HTTP, then a
+///   fresh [`DRAIN_TOR_SECS`]-second budget for Tor circuit teardown.
+///
+/// The hard caps are intentional — the process must not hang forever.
+/// Callers drop the Tokio runtime after this function returns, which cancels
+/// any tasks that did not complete within their budget.
 async fn graceful_shutdown(
     shutdown_tx: watch::Sender<bool>,
     server_handle: tokio::task::JoinHandle<()>,
@@ -369,16 +397,36 @@ async fn graceful_shutdown(
     log::info!("Shutting down…");
     let _ = shutdown_tx.send(true);
 
-    // fix M-2 / clippy::integer_arithmetic — checked_add returns None only if
-    // the instant would overflow (practically impossible); fall back to now so
-    // the drain phase exits immediately rather than panicking or using bare `+`.
-    let shutdown_deadline = tokio::time::Instant::now()
-        .checked_add(Duration::from_secs(8))
-        .unwrap_or_else(tokio::time::Instant::now);
-    let _ = tokio::time::timeout_at(shutdown_deadline, server_handle).await;
+    // HTTP drain — budget depends on whether Tor needs its own window.
+    let http_budget = if tor_handle.is_some() {
+        Duration::from_secs(DRAIN_HTTP_WITH_TOR_SECS)
+    } else {
+        Duration::from_secs(DRAIN_HTTP_ONLY_SECS)
+    };
+
+    if tokio::time::timeout(http_budget, server_handle)
+        .await
+        .is_err()
+    {
+        let secs = http_budget.as_secs();
+        log::warn!(
+            "HTTP drain did not complete within {secs} s; \
+             some connections may be abruptly closed",
+        );
+    }
+
+    // Tor drain — only if Tor was started, with its own fresh budget so that
+    // a slow HTTP drain does not steal time from Tor circuit teardown.
     if let Some(handle) = tor_handle {
-        let remaining = shutdown_deadline.saturating_duration_since(tokio::time::Instant::now());
-        let _ = tokio::time::timeout(remaining, handle).await;
+        if tokio::time::timeout(Duration::from_secs(DRAIN_TOR_SECS), handle)
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "Tor circuit teardown did not complete within {DRAIN_TOR_SECS} s; \
+                 active Tor streams will be forcibly closed",
+            );
+        }
     }
 
     log::info!("RustHost shut down cleanly.");

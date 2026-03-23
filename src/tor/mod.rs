@@ -73,8 +73,14 @@ const LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// sending data.  (fix T-6)
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Base delay between re-bootstrap attempts (multiplied by attempt count).
+/// Base delay between re-bootstrap attempts.
 const RETRY_BASE_SECS: u64 = 30;
+
+/// Maximum delay between re-bootstrap attempts.
+///
+/// Caps the exponential growth so a long-running server with repeated failures
+/// never waits more than 5 minutes between attempts.
+const RETRY_MAX_SECS: u64 = 300;
 
 /// Maximum number of automatic re-bootstrap attempts after an unexpected
 /// stream-end before the module sets `TorStatus::Failed` permanently.
@@ -159,8 +165,7 @@ pub fn init(
                         break;
                     }
 
-                    let delay =
-                        Duration::from_secs(RETRY_BASE_SECS.saturating_mul(u64::from(attempts)));
+                    let delay = backoff_delay(attempts, RETRY_BASE_SECS, RETRY_MAX_SECS);
                     log::warn!(
                         "Tor: stream ended; re-bootstrapping in {delay:?} \
                          (attempt {attempts}/{MAX_RETRIES})"
@@ -536,6 +541,34 @@ pub(crate) fn onion_address_from_pubkey(pubkey: &[u8; 32]) -> String {
     format!("{encoded}.onion")
 }
 
+// ─── Backoff helper ───────────────────────────────────────────────────────────
+
+/// Compute the exponential backoff delay for attempt `n` (1-indexed).
+///
+/// Formula: `base * 2^(n-1)`, capped at `max_secs`.
+/// ```text
+/// Attempt 1 →  30 s
+/// Attempt 2 →  60 s
+/// Attempt 3 → 120 s
+/// Attempt 4 → 240 s
+/// Attempt 5 → 300 s (capped)
+/// ```
+///
+/// Uses saturating arithmetic throughout so extreme values of `attempt` do not
+/// panic under `clippy::pedantic`.
+fn backoff_delay(attempt: u32, base_secs: u64, max_secs: u64) -> Duration {
+    // Attempt 0 means "no previous failures" — no delay.
+    let Some(exp) = attempt.checked_sub(1) else {
+        return Duration::ZERO;
+    };
+    // `checked_shl` returns None when the shift count is >= 64; cap at 63 so
+    // we always get a valid power-of-two.  Any exponent >= 63 already exceeds
+    // `max_secs` after the multiply, so the `.min(max_secs)` cap handles it.
+    let multiplier = 1u64.checked_shl(exp.min(63)).unwrap_or(u64::MAX);
+    let secs = base_secs.saturating_mul(multiplier);
+    Duration::from_secs(secs.min(max_secs))
+}
+
 // ─── State helpers ────────────────────────────────────────────────────────────
 //
 // These must appear BEFORE the #[cfg(test)] module; items after a test module
@@ -601,6 +634,37 @@ async fn set_onion(state: &SharedState, addr: String) {
 }
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::backoff_delay;
+    use std::time::Duration;
+
+    #[test]
+    fn attempt_1_is_base() {
+        assert_eq!(backoff_delay(1, 30, 300), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn attempt_2_doubles() {
+        assert_eq!(backoff_delay(2, 30, 300), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn attempt_3_doubles_again() {
+        assert_eq!(backoff_delay(3, 30, 300), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn caps_at_max() {
+        assert_eq!(backoff_delay(10, 30, 300), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn attempt_0_is_zero() {
+        assert_eq!(backoff_delay(0, 30, 300), Duration::from_secs(0));
+    }
+}
 
 #[cfg(test)]
 mod tests {
