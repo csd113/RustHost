@@ -201,6 +201,86 @@ pub fn init(
 
 // ─── Core async logic ─────────────────────────────────────────────────────────
 
+/// Outcome of a successful bootstrap and onion-service launch.
+///
+/// Kept as a named struct so `run` can destructure it without a large tuple.
+struct TorSession {
+    /// Must be kept alive — dropping de-registers the service from Tor (fix T-3).
+    /// `launch_onion_service` returns `Arc<RunningOnionService>`, so we store that.
+    _onion_service_guard: std::sync::Arc<tor_hsservice::RunningOnionService>,
+    stream_requests: futures::stream::BoxStream<'static, StreamRequest>,
+    onion_name: String,
+}
+
+/// Bootstrap the Arti client and launch the onion service.
+///
+/// Extracted from [`run`] to keep that function under the 100-line limit.
+/// Returns `Ok(None)` on clean shutdown during bootstrap, `Ok(Some(session))`
+/// on success, or `Err` on an unrecoverable error.
+async fn bootstrap_and_launch(
+    data_dir: &std::path::Path,
+    shutdown: watch::Receiver<bool>,
+) -> Result<Option<TorSession>, Box<dyn std::error::Error + Send + Sync>> {
+    ensure_private_dir(&data_dir.join("arti_state"))
+        .map_err(|e| format!("Cannot create secure state directory: {e}"))?;
+    ensure_private_dir(&data_dir.join("arti_cache"))
+        .map_err(|e| format!("Cannot create secure cache directory: {e}"))?;
+
+    let config = TorClientConfigBuilder::from_directories(
+        data_dir.join("arti_state"),
+        data_dir.join("arti_cache"),
+    )
+    .build()?;
+
+    log::info!("Tor: bootstrapping — first run downloads ~2 MB of directory data (~30 s)");
+
+    // Honour shutdown during the up-to-120 s bootstrap window (fix T-5).
+    let tor_client = {
+        let mut sd = shutdown.clone();
+        tokio::select! {
+            result = tokio::time::timeout(BOOTSTRAP_TIMEOUT, TorClient::create_bootstrapped(config)) => {
+                result
+                    .map_err(|_| format!(
+                        "Tor bootstrap timed out after {}s — check network connectivity",
+                        BOOTSTRAP_TIMEOUT.as_secs()
+                    ))?
+                    .map_err(|e| format!("Tor bootstrap failed: {e}"))?
+            }
+            _ = sd.changed() => {
+                if *sd.borrow() {
+                    log::info!("Tor: shutdown received during bootstrap — exiting.");
+                    return Ok(None);
+                }
+                return Err("shutdown channel closed during bootstrap".into());
+            }
+        }
+    };
+
+    log::info!("Tor: connected to the Tor network");
+
+    let svc_config = OnionServiceConfigBuilder::default()
+        .nickname("rusthost".parse()?)
+        .build()?;
+
+    // Keep onion_service_guard alive for the session lifetime — dropping it
+    // de-registers the service from the Tor network (fix T-3).
+    let (onion_service_guard, rend_requests) = tor_client
+        .launch_onion_service(svc_config)?
+        .ok_or("Tor: onion service returned None (should not happen with in-code config)")?;
+
+    let hsid = onion_service_guard
+        .onion_address()
+        .ok_or("Tor: onion address not yet available (key generation incomplete)")?;
+    let onion_name = hsid_to_onion_address(hsid);
+    let stream_requests = Box::pin(handle_rend_requests(rend_requests));
+
+    Ok(Some(TorSession {
+        _onion_service_guard: onion_service_guard,
+        stream_requests,
+        onion_name,
+    }))
+}
+
 /// Run the full Tor lifecycle (bootstrap → launch service → proxy streams).
 ///
 /// Returns:
@@ -217,134 +297,47 @@ async fn run(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     set_status(&state, TorStatus::Starting).await;
 
-    // ── 1. Build TorClientConfig ──────────────────────────────────────────
-    //
-    // fix T-7 — explicitly create and lock down the Arti state/cache directories
-    // before use.  Default OpenOptions would create them with 0o755 (world-
-    // readable), which exposes the service keypair to other local users.
-    ensure_private_dir(&data_dir.join("arti_state"))
-        .map_err(|e| format!("Cannot create secure state directory: {e}"))?;
-    ensure_private_dir(&data_dir.join("arti_cache"))
-        .map_err(|e| format!("Cannot create secure cache directory: {e}"))?;
-
-    let config = TorClientConfigBuilder::from_directories(
-        data_dir.join("arti_state"),
-        data_dir.join("arti_cache"),
-    )
-    .build()?;
-
-    log::info!("Tor: bootstrapping — first run downloads ~2 MB of directory data (~30 s)");
-
-    // ── 2. Bootstrap ──────────────────────────────────────────────────────
-    //
-    // fix T-5 — wrap bootstrap in a select! so a shutdown signal received
-    // during the up-to-120s bootstrap window exits cleanly rather than
-    // blocking the lifecycle shutdown sequence.
-    let tor_client = {
-        let mut shutdown_bootstrap = shutdown.clone();
-        tokio::select! {
-            result = tokio::time::timeout(
-                BOOTSTRAP_TIMEOUT,
-                TorClient::create_bootstrapped(config),
-            ) => {
-                result
-                    .map_err(|_| format!(
-                        "Tor bootstrap timed out after {}s — check network connectivity",
-                        BOOTSTRAP_TIMEOUT.as_secs()
-                    ))?
-                    .map_err(|e| format!("Tor bootstrap failed: {e}"))?
-            }
-            _ = shutdown_bootstrap.changed() => {
-                if *shutdown_bootstrap.borrow() {
-                    log::info!("Tor: shutdown received during bootstrap — exiting.");
-                    return Ok(false);
-                }
-                return Err("shutdown channel closed during bootstrap".into());
-            }
-        }
+    let Some(TorSession {
+        _onion_service_guard,
+        mut stream_requests,
+        onion_name,
+    }) = bootstrap_and_launch(&data_dir, shutdown.clone()).await?
+    else {
+        return Ok(false); // clean shutdown during bootstrap
     };
 
-    log::info!("Tor: connected to the Tor network");
-
-    // ── 3. Launch the onion service ───────────────────────────────────────
-    //
-    // The nickname is a local label only — it never appears in the .onion
-    // address and does not need to match anything external.
-    let svc_config = OnionServiceConfigBuilder::default()
-        .nickname("rusthost".parse()?)
-        .build()?;
-
-    // fix T-3 — the OnionService handle represents the service lifetime.
-    // Dropping it de-registers the hidden service from the Tor network
-    // (analogous to closing a listener socket).  The variable is prefixed
-    // with `_` to communicate "kept alive intentionally" and to suppress the
-    // `unused_variables` warning — using `let _ =` would cause an immediate
-    // drop, which WOULD tear down the service.
-    //
-    // IMPORTANT: onion_service_guard must not be dropped; dropping it
-    // de-registers the hidden service from the Tor network.
-    let (onion_service_guard, rend_requests) = tor_client
-        .launch_onion_service(svc_config)?
-        .ok_or("Tor: onion service returned None (should not happen with in-code config)")?;
-
-    // ── 4. Read the onion address ─────────────────────────────────────────
-    let hsid = onion_service_guard
-        .onion_address()
-        .ok_or("Tor: onion address not yet available (key generation incomplete)")?;
-    let onion_name = hsid_to_onion_address(hsid);
+    // Phase 2 (H-6) — log only the first 12 characters of the onion host.
+    let display_prefix = onion_name
+        .strip_suffix(".onion")
+        .and_then(|host| host.get(..12))
+        .unwrap_or(&onion_name);
 
     log::info!(
         "\n  ╔═══════════════════════════════════════════════════╗\n  \
            ║   TOR ONION SERVICE ACTIVE                        ║\n  \
            ╠═══════════════════════════════════════════════════╣\n  \
-           ║   http://{onion_name:<43}║\n  \
-           ║   Share this address with Tor Browser users.      ║\n  \
+           ║   {display_prefix}….onion (full address in dashboard)  ║\n  \
            ╚═══════════════════════════════════════════════════╝"
+    );
+    log::info!(
+        "Tor onion service active: {display_prefix}….onion (full address visible in dashboard)"
     );
 
     set_onion(&state, onion_name).await;
 
-    // ── 5. Bridge incoming streams to the local HTTP server ───────────────
-    //
-    // `handle_rend_requests` takes the raw `Stream<Item = RendRequest>` from
-    // `launch_onion_service`, auto-accepts each rendezvous handshake, and
-    // yields a `StreamRequest` for every new inbound connection — the Arti
-    // equivalent of the old torrc line:
-    //
-    //   HiddenServicePort 80 127.0.0.1:{bind_port}
-    //
-    // Each connection is proxied in its own Tokio task so they do not block
-    // each other.  Dropping the task naturally closes the Tor circuit.
-    let mut stream_requests = handle_rend_requests(rend_requests);
-
-    // fix T-2 — size the Tor semaphore from config rather than a hardcoded 256.
-    // Hardcoding 256 means operators who lower max_connections to (e.g.) 32
-    // still queue up to 256 Tor streams against the HTTP server; operators who
-    // raise it above 256 are silently capped.  Tying both values together
-    // ensures the Tor layer and HTTP layer agree on the concurrency limit.
+    // Size the Tor semaphore to match the HTTP server's connection limit (fix T-2).
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
 
     loop {
         tokio::select! {
             next = stream_requests.next() => {
                 if let Some(stream_req) = next {
-                    // fix T-1 — use format_local_addr() to correctly bracket
-                    // IPv6 addresses.  Without bracketing, "::1:8080" is not a
-                    // valid SocketAddr literal; every IPv6 proxy connect fails.
                     let local_addr = format_local_addr(bind_addr, bind_port);
-
-                    // fix T-2 — use try_acquire_owned() instead of awaiting
-                    // acquire_owned().  The rendezvous handshake (multi-RTT Tor
-                    // protocol exchange) already completed by the time we reach
-                    // here; dropping the stream_req at this point sends a
-                    // RELAY_END cell that closes the circuit without burning a
-                    // permit.  This is the earliest point we can shed load.
                     let Ok(permit) = std::sync::Arc::clone(&semaphore).try_acquire_owned() else {
                         log::warn!("Tor: at capacity ({max_connections}), dropping stream");
                         drop(stream_req);
                         continue;
                     };
-
                     tokio::spawn(async move {
                         let _permit = permit;
                         if let Err(e) = proxy_stream(stream_req, &local_addr).await {
@@ -352,13 +345,7 @@ async fn run(
                         }
                     });
                 } else {
-                    // The onion service stream ended unexpectedly (Tor network
-                    // disruption, Arti internal error, resource exhaustion).
-                    // Return Ok(true) so init()'s retry loop can re-bootstrap
-                    // instead of dying permanently (fix 3.4).
-                    log::warn!(
-                        "Tor: stream_requests stream ended — will attempt re-bootstrap"
-                    );
+                    log::warn!("Tor: stream_requests stream ended — will attempt re-bootstrap");
                     state.write().await.onion_address = None;
                     return Ok(true); // signal: retry
                 }
@@ -366,8 +353,6 @@ async fn run(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     log::info!("Tor: shutdown signal received — stopping stream loop");
-                    // fix 3.5 — close the semaphore so any in-progress
-                    // acquire_owned() call in the `next` arm returns immediately.
                     semaphore.close();
                     break;
                 }
@@ -375,7 +360,6 @@ async fn run(
         }
     }
 
-    // Clean shutdown: clear the displayed onion address.
     state.write().await.onion_address = None;
     Ok(false) // signal: do not retry
 }
@@ -566,14 +550,43 @@ fn format_local_addr(addr: IpAddr, port: u16) -> String {
     }
 }
 
-/// Create a directory with owner-only permissions 0o700 (fix T-7).
+/// Create a directory that is readable only by the current user (fix T-7, H-4).
+///
+/// On Unix this applies mode 0o700 (owner rwx, no group/other access).
+/// On Windows this shells out to `icacls` to apply a DACL that grants Full
+/// Control only to the current user, removing all inherited permissions.
+/// Using `icacls` avoids pulling in the `windows` crate for this single call;
+/// it is available on all Windows versions since Vista.
 fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
+
+    #[cfg(windows)]
+    {
+        // Determine the current user via `whoami` so the DACL grant is
+        // user-specific.  `icacls /inheritance:r` removes inherited ACEs from
+        // parent directories so the directory is not readable by Administrators
+        // or other groups through inheritance.
+        let whoami_out = std::process::Command::new("whoami").output()?;
+        let user = String::from_utf8_lossy(&whoami_out.stdout)
+            .trim()
+            .to_owned();
+        let path_str = path.to_string_lossy();
+        std::process::Command::new("icacls")
+            .args([
+                path_str.as_ref(),
+                "/inheritance:r", // remove inherited permissions
+                "/grant:r",
+                &format!("{user}:(OI)(CI)F"), // Full Control (recursive)
+            ])
+            .output()?;
+    }
+
     Ok(())
 }
 

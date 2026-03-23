@@ -210,6 +210,28 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
+            // Phase 2 (H-5) — enforce owner-only access on Windows as well.
+            // Default directory creation on Windows inherits the parent ACL,
+            // which is typically world-readable on consumer machines.
+            // `icacls /inheritance:r` removes inherited ACEs; the `/grant:r`
+            // grants Full Control only to the current user.
+            #[cfg(windows)]
+            {
+                if let Ok(whoami_out) = std::process::Command::new("whoami").output() {
+                    let user = String::from_utf8_lossy(&whoami_out.stdout)
+                        .trim()
+                        .to_owned();
+                    let path_str = parent.to_string_lossy();
+                    let _ = std::process::Command::new("icacls")
+                        .args([
+                            path_str.as_ref(),
+                            "/inheritance:r",
+                            "/grant:r",
+                            &format!("{user}:(OI)(CI)F"),
+                        ])
+                        .output();
+                }
+            }
         }
 
         // fix G-1 — open with explicit 0o600 mode (owner read/write only).

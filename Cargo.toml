@@ -80,11 +80,23 @@ openssl      = { version = "0.10", features = ["vendored"] }
 # across the whole dep tree so cross-compiling to Linux/Windows works without a
 # system sqlite3 library present on the host Mac.
 rusqlite     = { version = "*", features = ["bundled"] }
+# Per-IP connection tracking for rate limiting (Phase 2 — C-4).
+# DashMap is a concurrent hash map with fine-grained shard locking; it avoids
+# the single global Mutex that would serialise every accept() call.
+dashmap      = "6"
 
 [dev-dependencies]
 tempfile = "3"
 
+[profile.dev.package."*"]
+opt-level = 1   # dependency builds: faster compile, smaller debug symbols
+
+[profile.dev]
+opt-level = 0
+debug     = true
+
 [profile.release]
-opt-level = 3
-lto        = true
-strip      = true
+opt-level       = 3
+lto             = true
+strip           = true
+codegen-units   = 1  # maximum optimisation; slower link but smaller/faster binary

@@ -299,63 +299,37 @@ pub async fn handle(
 ///
 /// Propagates I/O errors from opening the file, reading metadata, or writing
 /// the response to the stream.
-async fn serve_file(
+/// Write the body of an already-opened file to `stream`, with a 120 s timeout.
+///
+/// Separated from [`serve_file`] to keep that function under the line limit.
+async fn send_file_body(stream: &mut TcpStream, file: &mut tokio::fs::File) -> Result<()> {
+    // A slow reader holds a semaphore permit for an unbounded time without a
+    // write timeout.  120 s is generous for Tor while still ejecting idle
+    // connections.
+    const RESPONSE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    tokio::time::timeout(RESPONSE_WRITE_TIMEOUT, tokio::io::copy(file, stream))
+        .await
+        .map_err(|_| {
+            crate::AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "response write timed out — client too slow",
+            ))
+        })??;
+    Ok(())
+}
+
+/// Write the appropriate error response when `File::open` fails.
+///
+/// Separated from [`serve_file`] to keep that function under the line limit.
+async fn serve_open_error(
     stream: &mut TcpStream,
     abs_path: &std::path::Path,
-    is_head: bool,
+    e: std::io::Error,
     metrics: &SharedMetrics,
     csp: &str,
 ) -> Result<()> {
-    // fix H-6 — distinguish error kinds so the client gets the right status:
-    //   PermissionDenied → 403 Forbidden
-    //   NotFound         → 404 Not Found
-    //   anything else    → 500 Internal Server Error (also logged)
-    match tokio::fs::File::open(abs_path).await {
-        Ok(mut file) => {
-            let file_len = match file.metadata().await {
-                Ok(m) => m.len(),
-                Err(e) => {
-                    log::warn!(
-                        "Failed to read file metadata for {}: {e}",
-                        abs_path.display()
-                    );
-                    write_response(
-                        stream,
-                        500,
-                        "Internal Server Error",
-                        "text/plain",
-                        b"Internal Server Error",
-                        false,
-                        csp,
-                    )
-                    .await?;
-                    metrics.add_error();
-                    return Ok(());
-                }
-            };
-            let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let content_type = mime::for_extension(ext);
-
-            write_headers(stream, 200, "OK", content_type, file_len, csp, None).await?;
-            if !is_head {
-                // fix H-2 — a slow reader holds a semaphore permit for an
-                // unbounded time without a write timeout.  120 s is generous
-                // for Tor (slow) while still ejecting fully-idle connections.
-                const RESPONSE_WRITE_TIMEOUT: std::time::Duration =
-                    std::time::Duration::from_secs(120);
-                tokio::time::timeout(RESPONSE_WRITE_TIMEOUT, tokio::io::copy(&mut file, stream))
-                    .await
-                    .map_err(|_| {
-                        crate::AppError::Io(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "response write timed out — client too slow",
-                        ))
-                    })??;
-            }
-            stream.flush().await?;
-            metrics.add_request();
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+    match e.kind() {
+        std::io::ErrorKind::PermissionDenied => {
             log::warn!("403 Forbidden (permission denied): {}", abs_path.display());
             write_response(
                 stream,
@@ -369,7 +343,7 @@ async fn serve_file(
             .await?;
             metrics.add_error();
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        std::io::ErrorKind::NotFound => {
             log::warn!(
                 "404 Not Found (file disappeared after resolve): {}",
                 abs_path.display()
@@ -386,7 +360,7 @@ async fn serve_file(
             .await?;
             metrics.add_error();
         }
-        Err(e) => {
+        _ => {
             log::error!("Unexpected error opening {}: {e}", abs_path.display());
             write_response(
                 stream,
@@ -401,6 +375,68 @@ async fn serve_file(
             metrics.add_error();
         }
     }
+    Ok(())
+}
+
+async fn serve_file(
+    stream: &mut TcpStream,
+    abs_path: &std::path::Path,
+    is_head: bool,
+    metrics: &SharedMetrics,
+    csp: &str,
+) -> Result<()> {
+    // Distinguish error kinds so the client gets the right status code:
+    //   PermissionDenied → 403 Forbidden
+    //   NotFound         → 404 Not Found
+    //   anything else    → 500 Internal Server Error (also logged)
+    let mut file = match tokio::fs::File::open(abs_path).await {
+        Ok(f) => f,
+        Err(e) => return serve_open_error(stream, abs_path, e, metrics, csp).await,
+    };
+
+    let file_len = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(e) => {
+            log::warn!(
+                "Failed to read file metadata for {}: {e}",
+                abs_path.display()
+            );
+            write_response(
+                stream,
+                500,
+                "Internal Server Error",
+                "text/plain",
+                b"Internal Server Error",
+                false,
+                csp,
+            )
+            .await?;
+            metrics.add_error();
+            return Ok(());
+        }
+    };
+
+    let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let content_type = mime::for_extension(ext);
+    // Phase 2 (M-17) — pass the actual path so cache_control_for can give
+    // hashed assets immutable caching.
+    let path_str = abs_path.to_str().unwrap_or("");
+    write_headers(
+        stream,
+        200,
+        "OK",
+        content_type,
+        file_len,
+        csp,
+        None,
+        path_str,
+    )
+    .await?;
+    if !is_head {
+        send_file_body(stream, &mut file).await?;
+    }
+    stream.flush().await?;
+    metrics.add_request();
     Ok(())
 }
 
@@ -505,6 +541,24 @@ fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
     stack.iter().collect()
 }
 
+/// Return `true` when any component of `resolved` relative to `root` starts with `.`.
+///
+/// Called *after* `canonicalize()` so symlinks are fully resolved (M-2).
+/// The URL-path check that ran before `canonicalize()` could be bypassed by a
+/// symlink whose link name does not start with `.` but whose target path does
+/// (e.g. a symlink named `public` pointing to `.git/`).  Checking the
+/// canonicalized path closes that gap because the resolved component IS `.git`.
+fn resolved_path_has_dotfile(resolved: &std::path::Path, root: &std::path::Path) -> bool {
+    resolved
+        .strip_prefix(root)
+        .unwrap_or(resolved)
+        .components()
+        .any(|c| {
+            matches!(c, std::path::Component::Normal(name)
+                if name.to_str().is_some_and(|s| s.starts_with('.')))
+        })
+}
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Resolved {
     File(std::path::PathBuf),
@@ -573,20 +627,41 @@ pub(crate) fn resolve_path(
         return Resolved::Forbidden;
     }
 
+    // Phase 2 (M-2) — re-check for dot-file components on the *canonicalized*
+    // path.  The URL-path check above catches obvious cases like `/.git/config`
+    // but a symlink whose link name is `public` pointing to `.git/` would pass
+    // that check because "public" does not start with `.`.  After canonicalize()
+    // the resolved path contains `.git` directly, so this check catches it.
+    if !expose_dotfiles && resolved_path_has_dotfile(&canonical, canonical_root) {
+        return Resolved::Forbidden;
+    }
+
     Resolved::File(canonical)
 }
 
 // ─── Response writing ────────────────────────────────────────────────────────
 
-/// Strip CR and LF characters from any string destined for an HTTP header value.
+/// Strip all ASCII control characters from a string destined for an HTTP header value.
 ///
-/// fix H-3 — decoded URL paths may contain CRLF characters (legal on Linux
-/// filesystems), which can split a header line and inject arbitrary response
-/// headers.  Removing them is the correct fix; the redirected URL is otherwise
-/// unchanged.  Applied to the CSP value in [`write_headers`] for the same reason.
+/// RFC 9110 §5.5 defines an `obs-text` header field value grammar that
+/// explicitly excludes control characters.  The previous implementation only
+/// stripped CR (`\r`) and LF (`\n`), which prevented response splitting but
+/// still permitted null bytes (U+0000) and other C0 controls that can confuse
+/// downstream proxies and logging systems (M-1).
+///
+/// The filter retains:
+/// - Printable ASCII (U+0020–U+007E)
+/// - Non-ASCII Unicode (U+0080 and above) — legal in obs-text
+///
+/// It removes:
+/// - All C0 controls (U+0000–U+001F) including NUL, CR, LF, TAB, ESC
+/// - DEL (U+007F)
+///
+/// Returns `Cow::Borrowed` when no characters need stripping to avoid a heap
+/// allocation on the common (clean) path.
 fn sanitize_header_value(s: &str) -> std::borrow::Cow<'_, str> {
-    if s.contains(['\r', '\n']) {
-        std::borrow::Cow::Owned(s.chars().filter(|&c| c != '\r' && c != '\n').collect())
+    if s.chars().any(|c| c.is_ascii_control()) {
+        std::borrow::Cow::Owned(s.chars().filter(|c| !c.is_ascii_control()).collect())
     } else {
         std::borrow::Cow::Borrowed(s)
     }
@@ -614,7 +689,20 @@ async fn write_response(
     // at the narrowest possible scope.
     #[allow(clippy::cast_possible_truncation)]
     let body_len: u64 = body.len() as u64;
-    write_headers(stream, status, reason, content_type, body_len, csp, None).await?;
+    // Error and fallback pages are not tied to a URL for caching — pass "" so
+    // cache_control_for returns "no-cache" rather than accidentally applying
+    // "immutable" to a synthetic body.
+    write_headers(
+        stream,
+        status,
+        reason,
+        content_type,
+        body_len,
+        csp,
+        None,
+        "",
+    )
+    .await?;
     if !suppress_body {
         stream.write_all(body).await?;
     }
@@ -622,7 +710,49 @@ async fn write_response(
     Ok(())
 }
 
-/// Write all HTTP header *fields* (no status line) followed by the blank line.
+// ─── Cache-Control classification (M-17) ─────────────────────────────────────
+
+/// Classify a URL path into the appropriate `Cache-Control` value.
+///
+/// Rules:
+/// - HTML documents: `no-store` (prevent Tor onion address from leaking via
+///   HTTP caches or browser history — HTML may contain the address inline).
+/// - Paths containing a 8-16 hex-char hash segment (hashed assets produced by
+///   bundlers such as Vite/webpack): `max-age=31536000, immutable`.  Content-
+///   addressed filenames cannot change without the URL changing, so a permanent
+///   cache is safe.
+/// - Everything else: `no-cache` (revalidate on every request but allow
+///   conditional GET, improving performance for unchanged resources).
+///
+/// Previously `no-store` was applied to every response, which meant large JS
+/// and CSS files were re-fetched in full on every page load — painful over Tor
+/// (M-17).
+fn cache_control_for(content_type: &str, path: &str) -> &'static str {
+    if content_type.starts_with("text/html") {
+        return "no-store";
+    }
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    if is_hashed_asset(file_name) {
+        "max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
+/// Return `true` when `name` contains a segment that looks like a content hash.
+///
+/// Matches bundler output patterns such as `app.a1b2c3d4.js` and
+/// `main.deadbeef01234567.css` — a dot-delimited segment of 8–16 lowercase hex
+/// characters surrounded by at least one other segment.
+fn is_hashed_asset(name: &str) -> bool {
+    name.split('.')
+        .any(|seg| (8..=16).contains(&seg.len()) && seg.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 ///
 /// Called by both [`write_headers`] (after emitting the status line) and
 /// [`write_redirect`] (after emitting `301 + Location`).  Centralising the
@@ -630,6 +760,10 @@ async fn write_response(
 /// place — the previous arrangement required identical edits in both functions,
 /// an invariant that was already violated when `Content-Security-Policy` was
 /// added only to `write_headers` (fix H-1).
+///
+/// The `url_path` parameter is used to compute the `Cache-Control` value via
+/// [`cache_control_for`].  Pass `""` for responses that are not tied to a
+/// specific URL (redirects, error pages) — they will receive `no-cache`.
 ///
 /// ## Security headers emitted on every response
 ///
@@ -650,9 +784,10 @@ async fn write_header_fields(
     content_length: u64,
     csp: &str,
     content_disposition: Option<&str>,
+    url_path: &str,
 ) -> Result<()> {
     let is_html = content_type.starts_with("text/html");
-    // fix H-3 — strip CR/LF from the CSP value before embedding it in a header.
+    // Phase 2 (M-1) — strip ALL ASCII control chars, not just CR/LF.
     let safe_csp = sanitize_header_value(csp);
     let csp_line = if is_html && !safe_csp.is_empty() {
         format!("Content-Security-Policy: {safe_csp}\r\n")
@@ -662,11 +797,14 @@ async fn write_header_fields(
     let cd_line =
         content_disposition.map_or_else(String::new, |cd| format!("Content-Disposition: {cd}\r\n"));
 
+    // Phase 2 (M-17) — smart Cache-Control instead of blanket no-store.
+    let cache_control = cache_control_for(content_type, url_path);
+
     let fields = format!(
         "Content-Type: {content_type}\r\n\
          Content-Length: {content_length}\r\n\
          Connection: close\r\n\
-         Cache-Control: no-store\r\n\
+         Cache-Control: {cache_control}\r\n\
          X-Content-Type-Options: nosniff\r\n\
          X-Frame-Options: SAMEORIGIN\r\n\
          Referrer-Policy: no-referrer\r\n\
@@ -684,6 +822,10 @@ async fn write_header_fields(
 /// Delegates the header fields (including all security headers) to
 /// [`write_header_fields`] so the security-header set is defined in one place.
 ///
+/// `url_path` is forwarded to [`cache_control_for`] so assets with content-hash
+/// filenames receive `immutable` caching while HTML keeps `no-store`.  Pass `""`
+/// for synthetic responses (error pages, fallback page) — they receive `no-cache`.
+///
 /// # Errors
 ///
 /// Propagates any [`std::io::Error`] from writing to the stream.
@@ -695,6 +837,7 @@ async fn write_headers(
     content_length: u64,
     csp: &str,
     content_disposition: Option<&str>, // fix H-5: pass Some("attachment") for SVG
+    url_path: &str,
 ) -> Result<()> {
     stream
         .write_all(format!("HTTP/1.1 {status} {reason}\r\n").as_bytes())
@@ -706,6 +849,7 @@ async fn write_headers(
         content_length,
         csp,
         content_disposition,
+        url_path,
     )
     .await
 }
@@ -739,7 +883,9 @@ async fn write_redirect(
         )
         .await?;
     // write_headers emits all security headers from one place; write_redirect delegates here
-    write_header_fields(stream, "text/plain", body_len, csp, None).await
+    // Redirects are not tied to a specific URL for caching purposes — pass ""
+    // so cache_control_for returns "no-cache" rather than "no-store".
+    write_header_fields(stream, "text/plain", body_len, csp, None, "").await
 }
 
 // ─── Directory listing ───────────────────────────────────────────────────────
@@ -1052,5 +1198,175 @@ mod tests {
         let missing_root = Path::new("/nonexistent/root/that/does/not/exist");
         let result = resolve_path(missing_root, "/index.html", "index.html", false, false);
         assert_eq!(result, Resolved::Fallback);
+    }
+}
+
+// ── Phase 2 tests ─────────────────────────────────────────────────────────────
+
+// ── 2.3 sanitize_header_value ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_header_value;
+
+    #[test]
+    fn strips_crlf() {
+        assert_eq!(sanitize_header_value("foo\r\nbar"), "foobar");
+    }
+
+    #[test]
+    fn strips_null_byte() {
+        // M-1: null bytes were not stripped by the old CR/LF-only filter.
+        assert_eq!(sanitize_header_value("foo\x00bar"), "foobar");
+    }
+
+    #[test]
+    fn strips_esc() {
+        // M-1: ESC (U+001B) is a C0 control and must be stripped.
+        assert_eq!(sanitize_header_value("foo\x1bbar"), "foobar");
+    }
+
+    #[test]
+    fn strips_del() {
+        // M-1: DEL (U+007F) must be stripped.
+        assert_eq!(sanitize_header_value("foo\x7fbar"), "foobar");
+    }
+
+    #[test]
+    fn strips_tab() {
+        // M-1: TAB (U+0009) is a C0 control; strip it.
+        assert_eq!(sanitize_header_value("foo\tbar"), "foobar");
+    }
+
+    #[test]
+    fn preserves_unicode() {
+        // Non-ASCII Unicode must pass through unchanged (legal in obs-text).
+        let input = "/café/page";
+        assert_eq!(sanitize_header_value(input), input);
+    }
+
+    #[test]
+    fn no_allocation_when_clean() {
+        // Fast path: clean strings must be returned as Borrowed (no heap alloc).
+        let s = "/normal/path";
+        assert!(matches!(
+            sanitize_header_value(s),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+}
+
+// ── 2.5 cache_control_for / is_hashed_asset ───────────────────────────────────
+
+#[cfg(test)]
+mod cache_tests {
+    use super::{cache_control_for, is_hashed_asset};
+
+    #[test]
+    fn html_gets_no_store() {
+        assert_eq!(
+            cache_control_for("text/html; charset=utf-8", "/index.html"),
+            "no-store"
+        );
+    }
+
+    #[test]
+    fn hashed_js_gets_immutable() {
+        // 8-char hex hash segment → "immutable".
+        assert_eq!(
+            cache_control_for("text/javascript", "/app.a1b2c3d4.js"),
+            "max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn hashed_css_gets_immutable() {
+        assert_eq!(
+            cache_control_for("text/css", "/style.deadbeef.css"),
+            "max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn plain_css_gets_no_cache() {
+        assert_eq!(cache_control_for("text/css", "/style.css"), "no-cache");
+    }
+
+    #[test]
+    fn plain_js_gets_no_cache() {
+        assert_eq!(cache_control_for("text/javascript", "/main.js"), "no-cache");
+    }
+
+    #[test]
+    fn empty_path_gets_no_cache() {
+        // Error / redirect responses pass "" — must not crash, returns no-cache.
+        assert_eq!(cache_control_for("text/plain", ""), "no-cache");
+    }
+
+    #[test]
+    fn is_hashed_asset_rejects_short_hex() {
+        // Only 3 hex chars — too short to be a content hash.
+        assert!(!is_hashed_asset("app.abc.js"));
+    }
+
+    #[test]
+    fn is_hashed_asset_accepts_exactly_8_hex() {
+        assert!(is_hashed_asset("app.deadbeef.js"));
+    }
+
+    #[test]
+    fn is_hashed_asset_accepts_16_hex() {
+        assert!(is_hashed_asset("app.deadbeef01234567.js"));
+    }
+
+    #[test]
+    fn is_hashed_asset_rejects_17_hex() {
+        // 17 chars exceeds the 8-16 range — should not match.
+        assert!(!is_hashed_asset("app.deadbeef012345678.js"));
+    }
+
+    #[test]
+    fn is_hashed_asset_rejects_non_hex_segment() {
+        // "ghijklmn" is 8 chars but contains non-hex characters.
+        assert!(!is_hashed_asset("app.ghijklmn.js"));
+    }
+}
+
+// ── 2.4 resolved_path_has_dotfile ─────────────────────────────────────────────
+
+#[cfg(test)]
+mod dotfile_tests {
+    use super::resolved_path_has_dotfile;
+    use std::path::Path;
+
+    #[test]
+    fn detects_dotfile_component() {
+        let root = Path::new("/srv/site");
+        let resolved = Path::new("/srv/site/.git/config");
+        assert!(resolved_path_has_dotfile(resolved, root));
+    }
+
+    #[test]
+    fn allows_normal_component() {
+        let root = Path::new("/srv/site");
+        let resolved = Path::new("/srv/site/assets/main.js");
+        assert!(!resolved_path_has_dotfile(resolved, root));
+    }
+
+    #[test]
+    fn detects_nested_dotfile() {
+        let root = Path::new("/srv/site");
+        let resolved = Path::new("/srv/site/sub/.env");
+        assert!(resolved_path_has_dotfile(resolved, root));
+    }
+
+    #[test]
+    fn allows_dotfile_outside_root_prefix() {
+        // The function strips the root prefix before checking; a dotfile in
+        // the root itself (which is above the served tree) should not trigger.
+        let root = Path::new("/srv/.hidden/site");
+        let resolved = Path::new("/srv/.hidden/site/index.html");
+        // ".hidden" is in the root prefix, not in the relative path — not flagged.
+        assert!(!resolved_path_has_dotfile(resolved, root));
     }
 }

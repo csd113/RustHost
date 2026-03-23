@@ -146,11 +146,31 @@ pub struct ServerConfig {
     pub open_browser_on_start: bool,
     pub max_connections: u32,
 
+    /// Maximum concurrent connections from a single IP address.
+    ///
+    /// Prevents a single client from monopolising the connection pool (C-4).
+    /// When the limit is reached the connection is dropped at the TCP level —
+    /// the OS sends a RST so no HTTP overhead is incurred.
+    ///
+    /// Must be ≥ 1 and ≤ `max_connections`.  Validated in `loader.rs`.
+    /// Defaults to 16, which is generous for browsers (typically 6–8 parallel
+    /// connections) while preventing trivial single-client exhaustion attacks.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: u32,
+
     /// Content-Security-Policy preset.  See [`CspLevel`] for available values
     /// (`"off"`, `"relaxed"`, `"strict"`) and the header each one sends.
     /// Defaults to `"off"` — no CSP header, maximum browser compatibility.
     #[serde(default)]
     pub csp_level: CspLevel,
+}
+
+/// Default per-IP connection limit.
+///
+/// 16 is generous for browsers (6–8 parallel connections per origin) while
+/// making single-client `DoS` impractical without cooperation from many IPs.
+const fn default_max_connections_per_ip() -> u32 {
+    16
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +249,7 @@ impl Default for Config {
                 auto_port_fallback: true,
                 open_browser_on_start: false,
                 max_connections: 256,
+                max_connections_per_ip: default_max_connections_per_ip(),
                 csp_level: CspLevel::Strict,
             },
             site: SiteConfig {
