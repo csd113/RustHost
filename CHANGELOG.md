@@ -10,9 +10,6 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [v0.1.1]
 
 ### Added
-- **`CONTRIBUTING.md`** — development workflow, lint gates, PR checklist, and architecture overview for new contributors.
-- **`SECURITY.md`** — private vulnerability disclosure policy and scope definition.
-- **`CHANGELOG.md`** — this file.
 - **Depth-bounded `scan_site` BFS** — the directory scanner now stops at 64 levels deep and emits a warning instead of running indefinitely on adversarially deep directory trees.
 - **Multiple log rotation backups** — `LogFile::rotate` now keeps up to five numbered backup files (`.log.1`–`.log.5`) instead of one, matching what operators expect from tools like `logrotate`.
 
