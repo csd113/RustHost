@@ -7,7 +7,7 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [v0.1.1]
 
 ### Added
 - **`CONTRIBUTING.md`** — development workflow, lint gates, PR checklist, and architecture overview for new contributors.
