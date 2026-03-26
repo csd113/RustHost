@@ -1,6 +1,6 @@
 [package]
 name        = "rusthost"
-version     = "0.1.1"
+version     = "0.1.2"
 edition     = "2021"
 # Bumped from 1.86 → 1.90 to match the highest MSRV in the transitive dep tree:
 #   arti-client 0.40 and most tor-* crates require 1.89
@@ -37,6 +37,18 @@ nursery  = { level = "warn",  priority = -1 }
 [dependencies]
 
 openssl = { version = "0.10", features = ["vendored"] }
+
+rustls-pemfile = "2"          # PEM parsing — used in mod.rs
+x509-cert      = "0.2"        # cert expiry parsing — used in self_signed.rs
+pem-rfc7468    = "0.7"        # PEM decode for the expiry check
+time           = "0.3"        # OffsetDateTime for rcgen cert params
+
+# Phase 6 — TLS / HTTPS support
+tokio-rustls  = "0.26"                                       # TLS stream wrapper for Tokio
+tokio-util    = { version = "0.7", features = ["compat"] }   # futures-io ↔ tokio-io compatibility bridge
+rustls        = { version = "0.23", features = ["ring"] }    # rustls TLS implementation
+rustls-acme   = { version = "0.12", features = ["tokio"] }   # ACME / Let's Encrypt automation
+rcgen         = "0.13"                                        # self-signed dev cert generation
 
 tokio = { version = "1", features = [
     "rt-multi-thread",

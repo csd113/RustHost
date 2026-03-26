@@ -27,9 +27,9 @@ use crate::{
     console, logging,
     runtime::{
         events,
-        state::{AppState, Metrics, SharedMetrics, SharedState, TorStatus},
+        state::{AppState, CertStatus, Metrics, SharedMetrics, SharedState, TorStatus},
     },
-    server, tor, AppError, Result,
+    server, tls, tor, AppError, Result,
 };
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -154,6 +154,7 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
             instance_name: "RustHost".into(),
         },
         redirects: Vec::new(),
+        tls: crate::config::TlsConfig::default(),
     });
 
     normal_run_with_config(data_dir, config).await
@@ -301,6 +302,67 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
             ));
         }
     };
+
+    // 7b. TLS / HTTPS — optional, non-fatal.
+    //
+    // Build a TlsAcceptor from `config.tls`.  If anything goes wrong (bad cert
+    // files, unsupported key type, …) we log the error and continue HTTP-only
+    // rather than refusing to start.  This mirrors the design principle that
+    // TLS is additive — it must never break an otherwise-working server.
+    if config.tls.enabled {
+        let tls_result = tls::build_acceptor(&config.tls, &data_dir).await;
+        match tls_result {
+            Err(e) => {
+                log::error!("TLS init failed: {e}. Continuing in HTTP-only mode.");
+            }
+            Ok(None) => { /* enabled=false handled inside build_acceptor */ }
+            Ok(Some(acceptor)) => {
+                // Record cert type in shared state for the dashboard.
+                {
+                    let mut s = state.write().await;
+                    s.tls_cert_status = if config.tls.acme.enabled {
+                        config.tls.acme.domains.first().map_or(
+                            CertStatus::Acme {
+                                domain: String::new(),
+                            },
+                            |d| CertStatus::Acme { domain: d.clone() },
+                        )
+                    } else if config.tls.manual_cert.is_some() {
+                        CertStatus::Manual
+                    } else {
+                        CertStatus::SelfSigned
+                    };
+                }
+
+                // Spawn the HTTPS accept loop.
+                let cfg_https = Arc::clone(&config);
+                let st_https = Arc::clone(&state);
+                let met_https = Arc::clone(&metrics);
+                let shut_https = shutdown_rx.clone();
+                let dd_https = data_dir.clone();
+                tokio::spawn(async move {
+                    server::run_https(
+                        cfg_https, st_https, met_https, dd_https, shut_https, acceptor,
+                    )
+                    .await;
+                });
+
+                // Optionally spawn the HTTP→HTTPS redirect server.
+                if config.tls.redirect_http {
+                    let bind_addr = config.server.bind;
+                    let http_port = config.tls.http_port.get();
+                    let https_port = config.tls.port.get();
+                    let shut_redir = shutdown_rx.clone();
+                    tokio::spawn(async move {
+                        server::redirect::run_redirect_server(
+                            bind_addr, http_port, https_port, shut_redir,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
+    }
 
     // 8. Start Tor (if enabled).
     //    tor::init() spawns a Tokio task and returns its JoinHandle.

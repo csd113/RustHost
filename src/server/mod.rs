@@ -15,6 +15,7 @@
 pub mod fallback;
 pub mod handler;
 pub mod mime;
+pub mod redirect;
 
 use std::{
     net::{IpAddr, TcpListener as StdTcpListener},
@@ -26,17 +27,17 @@ use std::{
     time::Duration,
 };
 
+use crate::{
+    config::Config,
+    runtime::state::{SharedMetrics, SharedState},
+    tls::Acceptor,
+    AppError, Result,
+};
 use dashmap::DashMap;
 use tokio::{
     net::TcpListener,
     sync::{oneshot, watch, Semaphore},
     task::JoinSet,
-};
-
-use crate::{
-    config::Config,
-    runtime::state::{SharedMetrics, SharedState},
-    AppError, Result,
 };
 
 // ─── Per-IP rate limiting (C-4) ───────────────────────────────────────────────
@@ -227,6 +228,7 @@ impl ServerContext {
                 spa_routing,
                 e404,
                 redirects,
+                false, // is_https
             )
             .await
             {
@@ -338,6 +340,203 @@ pub async fn run(
     let drain = async { while join_set.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
     log::info!("HTTP server drained.");
+}
+
+/// Start the HTTPS server.
+///
+/// Mirrors [`run`] exactly but wraps every accepted TCP stream in a TLS
+/// handshake before handing it to the connection handler.  TLS handshake
+/// failures are logged at **`debug`** (not `warn`) because port-scanners,
+/// load-balancer health checks, and misconfigured clients hit port 443
+/// constantly and would create enormous log noise at higher severities.
+///
+/// The `per_ip_map` and `semaphore` are shared with the plain HTTP listener
+/// so both listeners draw from a single global connection budget.
+pub async fn run_https(
+    config: Arc<Config>,
+    state: SharedState,
+    metrics: SharedMetrics,
+    data_dir: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+    tls_acceptor: Acceptor,
+) {
+    let bind_addr = config.server.bind;
+    let port = config.tls.port.get();
+
+    let std_listener = match StdTcpListener::bind(format!("{bind_addr}:{port}")) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("HTTPS server failed to bind {bind_addr}:{port}: {e}");
+            return;
+        }
+    };
+    if let Err(e) = std_listener.set_nonblocking(true) {
+        log::error!("HTTPS listener set_nonblocking failed: {e}");
+        return;
+    }
+    let listener = match TcpListener::from_std(std_listener) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("HTTPS TcpListener conversion failed: {e}");
+            return;
+        }
+    };
+
+    {
+        let mut s = state.write().await;
+        s.tls_running = true;
+        s.tls_port = Some(port);
+    }
+    log::info!("HTTPS server listening on {bind_addr}:{port}");
+
+    let Some(ctx) = ServerContext::new(&config, &data_dir) else {
+        return;
+    };
+    let mut join_set: JoinSet<()> = JoinSet::new();
+    let mut backoff_ms: u64 = 1;
+
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((tcp_stream, peer)) => {
+                        backoff_ms = 1;
+                        log::debug!("TLS connection from {peer}");
+                        // Clone the acceptor handle cheaply — both variants are Arc-backed.
+                        let acceptor = match &tls_acceptor {
+                            Acceptor::Static(a) => Acceptor::Static(Arc::clone(a)),
+                            Acceptor::Acme(a, cfg) => Acceptor::Acme(Arc::clone(a), Arc::clone(cfg)),
+                        };
+                        let peer_ip = peer.ip();
+                        let Ok(ip_guard) = try_acquire_per_ip(&ctx.per_ip_map, peer_ip, ctx.max_per_ip) else {
+                            log::warn!(
+                                "Per-IP limit ({}) reached for {peer_ip}; dropping TLS connection",
+                                ctx.max_per_ip
+                            );
+                            drop(tcp_stream);
+                            continue;
+                        };
+                        let Ok(permit) = Arc::clone(&ctx.semaphore).acquire_owned().await else {
+                            break; // semaphore closed — shutting down
+                        };
+
+                        let site = Arc::clone(&ctx.canonical_root);
+                        let idx = Arc::clone(&ctx.index_file);
+                        let met = Arc::clone(&metrics);
+                        let csp = Arc::clone(&ctx.csp_header);
+                        let dir_list = ctx.dir_list;
+                        let expose_dots = ctx.expose_dots;
+                        let spa_routing = ctx.spa_routing;
+                        let e404 = ctx.error_404_path.clone();
+                        let redirects = Arc::clone(&ctx.redirects);
+
+                        join_set.spawn(async move {
+                            let _permit = permit;
+                            let _ip_guard = ip_guard;
+
+                            // Perform the TLS handshake.  The two acceptor variants
+                            // produce different concrete stream types, so we erase them
+                            // behind a boxed trait object for the generic handler.
+                            //
+                            // Rust does not allow `dyn TraitA + TraitB` when both traits
+                            // are non-auto traits, so we define a combined supertrait that
+                            // the compiler can use as a single vtable target.
+                            //
+                            // The ACME acceptor uses futures-io traits (not tokio traits).
+                            // We bridge in both directions with tokio-util's compat layer:
+                            //   • TcpStream  tokio→futures  via TokioAsyncReadCompatExt
+                            //   • TLS stream futures→tokio  via FuturesAsyncReadCompatExt
+                            use tokio_util::compat::{
+                                FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt,
+                            };
+
+                            trait TlsStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+                            impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TlsStream for T {}
+
+                            let tls_stream: Box<dyn TlsStream> = match acceptor {
+                                Acceptor::Static(a) => {
+                                    match a.accept(tcp_stream).await {
+                                        Ok(s) => Box::new(s),
+                                        Err(e) => {
+                                            log::debug!("TLS handshake failed from {peer}: {e}");
+                                            return;
+                                        }
+                                    }
+                                }
+                                Acceptor::Acme(a, server_cfg) => {
+                                    // AcmeAcceptor::accept needs futures-io AsyncRead/AsyncWrite,
+                                    // so adapt the tokio TcpStream before passing it in.
+                                    let compat_stream = tcp_stream.compat();
+                                    match a.accept(compat_stream).await {
+                                        Ok(Some(handshake)) => {
+                                            match handshake.into_stream(server_cfg).await {
+                                                // compat() flips the resulting futures-io
+                                                // TLS stream back to tokio traits.
+                                                Ok(s) => Box::new(s.compat()),
+                                                Err(e) => {
+                                                    log::debug!("ACME TLS handshake failed from {peer}: {e}");
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        // None means rustls-acme consumed this connection
+                                        // internally to complete a TLS-ALPN-01 challenge.
+                                        // No application data to serve — return cleanly.
+                                        Ok(None) => {
+                                            log::debug!("ACME challenge connection handled for {peer}");
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            log::debug!("ACME accept error from {peer}: {e}");
+                                            return;
+                                        }
+                                    }
+                                }
+                            };
+
+                            if let Err(e) = handler::handle(
+                                tls_stream,
+                                site,
+                                idx,
+                                dir_list,
+                                expose_dots,
+                                met,
+                                csp,
+                                spa_routing,
+                                e404,
+                                redirects,
+                                true, // is_https
+                            )
+                            .await
+                            {
+                                log::debug!("HTTPS handler error: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        if is_fd_exhaustion(&e) {
+                            log::error!(
+                                "HTTPS accept error — file-descriptor limit reached: {e}."
+                            );
+                        } else {
+                            log::debug!("HTTPS accept error (transient): {e}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = backoff_ms.saturating_mul(2).min(1_000);
+                    }
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+
+    state.write().await.tls_running = false;
+    log::info!("HTTPS server stopped accepting; draining in-flight connections…");
+    let drain = async { while join_set.join_next().await.is_some() {} };
+    let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+    log::info!("HTTPS server drained.");
 }
 
 // ─── Port binding ─────────────────────────────────────────────────────────────

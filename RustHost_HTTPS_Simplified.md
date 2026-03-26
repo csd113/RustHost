@@ -7,6 +7,7 @@ Use **`tokio-rustls`** + **`rustls-acme`**. Pure Rust, no FFI, compatible with `
 ```toml
 # Cargo.toml
 tokio-rustls = "0.26"
+rustls-pemfile = "2"
 rustls       = { version = "0.23", features = ["ring"] }
 rustls-acme  = { version = "0.12", features = ["tokio"] }
 rcgen        = { version = "0.13", optional = true }   # self-signed dev certs

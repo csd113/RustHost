@@ -26,7 +26,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper::{body::Incoming, header, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use super::{fallback, mime};
 use crate::{runtime::state::SharedMetrics, Result};
@@ -55,8 +55,8 @@ fn empty_body() -> BoxBody {
 /// # Errors
 ///
 /// Propagates I/O errors from hyper's connection driver.
-pub async fn handle(
-    stream: TcpStream,
+pub async fn handle<S>(
+    stream: S,
     canonical_root: Arc<Path>,
     index_file: Arc<str>,
     dir_listing: bool,
@@ -66,7 +66,11 @@ pub async fn handle(
     spa_routing: bool,
     error_404_path: Option<std::path::PathBuf>,
     redirects: Arc<Vec<crate::config::RedirectRule>>,
-) -> Result<()> {
+    is_https: bool,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let cfg = Arc::new(RouteConfig {
         canonical_root,
         index_file,
@@ -76,6 +80,7 @@ pub async fn handle(
         spa_routing,
         error_404_path,
         redirects,
+        is_https,
     });
 
     let io = TokioIo::new(stream);
@@ -112,6 +117,8 @@ struct RouteConfig {
     error_404_path: Option<std::path::PathBuf>,
     /// Operator redirect/rewrite rules (M-13), checked before filesystem resolution.
     redirects: Arc<Vec<crate::config::RedirectRule>>,
+    /// Whether this connection arrived over TLS — used to add HSTS.
+    is_https: bool,
 }
 
 async fn route(
@@ -124,13 +131,13 @@ async fn route(
             metrics.add_request();
             let resp = options_response();
             log_request(&req, resp.status().as_u16(), 0);
-            return Ok(resp);
+            return Ok(inject_security_headers(resp, cfg.is_https));
         }
         m if m != Method::GET && m != Method::HEAD => {
             metrics.add_error();
             let resp = method_not_allowed();
             log_request(&req, resp.status().as_u16(), 0);
-            return Ok(resp);
+            return Ok(inject_security_headers(resp, cfg.is_https));
         }
         _ => {}
     }
@@ -147,7 +154,7 @@ async fn route(
             metrics.add_request();
             let resp = external_redirect_response(&safe, status, &cfg.csp);
             log_request(&req, resp.status().as_u16(), 0);
-            return Ok(resp);
+            return Ok(inject_security_headers(resp, cfg.is_https));
         }
     }
 
@@ -174,6 +181,9 @@ async fn route(
 
     // M-16 — write one Combined Log Format line per request.
     log_request(&req, resp.status().as_u16(), 0);
+
+    // Inject HSTS and other security headers that depend on transport.
+    let resp = inject_security_headers(resp, cfg.is_https);
     Ok(resp)
 }
 
@@ -591,6 +601,41 @@ pub fn parse_range<B>(
 /// Single definition of the security headers (H-1).  Every response path —
 /// 200, 206, 301, 304, 400, 404, 500 — goes through here so additions never
 /// need to be applied in multiple places.
+/// Mutate a completed response to add transport-dependent security headers.
+///
+/// Called once per request in [`route`] after the full response is built so
+/// that *every* response — file, directory listing, error, redirect — receives
+/// the same headers regardless of which code path produced it.
+///
+/// | Header                     | Condition  | Value                                          |
+/// |----------------------------|------------|------------------------------------------------|
+/// | `Strict-Transport-Security`| HTTPS only | `max-age=63072000; includeSubDomains`          |
+/// | `X-Content-Type-Options`   | always     | `nosniff`                                      |
+/// | `X-Frame-Options`          | always     | `SAMEORIGIN`                                   |
+///
+/// `X-Content-Type-Options` and `X-Frame-Options` are also added by the lower-level
+/// [`security_headers`] builder helper for most response paths, making them
+/// doubly-inserted on those paths.  `insert` overwrites duplicates, so the net
+/// result is always exactly one copy of each header.
+fn inject_security_headers(mut resp: Response<BoxBody>, is_https: bool) -> Response<BoxBody> {
+    let h = resp.headers_mut();
+    if is_https {
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            header::HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+        );
+    }
+    h.insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        header::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::HeaderName::from_static("x-frame-options"),
+        header::HeaderValue::from_static("SAMEORIGIN"),
+    );
+    resp
+}
+
 fn security_headers(
     mut builder: hyper::http::response::Builder,
     csp: &str,

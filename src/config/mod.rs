@@ -113,7 +113,79 @@ impl CspLevel {
     }
 }
 
-// ─── Config structs ──────────────────────────────────────────────────────────
+// ─── TLS config ──────────────────────────────────────────────────────────────
+
+fn default_https_port() -> NonZeroU16 {
+    NonZeroU16::new(8443).unwrap_or(NonZeroU16::MIN)
+}
+
+fn default_http_port() -> NonZeroU16 {
+    NonZeroU16::new(8080).unwrap_or(NonZeroU16::MIN)
+}
+
+fn default_acme_dir() -> String {
+    "tls/acme".into()
+}
+
+/// Top-level TLS configuration block (`[tls]` in `settings.toml`).
+///
+/// All fields default to off/safe values so existing configs with no `[tls]`
+/// section continue to work identically (`TlsConfig::default()` → HTTP-only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_https_port")]
+    pub port: NonZeroU16,
+    #[serde(default)]
+    pub redirect_http: bool,
+    #[serde(default = "default_http_port")]
+    pub http_port: NonZeroU16,
+    #[serde(default)]
+    pub acme: AcmeConfig,
+    pub manual_cert: Option<ManualCertConfig>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_https_port(),
+            redirect_http: false,
+            http_port: default_http_port(),
+            acme: AcmeConfig::default(),
+            manual_cert: None,
+        }
+    }
+}
+
+/// Let's Encrypt / ACME configuration (`[tls.acme]` in `settings.toml`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AcmeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    pub email: Option<String>,
+    /// When `true` (the default), use Let's Encrypt's staging environment.
+    /// Staging certs are not trusted by browsers but have much higher rate
+    /// limits — always test with `staging = true` before flipping to `false`.
+    #[serde(default = "default_true")]
+    pub staging: bool,
+    /// Directory for the ACME DirCache (relative to the data dir).
+    #[serde(default = "default_acme_dir")]
+    pub cache_dir: String,
+}
+
+/// Paths to a manually-managed certificate chain and private key
+/// (`[tls.manual_cert]` in `settings.toml`).
+///
+/// Both paths are resolved relative to the data directory at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualCertConfig {
+    pub cert_path: String,
+    pub key_path: String,
+}
 
 /// A single URL redirect or rewrite rule, matched before filesystem resolution.
 ///
@@ -154,6 +226,11 @@ pub struct Config {
     /// Addresses M-13.
     #[serde(default)]
     pub redirects: Vec<RedirectRule>,
+
+    /// TLS / HTTPS configuration.  All fields default to disabled so existing
+    /// configs without a `[tls]` section are unaffected.
+    #[serde(default)]
+    pub tls: TlsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +403,7 @@ impl Default for Config {
                 instance_name: "RustHost".into(),
             },
             redirects: Vec::new(),
+            tls: TlsConfig::default(),
         }
     }
 }

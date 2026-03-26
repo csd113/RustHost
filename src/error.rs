@@ -7,7 +7,8 @@
 //! crate-level alias in `main.rs`.
 //!
 //! Variants are scoped to the subsystem that produces them so callers can match
-//! on the specific failure kind rather than inspecting a `Box<dyn Error>` string.
+//! on the specific failure kind rather than inspecting a `Box<dyn Error>`
+//! string.
 
 use thiserror::Error;
 
@@ -21,6 +22,10 @@ pub enum AppError {
     /// Config was parsed successfully but failed semantic validation.
     ///
     /// The inner `Vec` contains one human-readable message per violated rule.
+    ///
+    /// Callers should prefer constructing this variant with at least one
+    /// message. If the vector is empty, the rendered message will contain an
+    /// empty bullet entry.
     #[error("settings.toml has {} error(s):\n  • {}", .0.len(), .0.join("\n  • "))]
     ConfigValidation(Vec<String>),
 
@@ -41,8 +46,13 @@ pub enum AppError {
     #[error("Console error: {0}")]
     Console(String),
 
+    /// TLS configuration or certificate error (self-signed generation, PEM
+    /// parsing, ACME provisioning, or `rustls` config construction).
+    #[error("TLS error: {0}")]
+    Tls(String),
+
     /// Transparent wrapper for any `std::io::Error` not covered by a more
-    /// specific variant.  The `#[from]` attribute means `?` on any
+    /// specific variant. The `#[from]` attribute means `?` on any
     /// `io::Result` in the codebase converts automatically.
     #[error(transparent)]
     Io(#[from] std::io::Error),
