@@ -39,6 +39,14 @@ pub enum Acceptor {
 ///   2. `[tls.manual_cert]`    →  load PEM files from disk
 ///   3. `[tls.acme]`           →  Let's Encrypt via `rustls-acme` (spawns renewal loop)
 ///   4. fallback               →  auto-generate a `localhost` self-signed cert via `rcgen`
+///
+/// # Errors
+///
+/// Returns [`crate::AppError::Tls`] if:
+/// - A manual certificate path cannot be read or parsed.
+/// - The ACME config is invalid (empty domain list, IP address as domain, etc.).
+/// - The ACME cache directory cannot be created.
+/// - The self-signed certificate cannot be generated or written to disk.
 pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<Acceptor>> {
     if !cfg.enabled {
         return Ok(None);
@@ -51,7 +59,7 @@ pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<A
 
     if cfg.acme.enabled {
         log::info!("TLS: starting ACME / Let's Encrypt provisioning");
-        let (acme_acceptor, server_cfg) = acme::build_acme_acceptor(&cfg.acme, data_dir).await?;
+        let (acme_acceptor, server_cfg) = acme::build_acme_acceptor(&cfg.acme, data_dir)?;
         return Ok(Some(Acceptor::Acme(acme_acceptor, server_cfg)));
     }
 

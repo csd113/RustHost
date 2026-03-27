@@ -19,12 +19,18 @@
 //! pre-bound listener.  On the loopback interface this window is on the order
 //! of microseconds and is acceptable in practice.
 
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::Path,
+    sync::{atomic::AtomicU32, Arc},
+    time::Duration,
+};
 
+use dashmap::DashMap;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{watch, RwLock},
+    sync::{watch, RwLock, Semaphore},
 };
 
 use rusthost::{
@@ -86,13 +92,32 @@ impl TestServer {
         let site_root_arc: Arc<Path> = Arc::from(joined.as_path());
         let (root_tx, root_rx) = watch::channel(site_root_arc);
 
+        // Connection-count limiter: capacity matches config.server.max_connections
+        // so the server's internal limit and the semaphore stay in sync.
+        let conn_semaphore: Arc<Semaphore> =
+            Arc::new(Semaphore::new(config.server.max_connections as usize));
+
+        // Per-IP active-connection tracker required by the rate-limiting layer.
+        let ip_connections: Arc<DashMap<IpAddr, Arc<AtomicU32>>> = Arc::new(DashMap::new());
+
         let handle = {
             let cfg = Arc::clone(&config);
             let st = Arc::clone(&state);
             let met = Arc::clone(&metrics);
             let shut = shutdown_rx;
             tokio::spawn(async move {
-                rusthost::server::run(cfg, st, met, data_dir, shut, port_tx, root_rx).await;
+                rusthost::server::run(
+                    cfg,
+                    st,
+                    met,
+                    data_dir,
+                    shut,
+                    port_tx,
+                    root_rx,
+                    conn_semaphore,
+                    ip_connections,
+                )
+                .await;
             })
         };
 

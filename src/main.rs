@@ -388,6 +388,26 @@ Use -- to signal the end of options.",
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() {
+    // ── Terminal auto-launcher ────────────────────────────────────────────────
+    // Must be the very first thing: if stdout is not a TTY (e.g. the binary
+    // was double-clicked), relaunch inside a terminal emulator and exit.
+    // The sentinel env var `RUSTHOST_SPAWNED=1` prevents an infinite loop.
+    rusthost::terminal::maybe_relaunch();
+
+    // Install ring as the process-level rustls CryptoProvider.
+    //
+    // Must happen before *any* TLS initialisation (including the tokio runtime
+    // and any dependency init code that touches rustls).  Without this call,
+    // rustls panics at the first TLS operation when more than one provider is
+    // compiled into the binary — which happens here because rustls-acme's
+    // transitive dependencies can pull in aws-lc-rs alongside our explicit
+    // ring dependency.
+    //
+    // `install_default` returns Err if a provider is already installed; that
+    // is harmless (another crate beat us to it with the same provider), so we
+    // ignore the result rather than unwrapping.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Parse arguments before starting the async runtime so that --help and
     // --version never pay the runtime-construction cost.
     let args = parse_args();

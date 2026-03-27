@@ -47,7 +47,7 @@ time           = "0.3"        # OffsetDateTime for rcgen cert params
 tokio-rustls  = "0.26"                                       # TLS stream wrapper for Tokio
 tokio-util    = { version = "0.7", features = ["compat"] }   # futures-io ↔ tokio-io compatibility bridge
 rustls        = { version = "0.23", features = ["ring"] }    # rustls TLS implementation
-rustls-acme   = { version = "0.12", features = ["tokio"] }   # ACME / Let's Encrypt automation
+rustls-acme   = { version = "0.12", default-features = false, features = ["tokio", "ring"] }   # ACME / Let's Encrypt automation
 rcgen         = "0.13"                                        # self-signed dev cert generation
 
 tokio = { version = "1", features = [
@@ -69,6 +69,10 @@ arti-client = { version = "0.40", features = [
 tor-hsservice = { version = "0.40" }
 tor-cell      = { version = "0.40" }
 futures       = "0.3"
+
+# Terminal auto-launcher (Phase 0): TTY detection + error handling.
+atty         = "0.2"
+anyhow       = "1"
 
 sha3         = "0.10"
 data-encoding = "2"

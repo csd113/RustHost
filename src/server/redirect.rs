@@ -34,20 +34,20 @@ use tokio::{io::AsyncWriteExt as _, net::TcpListener, sync::watch};
 /// body into what is effectively a TCP-level redirect pump.
 pub async fn run_redirect_server(
     bind_addr: IpAddr,
-    http_port: u16,
-    https_port: u16,
+    plain_port: u16,
+    tls_port: u16,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let listener = match TcpListener::bind(format!("{bind_addr}:{http_port}")).await {
+    let listener = match TcpListener::bind(format!("{bind_addr}:{plain_port}")).await {
         Ok(l) => l,
         Err(e) => {
-            log::error!("HTTP-redirect server failed to bind {bind_addr}:{http_port}: {e}");
+            log::error!("HTTP-redirect server failed to bind {bind_addr}:{plain_port}: {e}");
             return;
         }
     };
     log::info!(
-        "HTTP-redirect server listening on {bind_addr}:{http_port} \
-         → HTTPS port {https_port}"
+        "HTTP-redirect server listening on {bind_addr}:{plain_port} \
+         → HTTPS port {tls_port}"
     );
 
     loop {
@@ -57,7 +57,7 @@ pub async fn run_redirect_server(
                     Ok((mut stream, peer)) => {
                         log::debug!("Redirect connection from {peer}");
                         tokio::spawn(async move {
-                            handle_redirect(&mut stream, https_port).await;
+                            handle_redirect(&mut stream, tls_port).await;
                         });
                     }
                     Err(e) => {
@@ -98,7 +98,7 @@ async fn handle_redirect(stream: &mut tokio::net::TcpStream, https_port: u16) {
         let mut request_line = String::new();
         match reader.read_line(&mut request_line).await {
             Ok(n) if n > 0 => {
-                total += n;
+                total = total.saturating_add(n);
                 let mut parts = request_line.split_whitespace();
                 let _ = parts.next(); // method
                 if let Some(p) = parts.next() {
@@ -114,7 +114,7 @@ async fn handle_redirect(stream: &mut tokio::net::TcpStream, https_port: u16) {
             match reader.read_line(&mut line).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    total += n;
+                    total = total.saturating_add(n);
                     if total > MAX_HEADER_BYTES {
                         return; // too large — drop
                     }

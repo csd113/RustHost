@@ -9,7 +9,17 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v0.1.2]
 
+### Added
+- **HTTPS support** — RustHost can now serve your site over a secure, encrypted connection (the padlock icon in your browser). Works out of the box with no extra software needed.
+- **Automatic self-signed certificates** — when you turn on HTTPS with no other setup, RustHost creates its own certificate for local development. Great for testing on your own machine.
+- **Let's Encrypt integration** — RustHost can automatically get and renew a free, trusted certificate from Let's Encrypt so browsers won't show any warnings for your real domain.
+- **Bring-your-own certificate** — if you already have certificate files from another provider, you can point RustHost at them directly.
+- **HTTP-to-HTTPS redirect** — optionally sends visitors who arrive on the plain HTTP address over to the secure HTTPS address automatically.
+- **`[tls]` config section** — new settings in `settings.toml` to control all of the above. If you don't add this section, everything works exactly as before — nothing breaks.
+- **Security headers on HTTPS** — secure connections automatically include headers that tell browsers to always use HTTPS for your site in the future.
 
+### Changed
+- **Connection handler is now flexible** — the part of RustHost that talks to browsers was updated so it can handle both regular and encrypted connections. Existing HTTP behavior is unchanged.
 
 ---
 

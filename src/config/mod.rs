@@ -172,7 +172,7 @@ pub struct AcmeConfig {
     /// limits — always test with `staging = true` before flipping to `false`.
     #[serde(default = "default_true")]
     pub staging: bool,
-    /// Directory for the ACME DirCache (relative to the data dir).
+    /// Directory for the ACME [`DirCache`] (relative to the data dir).
     #[serde(default = "default_acme_dir")]
     pub cache_dir: String,
 }
