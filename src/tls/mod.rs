@@ -1,3 +1,4 @@
+//! `src/tls/mod.rs`
 pub mod acme;
 pub mod self_signed;
 
@@ -47,7 +48,7 @@ pub enum Acceptor {
 /// - The ACME config is invalid (empty domain list, IP address as domain, etc.).
 /// - The ACME cache directory cannot be created.
 /// - The self-signed certificate cannot be generated or written to disk.
-pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<Acceptor>> {
+pub fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<Acceptor>> {
     if !cfg.enabled {
         return Ok(None);
     }

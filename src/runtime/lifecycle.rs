@@ -265,6 +265,10 @@ async fn wait_for_bind_port(port_rx: oneshot::Receiver<u16>) -> Result<u16> {
 }
 
 /// Optionally set up TLS/HTTPS and the HTTP→HTTPS redirect server.
+///
+/// `build_acceptor` is synchronous and may perform blocking file I/O (reading
+/// cert/key files, parsing PEM, etc.).  It is offloaded to the blocking thread
+/// pool via `spawn_blocking` so it cannot stall the async runtime.
 async fn setup_tls(
     config: &Arc<Config>,
     state: &SharedState,
@@ -277,7 +281,21 @@ async fn setup_tls(
     if !config.tls.enabled {
         return;
     }
-    let tls_result = tls::build_acceptor(&config.tls, data_dir).await;
+
+    // Clone owned copies so they can be moved into the 'static spawn_blocking
+    // closure.
+    let tls_cfg = config.tls.clone();
+    let dd = data_dir.to_path_buf();
+
+    let tls_result =
+        match tokio::task::spawn_blocking(move || tls::build_acceptor(&tls_cfg, &dd)).await {
+            Ok(inner) => inner,
+            Err(e) => {
+                log::error!("TLS initialisation task panicked: {e}. Continuing in HTTP-only mode.");
+                return;
+            }
+        };
+
     match tls_result {
         Err(e) => {
             log::error!("TLS init failed: {e}. Continuing in HTTP-only mode.");

@@ -29,7 +29,7 @@ use std::os::unix::fs::PermissionsExt;
 ///
 /// Returns [`AppError::Tls`] if:
 /// - [`validate_acme_config`] rejects the provided [`AcmeConfig`] (e.g.
-/// empty or invalid domains, empty email string), or
+///   empty or invalid domains, empty email string), or
 /// - the ACME cache directory cannot be created on disk.
 pub fn build_acme_acceptor(
     cfg: &AcmeConfig,
@@ -129,10 +129,8 @@ pub fn build_acme_acceptor(
 ///
 /// The loop exits only when the underlying stream closes, which normally
 /// only happens when the process shuts down.
-async fn run_acme_event_loop<EC, EA>(
-    mut state: rustls_acme::AcmeState<EC, EA>,
-    env_label: String,
-) where
+async fn run_acme_event_loop<EC, EA>(mut state: rustls_acme::AcmeState<EC, EA>, env_label: String)
+where
     EC: Debug + Send + 'static,
     EA: Debug + Send + 'static,
 {

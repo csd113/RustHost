@@ -36,15 +36,13 @@ nursery  = { level = "warn",  priority = -1 }
 
 [dependencies]
 
-openssl = { version = "0.10", features = ["vendored"] }
-
 rustls-pemfile = "2"          # PEM parsing — used in mod.rs
 x509-cert      = "0.2"        # cert expiry parsing — used in self_signed.rs
 pem-rfc7468    = "0.7"        # PEM decode for the expiry check
 time           = "0.3"        # OffsetDateTime for rcgen cert params
 
 # Phase 6 — TLS / HTTPS support
-tokio-rustls  = "0.26"                                       # TLS stream wrapper for Tokio
+tokio-rustls  = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-util    = { version = "0.7", features = ["compat"] }   # futures-io ↔ tokio-io compatibility bridge
 rustls        = { version = "0.23", features = ["ring"] }    # rustls TLS implementation
 rustls-acme   = { version = "0.12", default-features = false, features = ["tokio", "ring"] }   # ACME / Let's Encrypt automation
@@ -61,13 +59,15 @@ tokio = { version = "1", features = [
     "signal",
 ] }
 
-arti-client = { version = "0.40", features = [
+# default-features = false removes the implicit "native-tls" default that
+# would otherwise pull in openssl-sys and break cross-compilation.
+arti-client = { version = "0.40", default-features = false, features = [
     "tokio",
-    "native-tls",
+    "rustls",
     "onion-service-service",
 ] }
-tor-hsservice = { version = "0.40" }
-tor-cell      = { version = "0.40" }
+tor-hsservice = { version = "0.40", default-features = false }
+tor-cell      = { version = "0.40", default-features = false }
 futures       = "0.3"
 
 # Terminal auto-launcher (Phase 0): TTY detection + error handling.

@@ -1,4 +1,4 @@
-//! src/tls/self_signed.rs
+//! `src/tls/self_signed.rs`
 use crate::error::AppError;
 use crate::Result;
 use std::{path::Path, sync::Arc, time::SystemTime};
@@ -204,8 +204,16 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Install the `ring` crypto provider process-wide.
+    /// Returns `Ok(())` the first time; returns `Err` (harmlessly) if
+    /// another test in this process already installed it.
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     #[test]
     fn generates_cert_on_first_call() {
+        ensure_crypto_provider();
         let tmp = TempDir::new().unwrap();
         let cert = tmp.path().join("tls/dev/self-signed.crt");
         let key = tmp.path().join("tls/dev/self-signed.key");
@@ -217,6 +225,7 @@ mod tests {
 
     #[test]
     fn reuses_valid_cert_on_second_call() {
+        ensure_crypto_provider();
         let tmp = TempDir::new().unwrap();
         generate_or_load(tmp.path()).unwrap();
         let cert_path = tmp.path().join("tls/dev/self-signed.crt");
