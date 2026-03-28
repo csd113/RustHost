@@ -31,6 +31,10 @@ allow = [
     "BSL-1.0",
     # Unlicense — pulled in by async_executors (arti async runtime abstraction)
     "Unlicense",
+    # CDLA-Permissive-2.0 — pulled in by webpki-roots (transitively via
+    # rustls-acme and tokio-rustls).  This is a permissive Linux Foundation
+    # licence with an explicit patent grant; it imposes no copyleft obligations.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 
@@ -72,59 +76,48 @@ skip = [
     { name = "windows_aarch64_gnullvm" },
     { name = "windows_aarch64_msvc" },
     { name = "windows_i686_gnu" },
+    { name = "windows_i686_gnullvm" },  # 0.52.6 (ring) vs 0.53.1 (notify → tor-config)
     { name = "windows_i686_msvc" },
     { name = "windows_x86_64_gnu" },
     { name = "windows_x86_64_gnullvm" },
     { name = "windows_x86_64_msvc" },
     { name = "winnow" },
-    # 4.6 — Five additional duplicates present in Cargo.lock but previously
-    # absent from this list, causing `cargo deny check` to warn on every run.
-    #
-    # foldhash 0.1.x / 0.2.x — two generations pulled by hashbrown 0.15 vs 0.16
-    # (both via arti's dependency tree; different sub-crates pin different gens)
-    { name = "foldhash" },
-    # hashbrown 0.12 / 0.15 / 0.16 — pulled by indexmap 1.x (0.12), tokio/arti
-    # (0.15), and the latest arti-client dependency updates (0.16)
+    # hashbrown 0.12 / 0.15 / 0.16 — pulled by indexmap 1.x, tokio/arti, and
+    # latest arti-client dependency updates respectively
     { name = "hashbrown" },
-    # indexmap 1.x / 2.x — arti-client 0.40 still carries several crates that
-    # depend on indexmap 1.x while the rest of the tree has migrated to 2.x
-    { name = "indexmap" },
-    # redox_syscall 0.5.x / 0.7.x — pulled by crossterm (0.5) and tokio (0.7)
-    # via their respective platform abstraction layers for Redox OS
-    { name = "redox_syscall" },
-    # schemars 0.9.x / 1.x — arti-client 0.40 uses schemars 0.9 for config
-    # schema generation; our direct deps have moved to 1.x
-    { name = "schemars" },
+    # asn1-rs 0.6.x / 0.7.x — x509-cert pulls der 0.7 → asn1-rs 0.6;
+    # tor-* crates pull der 0.8 → asn1-rs 0.7.  Both generations are needed
+    # until the tor-* ecosystem converges on a single der/asn1-rs release.
+    { name = "asn1-rs" },
+    { name = "asn1-rs-derive" },
+    # der-parser 9.0.0 (x509-parser → rustls-acme) vs 10.0.0 (tor-llcrypto → arti-client)
+    { name = "der-parser" },
+    # hermit-abi 0.1.19 (atty → rusthost) vs 0.5.2 (polling → async-io → rustls-acme)
+    { name = "hermit-abi" },
 ]
 
 # ─── Advisories ───────────────────────────────────────────────────────────────
-# The `vulnerability` key was removed in cargo-deny 0.14.
-# Security advisory checks are now controlled via `[advisories]` alone.
 [advisories]
 db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
     # rsa 0.9.x — Marvin attack: timing side-channel on decryption
-    # (RUSTSEC-2023-0071, https://rustsec.org/advisories/RUSTSEC-2023-0071).
-    #
-    # No patched release of the `rsa` crate exists.  `rsa` is pulled in
-    # transitively by `arti-client` for parsing X.509 certificates in Tor
-    # directory consensus documents — it is used only for RSA *signature
-    # verification*, never for decryption.  The Marvin attack requires an
-    # adversary to make thousands of adaptive chosen-ciphertext queries and
-    # measure decryption timing; that threat model does not apply here.
-    #
+    # (RUSTSEC-2023-0071).  rsa is pulled in transitively by arti-client for
+    # RSA *signature verification* only, never decryption; the Marvin attack
+    # requires adaptive chosen-ciphertext queries which do not apply here.
     # Revisit when arti upgrades past rsa 0.9.x or a fixed version ships.
     { id = "RUSTSEC-2023-0071", reason = "rsa used only for signature verification in arti-client, not decryption; no fixed version available" },
 
-    # bincode 2.0.1 — unmaintained (RUSTSEC-2025-0141).
-    # Pulled in transitively by typed-index-collections → tor-netdir → arti-client.
-    # Not a direct dependency; no action we can take until arti upgrades.
-    { id = "RUSTSEC-2025-0141", reason = "transitive dep via arti-client/tor-netdir; no direct upgrade path available" },
-
     # paste 1.0.15 — unmaintained (RUSTSEC-2024-0436).
-    # Pulled in transitively by tor-rtcompat → arti-client.
-    # Not a direct dependency; no action we can take until arti upgrades.
+    # Transitive dep via tor-rtcompat → arti-client.
     { id = "RUSTSEC-2024-0436", reason = "transitive dep via arti-client/tor-rtcompat; no direct upgrade path available" },
+
+    # atty 0.2.14 — unmaintained (RUSTSEC-2024-0375).
+    # Direct dep of rusthost; replace with std::io::IsTerminal when time allows.
+    { id = "RUSTSEC-2024-0375", reason = "direct dep of rusthost; migrate to std::io::IsTerminal (stable since 1.70.0)" },
+
+    # rustls-pemfile 2.2.0 — unmaintained (RUSTSEC-2025-0134).
+    # Direct dep of rusthost; migrate to rustls-pki-types PemObject trait when time allows.
+    { id = "RUSTSEC-2025-0134", reason = "direct dep of rusthost; migrate to rustls-pki-types PemObject trait (>=1.9.0)" },
 ]
 
 # ─── Sources ──────────────────────────────────────────────────────────────────

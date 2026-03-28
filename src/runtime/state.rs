@@ -39,6 +39,19 @@ pub enum TorStatus {
     Failed(String),
 }
 
+/// Describes the active TLS certificate type for the dashboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CertStatus {
+    /// TLS not yet initialised or disabled.
+    Unknown,
+    /// Auto-generated self-signed certificate (local dev).
+    SelfSigned,
+    /// Let's Encrypt certificate managed by `rustls-acme`.
+    Acme { domain: String },
+    /// Manually supplied PEM certificate.
+    Manual,
+}
+
 /// Which screen the console is currently showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsoleMode {
@@ -81,6 +94,15 @@ pub struct AppState {
 
     /// Which console screen is active.
     pub console_mode: ConsoleMode,
+
+    /// Whether the HTTPS server is currently accepting connections.
+    pub tls_running: bool,
+
+    /// Port the HTTPS server is listening on (set after TLS bind succeeds).
+    pub tls_port: Option<u16>,
+
+    /// Describes the active certificate type for the dashboard.
+    pub tls_cert_status: CertStatus,
 }
 
 impl AppState {
@@ -94,6 +116,9 @@ impl AppState {
             site_file_count: 0,
             site_total_bytes: 0,
             console_mode: ConsoleMode::Dashboard,
+            tls_running: false,
+            tls_port: None,
+            tls_cert_status: CertStatus::Unknown,
         }
     }
 }

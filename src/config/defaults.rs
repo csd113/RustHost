@@ -124,6 +124,71 @@ show_timestamps = false
 
 # Display name shown in the dashboard header. Maximum 32 characters.
 instance_name = "RustHost"
+
+# ─── [tls] ────────────────────────────────────────────────────────────────────
+
+[tls]
+
+# Enable HTTPS / TLS.
+#
+# When enabled, RustHost starts an HTTPS listener in addition to the plain HTTP
+# one. Three certificate modes are available, tried in this order:
+#
+#   1. [tls.manual_cert]  — you supply your own PEM certificate and key files.
+#   2. [tls.acme]         — Let's Encrypt issues and auto-renews a certificate
+#                           (requires a public domain name and port 443).
+#   3. (fallback)         — a self-signed localhost certificate is generated
+#                           automatically for local development.
+#
+# Set to true to activate. HTTP continues to work alongside HTTPS unless you
+# also set redirect_http = true below.
+enabled = false
+
+# TCP port for the HTTPS listener (default: 8443).
+# Use 443 for production (may require elevated privileges on Linux).
+port = 8443
+
+# When true, the plain HTTP listener redirects every request to the HTTPS URL
+# with a 301. Requires enabled = true.
+redirect_http = false
+
+# Plain-HTTP port used when redirect_http = true (default: 8080).
+# This is separate from [server].port — both listeners run simultaneously.
+http_port = 8080
+
+# ── Let's Encrypt / ACME (automatic certificate) ─────────────────────────────
+#
+# Requires a publicly reachable domain name pointing at this server and
+# port 443 open (set [tls] port = 443 above).
+#
+# Always test with staging = true first — Let's Encrypt rate-limits production
+# issuance. Flip staging = false only once the full flow works in staging.
+
+[tls.acme]
+enabled = false
+
+# Domain(s) to request a certificate for.
+# Example: domains = ["example.com", "www.example.com"]
+domains = []
+
+# Contact email for expiry notices (recommended but not required).
+# Example: email = "admin@example.com"
+
+# true = Let's Encrypt staging (not browser-trusted, high rate limits).
+# false = production (browser-trusted, strict rate limits).
+staging = true
+
+# ACME certificate cache directory, relative to the data directory.
+cache_dir = "tls/acme"
+
+# ── Manual certificate ────────────────────────────────────────────────────────
+#
+# Paths are relative to the data directory (rusthost-data/).
+# Uncomment both lines to activate.
+#
+# [tls.manual_cert]
+# cert_path = "tls/cert.pem"
+# key_path  = "tls/key.pem"
 "#;
 
 /// Write the default `settings.toml` to `path`, creating parent directories

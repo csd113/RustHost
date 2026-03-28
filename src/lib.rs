@@ -17,6 +17,8 @@ pub mod server;
 // re-exports for test access.
 pub mod console;
 pub mod logging;
+pub mod terminal;
+pub mod tls;
 pub mod tor;
 
 pub use error::AppError;

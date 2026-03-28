@@ -1,14 +1,14 @@
 [package]
-name        = "rusthost"
-version     = "0.1.1"
-edition     = "2021"
+name = "rusthost"
+version = "0.1.2"
+edition = "2021"
 # Bumped from 1.86 → 1.90 to match the highest MSRV in the transitive dep tree:
-#   arti-client 0.40 and most tor-* crates require 1.89
-#   typed-index-collections 3.5 (via tor-netdir) requires 1.90
+# arti-client 0.40 and most tor-* crates require 1.89
+# typed-index-collections 3.5 (via tor-netdir) requires 1.90
 rust-version = "1.90"
 description = "Single-binary, zero-setup static site hosting appliance with Tor support"
-license     = "MIT"
-authors     = []
+license = "MIT"
+authors = []
 
 [lib]
 name = "rusthost"
@@ -19,22 +19,35 @@ name = "rusthost-cli"
 path = "src/main.rs"
 
 # ─── Lint configuration ───────────────────────────────────────────────────────
-#
 # clippy::all     — every lint in the default set (correctness + style + perf)
 # clippy::pedantic — stricter style + API lints; individual allows used where
-#                    the rule conflicts with the module's documented design
-#                    (e.g. too_many_arguments for the HTTP write_* stack which
-#                    must mirror the HTTP/1.1 wire format).
+#                   the rule conflicts with the module's documented design
+#                   (e.g. too_many_arguments for the HTTP write_* stack which
+#                   must mirror the HTTP/1.1 wire format).
+
 [lints.rust]
 unsafe_code = "forbid"
 
 [lints.clippy]
-all      = { level = "deny",  priority = -1 }
-pedantic = { level = "deny",  priority = -1 }
+all      = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
 # nursery lints warn but do not gate CI; they surface improvement candidates.
-nursery  = { level = "warn",  priority = -1 }
+nursery  = { level = "warn", priority = -1 }
 
 [dependencies]
+
+rustls-pemfile = "2"         # PEM parsing — used in mod.rs
+x509-cert      = "0.2"      # cert expiry parsing — used in self_signed.rs
+pem-rfc7468    = "0.7"      # PEM decode for the expiry check
+time           = "0.3"      # OffsetDateTime for rcgen cert params
+
+# Phase 6 — TLS / HTTPS support
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+tokio-util   = { version = "0.7",  features = ["compat"] }  # futures-io ↔ tokio-io compatibility bridge
+rustls       = { version = "0.23", features = ["ring"] }    # rustls TLS implementation
+rustls-acme  = { version = "0.12", default-features = false, features = ["tokio", "ring"] } # ACME / Let's Encrypt automation
+rcgen        = "0.13"                                        # self-signed dev cert generation
+
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "net",
@@ -46,35 +59,44 @@ tokio = { version = "1", features = [
     "signal",
 ] }
 
-arti-client = { version = "0.40", features = [
+# default-features = false removes the implicit "native-tls" default that
+# would otherwise pull in openssl-sys and break cross-compilation.
+arti-client = { version = "0.40", default-features = false, features = [
     "tokio",
-    "native-tls",
+    "rustls",
     "onion-service-service",
 ] }
-tor-hsservice = { version = "0.40" }
-tor-cell      = { version = "0.40" }
+tor-hsservice = { version = "0.40", default-features = false }
+tor-cell      = { version = "0.40", default-features = false }
 futures       = "0.3"
 
-sha3         = "0.10"
+# Terminal auto-launcher (Phase 0): TTY detection + error handling.
+atty    = "0.2"
+anyhow  = "1"
+
+sha3          = "0.10"
 data-encoding = "2"
-thiserror    = "1"
-serde        = { version = "1", features = ["derive"] }
-toml         = "0.8"
-log          = "0.4"
-crossterm    = "0.27"
-chrono       = { version = "0.4", features = ["clock"] }
+thiserror     = "1"
+serde         = { version = "1",   features = ["derive"] }
+toml          = "0.8"
+log           = "0.4"
+crossterm     = "0.27"
+chrono        = { version = "0.4", features = ["clock"] }
+
 # OS error codes used in the accept-loop backoff to distinguish EMFILE/ENFILE
 # (resource exhaustion → log error) from transient errors (log debug).
-libc         = "0.2"
+libc = "0.2"
+
 # Force rusqlite's bundled SQLite for cross-compilation targets.
 # arti-client pulls rusqlite transitively; declaring it here unifies the feature
 # across the whole dep tree so cross-compiling to Linux/Windows works without a
 # system sqlite3 library present on the host Mac.
-rusqlite     = { version = "*", features = ["bundled"] }
+rusqlite = { version = "*", features = ["bundled"] }
+
 # Per-IP connection tracking for rate limiting (Phase 2 — C-4).
 # DashMap is a concurrent hash map with fine-grained shard locking; it avoids
 # the single global Mutex that would serialise every accept() call.
-dashmap      = "6"
+dashmap = "6"
 
 # Phase 5 (M-8) — replace hand-rolled percent_decode with the audited upstream crate.
 # The crate handles incomplete escape sequences and non-ASCII bytes correctly;
@@ -85,11 +107,12 @@ percent-encoding = "2"
 # hyper provides a correct HTTP/1.1 connection loop with keep-alive; replacing
 # the hand-rolled single-shot parser eliminates the 30-45 s Tor page-load
 # penalty caused by Connection: close on every response.
-hyper            = { version = "1", features = ["http1", "server"] }
-hyper-util       = { version = "0.1", features = ["tokio"] }
-http-body-util   = "0.1"
-bytes            = "1"
-# async-compression provides Brotli and Gzip stream encoders.  Brotli gives
+hyper      = { version = "1",   features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes          = "1"
+
+# async-compression provides Brotli and Gzip stream encoders. Brotli gives
 # significantly better compression ratios than Gzip, which matters a lot for
 # Tor users who pay per-byte in latency.
 async-compression = { version = "0.4", features = ["tokio", "brotli", "gzip"] }
@@ -98,14 +121,14 @@ async-compression = { version = "0.4", features = ["tokio", "brotli", "gzip"] }
 tempfile = "3"
 
 [profile.dev.package."*"]
-opt-level = 1   # dependency builds: faster compile, smaller debug symbols
+opt-level = 1  # dependency builds: faster compile, smaller debug symbols
 
 [profile.dev]
 opt-level = 0
 debug     = true
 
 [profile.release]
-opt-level       = 3
-lto             = true
-strip           = true
-codegen-units   = 1  # maximum optimisation; slower link but smaller/faster binary
+opt-level      = 3
+lto            = true
+strip          = true
+codegen-units  = 1  # maximum optimisation; slower link but smaller/faster binary
