@@ -76,11 +76,11 @@ anyhow  = "1"
 
 sha3          = "0.10"
 data-encoding = "2"
-thiserror     = "1"
+thiserror     = "2"
 serde         = { version = "1",   features = ["derive"] }
 toml          = "0.8"
 log           = "0.4"
-crossterm     = "0.27"
+crossterm     = "0.28"
 chrono        = { version = "0.4", features = ["clock"] }
 
 # OS error codes used in the accept-loop backoff to distinguish EMFILE/ENFILE
