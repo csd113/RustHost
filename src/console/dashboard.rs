@@ -43,8 +43,8 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
         yellow("STARTING...")
     };
     let _ = writeln!(out, " Local Server : {server_str}\r");
-    // HTTPS status row — only shown when TLS is configured in settings.toml.
-    // Omitted entirely when disabled so the dashboard stays clean for HTTP-only setups.
+    // HTTPS status row — always shown so the user knows at a glance whether
+    // TLS is active or has been left disabled in settings.toml.
     if config.tls.enabled {
         let tls_str = if state.tls_running {
             let cert_label = match &state.tls_cert_status {
@@ -65,6 +65,8 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
             yellow("STARTING\u{2026}")
         };
         let _ = writeln!(out, " HTTPS : {tls_str}\r");
+    } else {
+        let _ = writeln!(out, " HTTPS : {}\r", dim("DISABLED"));
     }
     let tor_str = match &state.tor_status {
         TorStatus::Disabled => dim("DISABLED"),
