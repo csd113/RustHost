@@ -180,8 +180,6 @@ fn spawn_macos(exe: &std::path::Path, cli_args: &[String]) -> Result<()> {
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn spawn_linux(exe: &std::path::Path, cli_args: &[String]) -> Result<()> {
-    use std::process::Command;
-
     /// Terminal emulators tried in priority order.
     ///
     /// `x-terminal-emulator` is the Debian/Ubuntu alternatives system
