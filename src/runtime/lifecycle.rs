@@ -3,8 +3,8 @@
 //! **Directory:** `src/runtime/`
 //!
 //! Two paths:
-//! 1. **First run** — creates the directory tree, writes defaults, prints
-//!    instructions, and exits cleanly.
+//! 1. **First run** — creates the directory tree, writes defaults, prints a
+//!    "fresh install" notice, then continues directly into the normal run.
 //! 2. **Normal run** — loads config, starts every subsystem, enters the
 //!    event dispatch loop, then shuts down gracefully.
 //!
@@ -93,11 +93,10 @@ pub async fn run(args: CliArgs) -> Result<()> {
         .config_path
         .unwrap_or_else(|| data_dir.join("settings.toml"));
 
-    if settings_path.exists() {
-        normal_run(data_dir, &settings_path).await?;
-    } else {
+    if !settings_path.exists() {
         first_run_setup(&data_dir, &settings_path)?;
     }
+    normal_run(data_dir, &settings_path).await?;
     Ok(())
 }
 
@@ -202,14 +201,16 @@ fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
     }
 
     println!();
-    println!("  RustHost — initialised");
+    println!("  RustHost — fresh install detected");
     println!("  ─────────────────────────────────────────");
-    println!("  Drop your site files into:  ./rusthost-data/site/");
-    println!("  Then run RustHost again to go live.");
+    println!("  Data directories and a default config have been created.");
+    println!("  You can drop your site files into:  ./rusthost-data/site/");
     println!();
     println!("  Tor onion service is built-in — no external install required.");
     println!("  On first run, Arti will download ~2 MB of directory data (~30 s).");
     println!("  Your .onion address will be shown in the dashboard once ready.");
+    println!();
+    println!("  Starting server now…");
     println!();
 
     Ok(())
