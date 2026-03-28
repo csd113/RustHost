@@ -76,28 +76,24 @@ skip = [
     { name = "windows_aarch64_gnullvm" },
     { name = "windows_aarch64_msvc" },
     { name = "windows_i686_gnu" },
+    { name = "windows_i686_gnullvm" },  # 0.52.6 (ring) vs 0.53.1 (notify → tor-config)
     { name = "windows_i686_msvc" },
     { name = "windows_x86_64_gnu" },
     { name = "windows_x86_64_gnullvm" },
     { name = "windows_x86_64_msvc" },
     { name = "winnow" },
-    # foldhash 0.1.x / 0.2.x — two generations pulled by hashbrown 0.15 vs 0.16
-    { name = "foldhash" },
     # hashbrown 0.12 / 0.15 / 0.16 — pulled by indexmap 1.x, tokio/arti, and
     # latest arti-client dependency updates respectively
     { name = "hashbrown" },
-    # indexmap 1.x / 2.x — arti-client 0.40 carries crates still on 1.x while
-    # the rest of the tree has migrated to 2.x
-    { name = "indexmap" },
-    # redox_syscall 0.5.x / 0.7.x — crossterm (0.5) vs tokio (0.7)
-    { name = "redox_syscall" },
-    # schemars 0.9.x / 1.x — arti-client 0.40 uses 0.9; direct deps use 1.x
-    { name = "schemars" },
     # asn1-rs 0.6.x / 0.7.x — x509-cert pulls der 0.7 → asn1-rs 0.6;
     # tor-* crates pull der 0.8 → asn1-rs 0.7.  Both generations are needed
     # until the tor-* ecosystem converges on a single der/asn1-rs release.
     { name = "asn1-rs" },
     { name = "asn1-rs-derive" },
+    # der-parser 9.0.0 (x509-parser → rustls-acme) vs 10.0.0 (tor-llcrypto → arti-client)
+    { name = "der-parser" },
+    # hermit-abi 0.1.19 (atty → rusthost) vs 0.5.2 (polling → async-io → rustls-acme)
+    { name = "hermit-abi" },
 ]
 
 # ─── Advisories ───────────────────────────────────────────────────────────────
@@ -111,13 +107,17 @@ ignore = [
     # Revisit when arti upgrades past rsa 0.9.x or a fixed version ships.
     { id = "RUSTSEC-2023-0071", reason = "rsa used only for signature verification in arti-client, not decryption; no fixed version available" },
 
-    # bincode 2.0.1 — unmaintained (RUSTSEC-2025-0141).
-    # Transitive dep via typed-index-collections → tor-netdir → arti-client.
-    { id = "RUSTSEC-2025-0141", reason = "transitive dep via arti-client/tor-netdir; no direct upgrade path available" },
-
     # paste 1.0.15 — unmaintained (RUSTSEC-2024-0436).
     # Transitive dep via tor-rtcompat → arti-client.
     { id = "RUSTSEC-2024-0436", reason = "transitive dep via arti-client/tor-rtcompat; no direct upgrade path available" },
+
+    # atty 0.2.14 — unmaintained (RUSTSEC-2024-0375).
+    # Direct dep of rusthost; replace with std::io::IsTerminal when time allows.
+    { id = "RUSTSEC-2024-0375", reason = "direct dep of rusthost; migrate to std::io::IsTerminal (stable since 1.70.0)" },
+
+    # rustls-pemfile 2.2.0 — unmaintained (RUSTSEC-2025-0134).
+    # Direct dep of rusthost; migrate to rustls-pki-types PemObject trait when time allows.
+    { id = "RUSTSEC-2025-0134", reason = "direct dep of rusthost; migrate to rustls-pki-types PemObject trait (>=1.9.0)" },
 ]
 
 # ─── Sources ──────────────────────────────────────────────────────────────────
