@@ -70,8 +70,11 @@ tor-hsservice = { version = "0.40", default-features = false }
 tor-cell      = { version = "0.40", default-features = false }
 futures       = "0.3"
 
-# Terminal auto-launcher (Phase 0): TTY detection + error handling.
-atty    = "0.2"
+# Terminal auto-launcher (Phase 0): TTY detection uses std::io::IsTerminal
+# (stable since Rust 1.70; this project's MSRV is 1.90) — no additional crate
+# required. The previously used `atty` crate has been removed: it carried a
+# memory-safety vulnerability on Windows (RUSTSEC-2021-0145) and was
+# unmaintained. `anyhow` is retained for use in other modules.
 anyhow  = "1"
 
 sha3          = "0.10"

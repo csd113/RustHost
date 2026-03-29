@@ -24,13 +24,16 @@
 //! between checks. For Tor state material this is a real concern.
 //!
 //! For strongest protection, use platform-native secure directory creation APIs
-//! or openat-style directory traversal with symlink-resistant handles.
+//! (`openat`-style directory traversal on Linux, `SetNamedSecurityInfoW` via
+//! `windows-sys` on Windows) or run the service as a dedicated user account
+//! with a private home directory.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::TorClient;
 use futures::StreamExt;
@@ -106,7 +109,8 @@ pub fn init(
                     attempts = attempts.saturating_add(1);
                     if attempts > MAX_RETRIES {
                         log::error!(
-                            "Tor: stream ended too many consecutive times; giving up after {attempts} attempts."
+                            "Tor: stream ended too many consecutive times; giving up after \
+                             {attempts} attempts."
                         );
                         set_failed_and_clear_onion(&state, "too many reconnect attempts".into())
                             .await;
@@ -119,6 +123,9 @@ pub fn init(
                          (attempt {attempts}/{MAX_RETRIES})"
                     );
 
+                    // Show Starting state *during* the backoff sleep so the UI
+                    // reflects that we are actively retrying. run() also calls
+                    // this at its top, which is a benign no-op double-set.
                     set_starting_and_clear_onion(&state).await;
 
                     let mut backoff_shutdown = shutdown.clone();
@@ -131,8 +138,9 @@ pub fn init(
                     }
                 }
                 Err(e) => {
-                    log::error!("Tor: fatal error: {e}");
-                    set_failed_and_clear_onion(&state, e.to_string()).await;
+                    // {e:#} prints the full anyhow chain (source causes included).
+                    log::error!("Tor: fatal error: {e:#}");
+                    set_failed_and_clear_onion(&state, format!("{e:#}")).await;
                     break;
                 }
             }
@@ -153,17 +161,18 @@ struct TorSession {
 async fn bootstrap_and_launch(
     data_dir: &std::path::Path,
     shutdown: watch::Receiver<bool>,
-) -> Result<Option<TorSession>, Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<Option<TorSession>> {
     ensure_private_dir(&data_dir.join("arti_state"))
-        .map_err(|e| format!("Cannot create secure state directory: {e}"))?;
+        .context("cannot create secure Tor state directory")?;
     ensure_private_dir(&data_dir.join("arti_cache"))
-        .map_err(|e| format!("Cannot create secure cache directory: {e}"))?;
+        .context("cannot create secure Tor cache directory")?;
 
     let config = TorClientConfigBuilder::from_directories(
         data_dir.join("arti_state"),
         data_dir.join("arti_cache"),
     )
-    .build()?;
+    .build()
+    .context("failed to build Tor client configuration")?;
 
     log::info!("Tor: bootstrapping — first run downloads ~2 MB of directory data (~30 s)");
 
@@ -175,11 +184,11 @@ async fn bootstrap_and_launch(
                 TorClient::create_bootstrapped(config)
             ) => {
                 result
-                    .map_err(|_| format!(
+                    .map_err(|_| anyhow::anyhow!(
                         "Tor bootstrap timed out after {}s — check network connectivity",
                         BOOTSTRAP_TIMEOUT.as_secs()
                     ))?
-                    .map_err(|e| format!("Tor bootstrap failed: {e}"))?
+                    .context("Tor bootstrap failed")?
             }
             () = wait_for_shutdown_signal(&mut sd) => {
                 log::info!("Tor: shutdown received during bootstrap — exiting.");
@@ -191,17 +200,24 @@ async fn bootstrap_and_launch(
     log::info!("Tor: connected to the Tor network");
 
     let svc_config = OnionServiceConfigBuilder::default()
-        .nickname("rusthost".parse()?)
-        .build()?;
+        .nickname(
+            "rusthost"
+                .parse()
+                .context("invalid onion service nickname")?,
+        )
+        .build()
+        .context("failed to build onion service configuration")?;
 
-    let launched = tor_client.launch_onion_service(svc_config)?;
+    let launched = tor_client
+        .launch_onion_service(svc_config)
+        .context("failed to launch onion service")?;
     let Some((onion_service_guard, rend_requests)) = launched else {
-        return Err("Tor: onion service returned None".into());
+        anyhow::bail!("Tor: onion service returned None — possible key generation failure");
     };
 
-    let hsid = onion_service_guard
-        .onion_address()
-        .ok_or("Tor: onion address not yet available (key generation incomplete)")?;
+    let hsid = onion_service_guard.onion_address().ok_or_else(|| {
+        anyhow::anyhow!("Tor: onion address not yet available (key generation incomplete)")
+    })?;
     let onion_name = hsid_to_onion_address(hsid);
     let stream_requests = Box::pin(handle_rend_requests(rend_requests));
 
@@ -219,7 +235,12 @@ async fn run(
     max_connections: usize,
     state: SharedState,
     shutdown: watch::Receiver<bool>,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<bool> {
+    // Authoritative Starting state transition for every run attempt.
+    // The init() loop also calls this during backoff (which is intentional —
+    // it shows "Starting" while sleeping), making this a no-op double-set on
+    // reconnect paths. The double-set is harmless and simpler than splitting
+    // the responsibility.
     set_starting_and_clear_onion(&state).await;
 
     let Some(session) = bootstrap_and_launch(&data_dir, shutdown.clone()).await? else {
@@ -234,10 +255,12 @@ async fn run(
 }
 
 fn log_onion_banner(onion_name: &str) {
+    // Fall back to the stripped *host* portion, not the full "host.onion"
+    // string. If .onion is absent, use the raw name. If the host is shorter
+    // than 12 chars, show all of it.
     let display_prefix = onion_name
         .strip_suffix(".onion")
-        .and_then(|host| host.get(..12))
-        .unwrap_or(onion_name);
+        .map_or(onion_name, |host| host.get(..12).unwrap_or(host));
 
     log::info!(
         "\n  ╔═══════════════════════════════════════════════════╗\n  \
@@ -257,7 +280,7 @@ async fn process_streams(
     max_connections: usize,
     state: SharedState,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<bool> {
     let TorSession {
         onion_service_guard,
         mut stream_requests,
@@ -280,18 +303,28 @@ async fn process_streams(
                         &mut active_tasks,
                     );
                 } else {
-                    return reconnect_after_stream_end(&state, semaphore, &mut active_tasks).await;
+                    // Close the semaphore BEFORE draining so no new
+                    // acquisitions can succeed during the drain window.
+                    semaphore.close();
+                    return reconnect_after_stream_end(&state, &mut active_tasks).await;
                 }
             }
+
+            Some(result) = active_tasks.join_next(), if !active_tasks.is_empty() => {
+                if let Err(e) = result {
+                    log::debug!("Tor: stream task error: {e}");
+                }
+            }
+
             () = wait_for_shutdown_signal(&mut shutdown) => {
                 log::info!("Tor: shutdown signal received — stopping stream loop");
+                semaphore.close();
                 drain_tasks_with_timeout(
                     &mut active_tasks,
                     SHUTDOWN_DRAIN_TIMEOUT,
                     "shutdown",
                 )
                 .await;
-                semaphore.close();
                 break;
             }
         }
@@ -318,27 +351,28 @@ fn handle_stream_request(
     active_tasks.spawn(async move {
         let _permit = permit;
         if let Err(e) = proxy_stream(stream_req, &local_addr).await {
-            log::debug!("Tor: stream closed: {e}");
+            log::debug!("Tor: stream closed: {e:#}");
         }
     });
 }
 
 async fn reconnect_after_stream_end(
-    state: &SharedState,
-    semaphore: Arc<tokio::sync::Semaphore>,
+    _state: &SharedState,
     active_tasks: &mut JoinSet<()>,
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+) -> anyhow::Result<bool> {
     log::warn!("Tor: stream_requests stream ended — will attempt re-bootstrap");
-    semaphore.close();
-
     drain_tasks_with_timeout(active_tasks, RECONNECT_DRAIN_TIMEOUT, "reconnect").await;
-
-    set_starting_and_clear_onion(state).await;
+    // Signal the init() loop to re-bootstrap (Ok(true) = retry).
+    // set_starting_and_clear_onion is NOT called here — run() handles it.
     Ok(true)
 }
 
 async fn drain_tasks_with_timeout(active_tasks: &mut JoinSet<()>, timeout: Duration, phase: &str) {
-    let deadline = checked_deadline_from_now(timeout);
+    // If checked_add overflows (impossible for the short timeouts used in
+    // practice), fall back to `now` so the sleep fires immediately and tasks
+    // are aborted rather than waited on indefinitely.
+    let now = tokio::time::Instant::now();
+    let deadline = now.checked_add(timeout).unwrap_or(now);
 
     loop {
         tokio::select! {
@@ -352,11 +386,15 @@ async fn drain_tasks_with_timeout(active_tasks: &mut JoinSet<()>, timeout: Durat
                 }
             }
             () = tokio::time::sleep_until(deadline) => {
-                log::warn!("Tor: timed out waiting for active stream tasks during {phase}");
+                log::warn!(
+                    "Tor: timed out waiting for active stream tasks during {phase}"
+                );
                 active_tasks.abort_all();
                 while let Some(joined) = active_tasks.join_next().await {
                     if let Err(e) = joined {
-                        log::debug!("Tor: aborted stream task join error during {phase}: {e}");
+                        log::debug!(
+                            "Tor: aborted stream task join error during {phase}: {e}"
+                        );
                     }
                 }
                 break;
@@ -365,30 +403,44 @@ async fn drain_tasks_with_timeout(active_tasks: &mut JoinSet<()>, timeout: Durat
     }
 }
 
-fn checked_deadline_from_now(timeout: Duration) -> tokio::time::Instant {
-    tokio::time::Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(tokio::time::Instant::now)
-}
-
 // ─── Stream proxying ─────────────────────────────────────────────────────────
 
-async fn proxy_stream(
-    stream_req: StreamRequest,
-    local_addr: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut local = tokio::time::timeout(LOCAL_CONNECT_TIMEOUT, TcpStream::connect(local_addr))
-        .await
-        .map_err(|_| {
-            format!(
-                "timed out connecting to local server at {local_addr} \
-                 after {}s",
-                LOCAL_CONNECT_TIMEOUT.as_secs()
-            )
-        })?
-        .map_err(|e| format!("local connect to {local_addr} failed: {e}"))?;
+async fn proxy_stream(stream_req: StreamRequest, local_addr: &str) -> anyhow::Result<()> {
+    // Attempt the local TCP connection BEFORE accepting the Tor stream.
+    //
+    // On failure the StreamRequest must be explicitly dropped so that Arti
+    // sends a RELAY_END cell to the remote Tor client. Silently returning
+    // with stream_req still live relies on an undocumented drop-time side
+    // effect and leaves the client hanging until its own circuit timeout.
+    //
+    // NOTE: if a future arti release stabilises StreamRequest::reject() with
+    // an explicit EndReason, prefer it over drop() here to send a typed error
+    // code (e.g. EXITPOLICY for refused, TIMEOUT for timed-out connections).
+    let local_result =
+        tokio::time::timeout(LOCAL_CONNECT_TIMEOUT, TcpStream::connect(local_addr)).await;
 
-    let mut tor_stream = stream_req.accept(Connected::new_empty()).await?;
+    let mut local = match local_result {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            // drop(stream_req) sends RELAY_END to the Tor client.
+            drop(stream_req);
+            return Err(
+                anyhow::Error::new(e).context(format!("local connect to {local_addr} failed"))
+            );
+        }
+        Err(_elapsed) => {
+            drop(stream_req);
+            anyhow::bail!(
+                "timed out connecting to local server at {local_addr} after {}s",
+                LOCAL_CONNECT_TIMEOUT.as_secs()
+            );
+        }
+    };
+
+    let mut tor_stream = stream_req
+        .accept(Connected::new_empty())
+        .await
+        .context("failed to accept Tor stream")?;
 
     match tokio::time::timeout(
         IDLE_TIMEOUT,
@@ -396,11 +448,9 @@ async fn proxy_stream(
     )
     .await
     {
-        Ok(Ok((_a_to_b, _b_to_a))) => Ok(()),
-        Ok(Err(e)) => Err(format!("bidirectional proxy failed: {e}").into()),
-        Err(_) => {
-            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "stream idle timeout").into())
-        }
+        Ok(Ok(_byte_counts)) => Ok(()),
+        Ok(Err(e)) => Err(anyhow::Error::new(e).context("bidirectional proxy error")),
+        Err(_elapsed) => anyhow::bail!("stream idle timeout after {}s", IDLE_TIMEOUT.as_secs()),
     }
 }
 
@@ -422,21 +472,23 @@ pub fn onion_address_from_pubkey(pubkey: &[u8; 32]) -> String {
     hasher.update([version]);
     let hash = hasher.finalize();
 
-    let mut address_bytes = [0u8; 35];
-    address_bytes[..32].copy_from_slice(pubkey);
-
+    // All indices are provably in-bounds at compile time:
+    //   address_bytes: [0u8; 35]  — indices 32, 33, 34 are valid.
+    //   hash: GenericArray<u8, U32> — indices 0, 1 are valid.
     #[allow(clippy::indexing_slicing)]
     {
+        let mut address_bytes = [0u8; 35];
+        address_bytes[..32].copy_from_slice(pubkey);
         address_bytes[32] = hash[0];
         address_bytes[33] = hash[1];
+        address_bytes[34] = version;
+
+        let encoded = data_encoding::BASE32_NOPAD
+            .encode(&address_bytes)
+            .to_ascii_lowercase();
+
+        format!("{encoded}.onion")
     }
-    address_bytes[34] = version;
-
-    let encoded = data_encoding::BASE32_NOPAD
-        .encode(&address_bytes)
-        .to_ascii_lowercase();
-
-    format!("{encoded}.onion")
 }
 
 // ─── Backoff helper ───────────────────────────────────────────────────────────
@@ -446,12 +498,12 @@ fn backoff_delay(attempt: u32, base_secs: u64, max_secs: u64) -> Duration {
         return Duration::ZERO;
     };
 
-    let multiplier = 1u64.checked_shl(exp.min(63)).unwrap_or(u64::MAX);
+    let multiplier = 1u64 << exp.min(63); // exp ≤ 63, shift is always valid
     let secs = base_secs.saturating_mul(multiplier);
     Duration::from_secs(secs.min(max_secs))
 }
 
-// ─── State / shutdown / filesystem helpers ───────────────────────────────────
+// ─── State / shutdown / filesystem helpers ────────────────────────────────────
 
 fn format_local_addr(addr: IpAddr, port: u16) -> String {
     match addr {
@@ -460,16 +512,31 @@ fn format_local_addr(addr: IpAddr, port: u16) -> String {
     }
 }
 
-/// Create a directory intended to be private to the current user.
+/// Create a directory intended to be private to the current user and harden
+/// its permissions.
 ///
-/// Security limitations:
-/// - This function rejects obvious symlinks and validates the path after creation.
-/// - However, with only `std`, the create/check/harden sequence is not fully atomic.
-/// - A local attacker able to race filesystem operations may still exploit TOCTOU
-///   windows on hostile multi-user systems.
+/// ## Security limitations
 ///
-/// For Tor state material, prefer platform-native secure directory APIs or
-/// openat-style traversal if your threat model includes local attackers.
+/// - Symlinks at the target path are rejected and the path is re-verified
+///   after creation, but the create → verify → harden sequence is **not**
+///   fully atomic with only `std`.
+/// - A local attacker who can race filesystem operations may still exploit
+///   TOCTOU windows. On hostile multi-user systems this is a real risk for
+///   Tor private key material.
+///
+/// ## Platform notes
+///
+/// - **Unix**: `chmod 0700` is applied after creation via `std::fs`.
+/// - **Windows**: ACLs are set via `icacls`. The identity is read from the
+///   `USERNAME` / `USERDOMAIN` process-environment variables (set
+///   unconditionally by the Windows kernel) rather than spawning `whoami`,
+///   avoiding PATH-dependency and subprocess stdout encoding issues.
+///   Both values are validated before use to prevent injection into the
+///   `icacls` argument string.
+///
+/// **Future work (Windows)**: replace the `icacls` subprocess with a direct
+/// call to `SetNamedSecurityInfoW` via the `windows-sys` crate. That
+/// eliminates the subprocess entirely and removes all injection surface.
 fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         let ft = meta.file_type();
@@ -493,73 +560,169 @@ fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
 
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let meta = std::fs::symlink_metadata(path)?;
-        let ft = meta.file_type();
-        if ft.is_symlink() || !ft.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "private dir path is not a real directory: {}",
-                    path.display()
-                ),
-            ));
-        }
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
+    harden_unix_permissions(path)?;
 
     #[cfg(windows)]
-    {
-        let whoami_out = std::process::Command::new("whoami").output()?;
-        if !whoami_out.status.success() {
+    harden_windows_permissions(path)?;
+
+    Ok(())
+}
+
+/// Re-verify the path after creation and apply `0700` permissions.
+///
+/// Re-verifying catches a symlink swap that could occur in the window between
+/// the metadata check in `ensure_private_dir` and `create_dir_all`.
+#[cfg(unix)]
+fn harden_unix_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = std::fs::symlink_metadata(path)?;
+    let ft = meta.file_type();
+    if ft.is_symlink() || !ft.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "private dir path is not a real directory after creation: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+/// Set a Windows ACL on `path` granting the current user exclusive access.
+///
+/// Reads the identity from `USERNAME` / `USERDOMAIN` environment variables
+/// (set unconditionally by the Windows kernel) rather than spawning `whoami`,
+/// avoiding PATH-dependency and subprocess stdout encoding issues. Both values
+/// are validated against a strict allowlist before being passed to `icacls`.
+///
+/// **Future work**: replace `icacls` with `SetNamedSecurityInfoW` via the
+/// `windows-sys` crate to eliminate the subprocess and all injection surface.
+#[cfg(windows)]
+fn harden_windows_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    /// Validate a Windows identity name component (username or domain).
+    ///
+    /// Rejects control characters and the icacls metacharacters that would
+    /// confuse the argument parser. Deliberately does NOT log the raw value on
+    /// failure — adversarial input should not reach log sinks.
+    fn validate_windows_name(s: &str) -> std::io::Result<()> {
+        if s.is_empty() || s.len() > 256 {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+                std::io::ErrorKind::InvalidData,
                 format!(
-                    "whoami failed: {}",
-                    String::from_utf8_lossy(&whoami_out.stderr).trim()
+                    "Windows identity name has unexpected length: {} bytes",
+                    s.len()
                 ),
             ));
         }
-
-        let user = String::from_utf8_lossy(&whoami_out.stdout)
-            .trim()
-            .to_owned();
-        if user.is_empty() {
+        // Illegal in Windows names: " / \ [ ] : ; | = , + * ? < >
+        // Also reject: ( ) — icacls grant-string metacharacters.
+        // Also reject: control characters.
+        let has_bad_char = s.chars().any(|c| {
+            c.is_control()
+                || matches!(
+                    c,
+                    '"' | '/'
+                        | '\\'
+                        | '['
+                        | ']'
+                        | ':'
+                        | ';'
+                        | '|'
+                        | '='
+                        | ','
+                        | '+'
+                        | '*'
+                        | '?'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                )
+        });
+        if has_bad_char {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "whoami returned empty username",
+                std::io::ErrorKind::InvalidData,
+                // Raw value intentionally omitted to avoid logging attacker input.
+                "Windows identity name component contains disallowed characters",
             ));
         }
+        Ok(())
+    }
 
-        let path_str = path.to_string_lossy();
-        let icacls_out = std::process::Command::new("icacls")
-            .args([
-                path_str.as_ref(),
-                "/inheritance:r",
-                "/grant:r",
-                &format!("{user}:(OI)(CI)F"),
-            ])
-            .output()?;
+    let username = std::env::var("USERNAME").map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("USERNAME environment variable not available: {e}"),
+        )
+    })?;
+    let userdomain = std::env::var("USERDOMAIN").map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("USERDOMAIN environment variable not available: {e}"),
+        )
+    })?;
 
-        if !icacls_out.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "icacls failed: {}",
-                    String::from_utf8_lossy(&icacls_out.stderr).trim()
-                ),
-            ));
-        }
+    validate_windows_name(&username)?;
+    validate_windows_name(&userdomain)?;
+
+    // Build the icacls grant specifier as a single argument token.
+    // std::process::Command wraps arguments containing spaces in double
+    // quotes when constructing the CreateProcessW command-line string,
+    // so icacls receives the token correctly even for usernames with spaces
+    // (e.g. enterprise accounts like "John Smith").
+    //
+    // Format: "DOMAIN\user:(OI)(CI)F"
+    //   (OI) = object inherit, (CI) = container inherit, F = full control.
+    let grant_arg = format!("{userdomain}\\{username}:(OI)(CI)F");
+
+    let path_str = path.to_string_lossy();
+    let icacls_out = std::process::Command::new("icacls")
+        .args([
+            path_str.as_ref(),
+            "/inheritance:r", // strip inherited ACEs
+            "/grant:r",       // replace (not add to) explicit grant
+            grant_arg.as_str(),
+        ])
+        .output()?;
+
+    if !icacls_out.status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!(
+                "icacls failed (exit {:?}): {}",
+                icacls_out.status.code(),
+                String::from_utf8_lossy(&icacls_out.stderr).trim(),
+            ),
+        ));
     }
 
     Ok(())
 }
 
+/// Wait until the shutdown channel carries `true` or the sender is dropped.
+///
+/// ## Why `wait_for` and not `changed`
+///
+/// `changed()` blocks until the value *changes relative to the receiver's
+/// last-seen mark*. That has two failure modes:
+///
+/// 1. **Pre-set signal**: if the sender already wrote `true` before this call,
+///    `changed()` blocks forever waiting for a *subsequent* mutation; the
+///    shutdown is silently missed.
+///
+/// 2. **Sender drop**: `changed()` returns `Err(RecvError)` when the sender
+///    is dropped, which should also be treated as a stop signal.
+///
+/// `wait_for(|&v| v)` returns immediately if the current value is already
+/// `true` (no missed pre-set), and returns `Err(RecvError)` on sender drop
+/// (which we discard intentionally — both outcomes mean "stop").
 async fn wait_for_shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
-    let _changed = matches!(shutdown.changed().await, Ok(()));
+    // Discard Ok(()) (value became true) and Err(RecvError) (sender dropped)
+    // — both indicate the task should stop.
+    let _ = shutdown.wait_for(|&v| v).await;
 }
 
 async fn set_onion(state: &SharedState, addr: String) {
@@ -632,8 +795,11 @@ mod tests {
     fn format_is_56_chars_plus_dot_onion() {
         let addr = onion_address_from_pubkey(&[0u8; 32]);
         assert_eq!(addr.len(), 62);
-        assert!(addr.strip_suffix(".onion").is_some());
-        let host = addr.strip_suffix(".onion").unwrap_or(&addr);
+        assert!(
+            addr.strip_suffix(".onion").is_some(),
+            "onion address always ends with '.onion'"
+        );
+        let host = addr.strip_suffix(".onion").unwrap_or("");
         assert!(host
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
