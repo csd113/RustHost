@@ -2,10 +2,9 @@
 //!
 //! **Directory:** `src/config/`
 
-use std::path::Path;
-
 use super::Config;
 use crate::{AppError, Result};
+use std::path::Path;
 
 /// Load and validate the configuration from `path`.
 ///
@@ -20,7 +19,7 @@ pub fn load(path: &Path) -> Result<Config> {
         .map_err(|e| AppError::ConfigLoad(format!("Cannot read {}: {e}", path.display())))?;
 
     let config: Config = toml::from_str(&raw)
-        .map_err(|e| AppError::ConfigLoad(format!("settings.toml is malformed: {e}")))?;
+        .map_err(|e| AppError::ConfigLoad(format!("{} is malformed: {e}", path.display())))?;
 
     validate(&config)?;
     Ok(config)
@@ -30,17 +29,8 @@ fn validate(cfg: &Config) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
 
     // [server]
-    // port: NonZeroU16 — port 0 is already rejected by serde at parse time (4.2).
-    // bind: IpAddr     — invalid IPs are already rejected by serde at parse time (4.2).
-    // level: LogLevel  — invalid levels are already rejected by serde at parse time (4.2).
-
-    // a free-form CSP string with embedded CR/LF could inject
-    // arbitrary headers.  The field is now a typed `CspLevel` enum so serde
-    // rejects any value that isn't "off", "relaxed", or "strict" at parse time;
-    // no runtime check is needed here.
-
-    // max_connections = 0 deadlocks (semaphore never grants permits);
-    // very large values defeat the connection limit entirely.
+    // max_connections = 0 deadlocks the semaphore (never grants permits).
+    // Values > 65_535 are impractical for most OS-level connection limits.
     if cfg.server.max_connections == 0 {
         errors.push("[server] max_connections must be at least 1".into());
     }
@@ -51,12 +41,8 @@ fn validate(cfg: &Config) -> Result<()> {
         ));
     }
 
-    // Phase 2 (C-4) — validate per-IP connection limit.
-    //
-    // max_connections_per_ip = 0 would make every connection fail immediately
-    // (the CAS loop can never increment past the limit of zero).
-    // max_connections_per_ip > max_connections means the per-IP guard can
-    // never be the binding constraint, making it useless.
+    // max_connections_per_ip = 0 makes every connection fail immediately.
+    // max_connections_per_ip > max_connections makes the per-IP guard useless.
     if cfg.server.max_connections_per_ip == 0 {
         errors.push("[server] max_connections_per_ip must be at least 1".into());
     }
@@ -68,10 +54,14 @@ fn validate(cfg: &Config) -> Result<()> {
     }
 
     // [site]
-    // `index_file` must be a bare filename, not a path.
-    // Use Path::components() rather than checking for MAIN_SEPARATOR:
-    // on Windows both `/` and `\` are valid separators, so a string-contains
-    // check on `\` alone misses "sub/index.html" written with forward slashes.
+    if cfg.site.directory.is_empty() {
+        errors.push("[site] directory must not be empty".into());
+    }
+    if cfg.site.index_file.is_empty() {
+        errors.push("[site] index_file must not be empty".into());
+    }
+
+    // index_file must be a bare filename (no path separators or directories).
     if std::path::Path::new(&cfg.site.index_file)
         .components()
         .count()
@@ -79,9 +69,10 @@ fn validate(cfg: &Config) -> Result<()> {
     {
         errors.push("[site] index_file must be a filename only, not a path".into());
     }
+
     {
         let dir_path = std::path::Path::new(&cfg.site.directory);
-        if dir_path.is_absolute() {
+        if dir_path.has_root() {
             errors.push("[site] directory must not be an absolute path".into());
         }
         if dir_path
@@ -90,10 +81,7 @@ fn validate(cfg: &Config) -> Result<()> {
         {
             errors.push("[site] directory must not contain '..' components".into());
         }
-        // Count only Normal components so this check is independent from the
-        // is_absolute() guard above (a RootDir component would double-trigger).
-        // As with index_file, Path::components() handles both `/` and `\` on
-        // Windows, making the check correct on all platforms.
+        // Allow at most one Normal component (simple directory name only).
         if dir_path
             .components()
             .filter(|c| matches!(c, std::path::Component::Normal(_)))
@@ -105,9 +93,13 @@ fn validate(cfg: &Config) -> Result<()> {
     }
 
     // [logging]
+    if cfg.logging.file.is_empty() {
+        errors.push("[logging] file must not be empty".into());
+    }
+
     {
         let log_path = std::path::Path::new(&cfg.logging.file);
-        if log_path.is_absolute() {
+        if log_path.has_root() {
             errors.push("[logging] file must not be an absolute path".into());
         }
         if log_path
@@ -130,16 +122,13 @@ fn validate(cfg: &Config) -> Result<()> {
     if cfg.identity.instance_name.is_empty() {
         errors.push("[identity] instance_name must not be empty".into());
     }
-    if cfg.identity.instance_name.len() > 32 {
+    if cfg.identity.instance_name.chars().count() > 32 {
         errors.push(format!(
-            "[identity] instance_name is {} chars; maximum is 32",
-            cfg.identity.instance_name.len()
+            "[identity] instance_name is {} characters; maximum is 32",
+            cfg.identity.instance_name.chars().count()
         ));
     }
-    // `char::is_control` covers U+001B (ESC), BEL (\x07), backspace (\x08),
-    // null (\x00), and all other C0/C1 control characters. This check prevents
-    // ANSI/VT escape-sequence injection through `instance_name` into the
-    // terminal dashboard, which renders the value directly in raw mode.
+    // Prevent ANSI/VT escape-sequence injection into the terminal dashboard.
     if cfg.identity.instance_name.chars().any(char::is_control) {
         errors.push("[identity] instance_name must not contain control characters".into());
     }
@@ -152,7 +141,6 @@ fn validate(cfg: &Config) -> Result<()> {
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::{validate, Config};
@@ -164,14 +152,12 @@ mod tests {
     }
 
     // ── validate — happy path ────────────────────────────────────────────────
-
     #[test]
     fn validate_valid_config_returns_ok() {
         assert!(validate(&valid()).is_ok());
     }
 
     // ── validate — [server] max_connections_per_ip ───────────────────────────
-
     #[test]
     fn validate_max_connections_per_ip_zero_is_rejected() {
         let mut cfg = valid();
@@ -188,7 +174,7 @@ mod tests {
     fn validate_max_connections_per_ip_exceeds_max_connections() {
         let mut cfg = valid();
         cfg.server.max_connections = 32;
-        cfg.server.max_connections_per_ip = 64; // > max_connections
+        cfg.server.max_connections_per_ip = 64;
         let result = validate(&cfg);
         assert!(
             matches!(&result, Err(AppError::ConfigValidation(e))
@@ -201,11 +187,22 @@ mod tests {
     fn validate_max_connections_per_ip_equal_to_max_connections_is_ok() {
         let mut cfg = valid();
         cfg.server.max_connections = 32;
-        cfg.server.max_connections_per_ip = 32; // equal is permitted
+        cfg.server.max_connections_per_ip = 32;
         assert!(validate(&cfg).is_ok());
     }
 
     // ── validate — [site] directory ─────────────────────────────────────────
+    #[test]
+    fn validate_site_directory_empty_is_rejected() {
+        let mut cfg = valid();
+        cfg.site.directory = "".into();
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("[site] directory"))),
+            "expected ConfigValidation error mentioning [site] directory, got: {result:?}"
+        );
+    }
 
     #[test]
     fn validate_site_directory_relative_traversal() {
@@ -213,7 +210,8 @@ mod tests {
         cfg.site.directory = "../../etc".into();
         let result = validate(&cfg);
         assert!(
-            matches!(&result, Err(AppError::ConfigValidation(e)) if e.iter().any(|s| s.contains("[site] directory"))),
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("[site] directory"))),
             "expected ConfigValidation error with '[site] directory', got: {result:?}"
         );
     }
@@ -224,12 +222,36 @@ mod tests {
         cfg.site.directory = "/etc".into();
         let result = validate(&cfg);
         assert!(
-            matches!(&result, Err(AppError::ConfigValidation(e)) if e.iter().any(|s| s.contains("[site] directory"))),
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("[site] directory"))),
             "expected ConfigValidation error with '[site] directory', got: {result:?}"
         );
     }
 
+    #[test]
+    fn validate_site_index_file_empty_is_rejected() {
+        let mut cfg = valid();
+        cfg.site.index_file = "".into();
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("[site] index_file"))),
+            "expected ConfigValidation error mentioning [site] index_file, got: {result:?}"
+        );
+    }
+
     // ── validate — [logging] file ────────────────────────────────────────────
+    #[test]
+    fn validate_logging_file_empty_is_rejected() {
+        let mut cfg = valid();
+        cfg.logging.file = "".into();
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("[logging] file"))),
+            "expected ConfigValidation error mentioning [logging] file, got: {result:?}"
+        );
+    }
 
     #[test]
     fn validate_logging_file_traversal() {
@@ -237,17 +259,52 @@ mod tests {
         cfg.logging.file = "../../.bashrc".into();
         let result = validate(&cfg);
         assert!(
-            matches!(&result, Err(AppError::ConfigValidation(e)) if e.iter().any(|s| s.contains("[logging] file"))),
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("[logging] file"))),
             "expected ConfigValidation error with '[logging] file', got: {result:?}"
+        );
+    }
+
+    // ── validate — [identity] instance_name ──────────────────────────────────
+    #[test]
+    fn validate_instance_name_empty_is_rejected() {
+        let mut cfg = valid();
+        cfg.identity.instance_name = "".into();
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("instance_name"))),
+            "expected ConfigValidation error mentioning instance_name, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_instance_name_too_long_is_rejected() {
+        let mut cfg = valid();
+        cfg.identity.instance_name = "x".repeat(33);
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("instance_name"))),
+            "expected ConfigValidation error mentioning instance_name, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_instance_name_control_char_is_rejected() {
+        let mut cfg = valid();
+        cfg.identity.instance_name = "Test\x1b".into(); // ESC
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("instance_name"))),
+            "expected ConfigValidation error mentioning instance_name, got: {result:?}"
         );
     }
 
     // ── validate — port ──────────────────────────────────────────────────────
     //
-    // Port 0 is already rejected by `NonZeroU16` at the serde layer (fix 4.2),
-    // so we verify that serde rejects a zero value rather than testing via
-    // `validate()` (which only receives already-parsed configs).
-
+    // Port 0 is already rejected by `NonZeroU16` at the serde layer.
     #[test]
     fn config_rejects_port_zero_at_parse_time() {
         let toml_str = make_full_toml("port = 0");
@@ -256,7 +313,6 @@ mod tests {
     }
 
     // ── validate — bind address ──────────────────────────────────────────────
-
     #[test]
     fn config_rejects_invalid_bind_address_at_parse_time() {
         let toml_str = make_full_toml("bind = \"not.an.ip\"");
@@ -267,22 +323,17 @@ mod tests {
         );
     }
 
-    // ── validate — deny_unknown_fields (fix 2.5) ─────────────────────────────
-
+    // ── validate — deny_unknown_fields ───────────────────────────────────────
     #[test]
     fn config_rejects_unknown_fields_at_parse_time() {
-        // Insert an unrecognised key into [server] — must be rejected by serde
-        // because all Config structs carry `#[serde(deny_unknown_fields)]`.
         let toml_str = make_full_toml("completely_unknown_key = true");
         let result = toml::from_str::<Config>(&toml_str);
         assert!(result.is_err(), "expected serde error for unknown field");
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
-
     /// Build a complete, valid TOML document with `extra` injected into
-    /// the `[server]` section, so individual field-level tests can be
-    /// expressed as minimal one-liner overrides.
+    /// the `[server]` section.
     fn make_full_toml(extra: &str) -> String {
         format!(
             r#"
