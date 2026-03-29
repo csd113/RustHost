@@ -195,7 +195,7 @@ mod tests {
     #[test]
     fn validate_site_directory_empty_is_rejected() {
         let mut cfg = valid();
-        cfg.site.directory = "".into();
+        cfg.site.directory = String::new();
         let result = validate(&cfg);
         assert!(
             matches!(&result, Err(AppError::ConfigValidation(e))
@@ -231,7 +231,7 @@ mod tests {
     #[test]
     fn validate_site_index_file_empty_is_rejected() {
         let mut cfg = valid();
-        cfg.site.index_file = "".into();
+        cfg.site.index_file = String::new();
         let result = validate(&cfg);
         assert!(
             matches!(&result, Err(AppError::ConfigValidation(e))
@@ -244,7 +244,7 @@ mod tests {
     #[test]
     fn validate_logging_file_empty_is_rejected() {
         let mut cfg = valid();
-        cfg.logging.file = "".into();
+        cfg.logging.file = String::new();
         let result = validate(&cfg);
         assert!(
             matches!(&result, Err(AppError::ConfigValidation(e))
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn validate_instance_name_empty_is_rejected() {
         let mut cfg = valid();
-        cfg.identity.instance_name = "".into();
+        cfg.identity.instance_name = String::new();
         let result = validate(&cfg);
         assert!(
             matches!(&result, Err(AppError::ConfigValidation(e))

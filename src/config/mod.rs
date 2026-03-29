@@ -52,15 +52,21 @@ fn serialize_ip_addr<S: serde::Serializer>(addr: &IpAddr, s: S) -> Result<S::Ok,
 }
 
 // ─── Default value helpers (for serde + Config::default) ─────────────────────
-/// Numeric / bool / enum helpers are `const fn` (compile-time evaluable).
-/// String helpers are ordinary `fn` for maximum Rust version compatibility
-/// (String::from is not `const` in all MSRV versions).
+// Numeric / bool / enum helpers are `const fn` (compile-time evaluable).
+// String helpers are ordinary `fn` for maximum Rust version compatibility
+// (`String::from` is not `const` in all MSRV versions).
 
 const fn default_https_port() -> NonZeroU16 {
-    NonZeroU16::new(8443).unwrap()
+    match NonZeroU16::new(8443) {
+        Some(v) => v,
+        None => NonZeroU16::MIN,
+    }
 }
 const fn default_http_port() -> NonZeroU16 {
-    NonZeroU16::new(8080).unwrap()
+    match NonZeroU16::new(8080) {
+        Some(v) => v,
+        None => NonZeroU16::MIN,
+    }
 }
 fn default_acme_dir() -> String {
     String::from("tls/acme")
@@ -77,7 +83,10 @@ const fn default_true() -> bool {
 
 /// Server defaults
 const fn default_server_port() -> NonZeroU16 {
-    NonZeroU16::new(8080).unwrap()
+    match NonZeroU16::new(8080) {
+        Some(v) => v,
+        None => NonZeroU16::MIN,
+    }
 }
 const fn default_bind() -> IpAddr {
     IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
