@@ -654,13 +654,14 @@ fn security_headers(
             "Permissions-Policy",
             "camera=(), microphone=(), geolocation=()",
         );
-    if content_type.starts_with("text/html") {
-        let effective = if csp.is_empty() {
-            "default-src 'self'"
-        } else {
-            csp
-        };
-        let safe = sanitize_header_value(effective);
+    // An empty `csp` string is the sentinel value produced by `CspLevel::Off`
+    // (see `CspLevel::as_header_value`).  In that case we must not emit any
+    // `Content-Security-Policy` header at all — not even a "safe" default —
+    // because the operator has explicitly opted out.  Emitting `default-src
+    // 'self'` when `csp_level = "off"` blocks external fonts, CDN
+    // stylesheets, and inline styles, visibly breaking page formatting.
+    if content_type.starts_with("text/html") && !csp.is_empty() {
+        let safe = sanitize_header_value(csp);
         builder = builder.header("Content-Security-Policy", safe.as_ref());
     }
     builder
