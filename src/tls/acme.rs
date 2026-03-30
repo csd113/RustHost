@@ -3,7 +3,13 @@ use crate::Result;
 use crate::{config::AcmeConfig, error::AppError};
 use rustls::ServerConfig;
 use rustls_acme::AcmeAcceptor;
-use std::{fmt::Debug, net::IpAddr, path::Path, sync::Arc};
+use std::{
+    fmt::Debug,
+    net::IpAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::runtime::Handle;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -25,6 +31,8 @@ use std::os::unix::fs::PermissionsExt;
 /// burn your quota. Set staging = false only once you have confirmed the
 /// full ACME flow works end-to-end in staging.
 ///
+/// **Requires:** Must be called within an active Tokio runtime context.
+///
 /// # Errors
 ///
 /// Returns [`AppError::Tls`] if:
@@ -37,7 +45,24 @@ pub fn build_acme_acceptor(
 ) -> Result<(Arc<AcmeAcceptor>, Arc<ServerConfig>)> {
     validate_acme_config(cfg)?;
 
-    let cache_dir = data_dir.join(&cfg.cache_dir);
+    // Validate cache_dir before joining
+    if Path::new(&cfg.cache_dir).is_absolute() {
+        return Err(AppError::Tls(
+            "[tls.acme.cache_dir] must be relative path without absolute components".into(),
+        ));
+    }
+    if cfg.cache_dir.contains("..") {
+        return Err(AppError::Tls(
+            "[tls.acme.cache_dir] must not contain '..' segments".into(),
+        ));
+    }
+    if cfg.cache_dir.len() > 512 {
+        return Err(AppError::Tls(
+            "[tls.acme.cache_dir] path too long (max 512 chars)".into(),
+        ));
+    }
+
+    let cache_dir: PathBuf = data_dir.join(&cfg.cache_dir);
     std::fs::create_dir_all(&cache_dir).map_err(|e| {
         AppError::Tls(format!(
             "failed to create ACME cache directory {}: {e}",
@@ -72,11 +97,10 @@ pub fn build_acme_acceptor(
     );
 
     let cache = rustls_acme::caches::DirCache::new(cache_dir);
-    let domains: Vec<&str> = cfg.domains.iter().map(String::as_str).collect();
 
     // Modern builder API (rustls-acme ≥ 0.15+)
     // Note: directory_lets_encrypt now takes a *production* bool.
-    let mut acme_cfg = rustls_acme::AcmeConfig::new(domains)
+    let mut acme_cfg = rustls_acme::AcmeConfig::new(cfg.domains.iter().map(String::as_str))
         .cache(cache)
         .directory_lets_encrypt(!cfg.staging);
 
@@ -85,8 +109,7 @@ pub fn build_acme_acceptor(
         acme_cfg = acme_cfg.contact_push(format!("mailto:{email}"));
     } else {
         log::warn!(
-            "TLS/ACME: no contact email configured;
-             Let's Encrypt recommends providing one for expiry notifications"
+            "TLS/ACME: no contact email configured; Let's Encrypt recommends providing one for expiry notifications"
         );
     }
 
@@ -101,18 +124,17 @@ pub fn build_acme_acceptor(
             .with_cert_resolver(state.resolver()),
     );
 
-    // AcmeAcceptor is the low-level handle for custom server architectures
-    // that do not use the high-level `AcmeState::incoming()` stream.
-    // The `acceptor()` method is marked deprecated in favor of framework
-    // helpers (e.g. `axum_acceptor`) or the high-level API, but it remains
-    // the supported path for per-acceptor / manual rustls setups.
+    // TODO: Migrate from deprecated `acceptor()` to framework-specific helpers
+    // (e.g. `rustls_acme::axum_acceptor` or `AcmeState::incoming`) or manual
+    // CertResolver integration. See rustls-acme docs for raw rustls setups.
     #[allow(deprecated)]
     let acme_acceptor = Arc::new(state.acceptor());
 
     // Spawn the event loop. This task must stay alive for the lifetime of
     // the server process — it drives ACME challenge responses and renewals.
     let env_label = if cfg.staging { "staging" } else { "production" };
-    tokio::spawn(run_acme_event_loop(state, env_label.to_owned()));
+    // Safe under active Tokio runtime (doc'd above).
+    Handle::current().spawn(run_acme_event_loop(state, env_label));
 
     Ok((acme_acceptor, server_cfg))
 }
@@ -129,8 +151,10 @@ pub fn build_acme_acceptor(
 ///
 /// The loop exits only when the underlying stream closes, which normally
 /// only happens when the process shuts down.
-async fn run_acme_event_loop<EC, EA>(mut state: rustls_acme::AcmeState<EC, EA>, env_label: String)
-where
+async fn run_acme_event_loop<EC, EA>(
+    mut state: rustls_acme::AcmeState<EC, EA>,
+    env_label: &'static str,
+) where
     EC: Debug + Send + 'static,
     EA: Debug + Send + 'static,
 {
@@ -167,24 +191,28 @@ fn validate_acme_config(cfg: &AcmeConfig) -> Result<()> {
         ));
     }
     for domain in &cfg.domains {
-        if domain.trim().is_empty() {
+        let trimmed = domain.trim();
+        if trimmed.is_empty() {
             return Err(AppError::Tls(
-                "[tls.acme] domains contains an empty string".into(),
+                "[tls.acme] domains contains an empty/whitespace-only string".into(),
             ));
         }
-        // Rudimentary check: must contain at least one dot (e.g. "example.com")
-        // and must not look like a raw IP address (ACME doesn't issue for IPs).
-        if !domain.contains('.') || domain.parse::<IpAddr>().is_ok() {
+        if *domain != trimmed {
             return Err(AppError::Tls(format!(
-                "[tls.acme] invalid domain {domain:?}:
-                 must be a fully-qualified domain name, not an IP address"
+                "[tls.acme] domain {domain:?} contains leading/trailing whitespace"
             )));
         }
+        if !trimmed.contains('.') || trimmed.parse::<IpAddr>().is_ok() {
+            return Err(AppError::Tls(format!("[tls.acme] invalid domain {domain:?}: must be a fully-qualified domain name, not an IP address")));
+        }
     }
-    if cfg.email.as_deref().is_some_and(str::is_empty) {
-        return Err(AppError::Tls(
-            "[tls.acme] email is set but empty; provide a valid address or remove the key".into(),
-        ));
+    if let Some(email) = &cfg.email {
+        let trimmed = email.trim();
+        if trimmed.is_empty() {
+            return Err(AppError::Tls(
+                "[tls.acme] email is set but empty/whitespace-only; provide a valid address or remove the key".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -236,6 +264,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_whitespace_email() {
+        let mut cfg = valid_cfg();
+        cfg.email = Some("   ".into());
+        assert!(validate_acme_config(&cfg).is_err());
+    }
+
+    #[test]
     fn accepts_none_email() {
         let mut cfg = valid_cfg();
         cfg.email = None;
@@ -253,5 +288,12 @@ mod tests {
         let mut cfg = valid_cfg();
         cfg.domains = vec!["example.com".into(), "www.example.com".into()];
         assert!(validate_acme_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn rejects_whitespace_domain() {
+        let mut cfg = valid_cfg();
+        cfg.domains = vec![" ex.com".into()];
+        assert!(validate_acme_config(&cfg).is_err());
     }
 }

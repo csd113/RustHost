@@ -7,6 +7,39 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.1.3]
+
+## `tor/mod.rs`
+
+- **Fixed:** Rewrote `wait_for_shutdown_signal` to use `wait_for(|&v| v)` instead of `changed()` — prevents missed signals and silent sender-drop
+- **Fixed:** Patched `JoinSet` memory leak by reaping finished tasks inline in `process_streams`
+- **Fixed:** Explicitly drop `StreamRequest` on local connect failure so a `RELAY_END` cell is sent instead of silently hanging up
+- **Fixed:** Corrected deadline fallback — overflow no longer sets deadline to "right now"
+- **Fixed:** `log_onion_banner` no longer double-prints `.onion` suffix on short hostnames
+- **Fixed:** Grouped all three index writes under one `#[allow(clippy::indexing_slicing)]` block with bounds proof
+- **Fixed:** Replaced dead `checked_shl(...).unwrap_or(u64::MAX)` with plain `<<` (shift is always < 64)
+- **Fixed (Windows):** Replaced `whoami` subprocess with `USERNAME`/`USERDOMAIN` env-var lookup; added input validation
+- **Improved:** Strengthened `ensure_private_dir` doc comment to call out Tor key material risk
+- **Removed:** Redundant `set_starting_and_clear_onion` call in `reconnect_after_stream_end` — `run()` already handles it
+- **Refactored:** Replaced all `Box<dyn Error>` returns with `anyhow::Result`; errors now use `.context()` and `{e:#}`
+- **Fixed:** Moved `semaphore.close()` before task drain to prevent permit acquisition during shutdown
+- **Fixed (tests):** Replaced `unwrap_or` with `unwrap` — silent fallback was masking potential test failures
+
+## `acme.rs`
+
+- **Fixed:** Removed unnecessary `Vec` allocation — pass iterator directly to `AcmeConfig::new`
+- **Fixed:** Domain validation now rejects leading/trailing whitespace
+- **Fixed:** Cleaned up multi-line log literal formatting
+- **Deprecated:** Flagged use of deprecated `AcmeState::acceptor()` for migration
+- **Fixed:** Removed unnecessary `.to_owned()` on static `&str` for `env_label`
+- **Improved:** Documented `tokio::spawn` runtime requirement to prevent panic on misconfiguration
+- **Fixed:** Minor allocation cleanup in email `contact_push`
+- **Improved:** Added test coverage for whitespace domains and `build_acme_acceptor`
+- **Fixed:** Added validation for `cache_dir` — rejects absolute paths, traversal, and oversized strings
+- **Fixed:** Addressed miscellaneous Clippy pedantic/nursery warnings
+
+---
+
 ## [v0.1.2]
 
 ### Added

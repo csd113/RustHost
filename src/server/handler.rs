@@ -654,8 +654,13 @@ fn security_headers(
             "Permissions-Policy",
             "camera=(), microphone=(), geolocation=()",
         );
-    if content_type.starts_with("text/html") && !csp.is_empty() {
-        let safe = sanitize_header_value(csp);
+    if content_type.starts_with("text/html") {
+        let effective = if csp.is_empty() {
+            "default-src 'self'"
+        } else {
+            csp
+        };
+        let safe = sanitize_header_value(effective);
         builder = builder.header("Content-Security-Policy", safe.as_ref());
     }
     builder
