@@ -2,12 +2,7 @@
 pub mod acme;
 pub mod self_signed;
 
-use std::{
-    io::BufReader,
-    path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
-};
+use std::{io::BufReader, path::Path, sync::Arc};
 
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -22,8 +17,6 @@ use crate::{
     error::AppError,
 };
 
-static ACME_INITIALIZED: AtomicBool = AtomicBool::new(false);
-
 /// Converts a borrowed `PrivateKeyDer` to an owned `'static` version.
 fn private_key_der_to_static(key: &PrivateKeyDer<'_>) -> PrivateKeyDer<'static> {
     key.clone_key()
@@ -35,7 +28,18 @@ pub enum Acceptor {
     /// Static certificate — manual PEM files or a self-signed dev cert.
     Static(Arc<TlsAcceptor>),
     /// Let's Encrypt certificate managed by `rustls-acme`.
-    Acme(Arc<rustls_acme::AcmeAcceptor>, Arc<ServerConfig>),
+    ///
+    /// The [`tokio::task::JoinHandle`] is wrapped in [`Arc`] so the
+    /// `Acceptor` can be cheaply cloned for each accepted connection without
+    /// transferring ownership of the handle. The handle drives the ACME event
+    /// loop (challenge responses, renewals) and **must** be retained and
+    /// awaited during graceful shutdown; all clones share the same underlying
+    /// task — awaiting any one of them is sufficient.
+    Acme(
+        Arc<rustls_acme::AcmeAcceptor>,
+        Arc<ServerConfig>,
+        Arc<tokio::task::JoinHandle<()>>,
+    ),
 }
 
 /// Construct an [`Acceptor`] from the provided [`TlsConfig`], or return
@@ -54,7 +58,7 @@ pub enum Acceptor {
 /// - The ACME config is invalid (empty domain list, IP address as domain, etc.).
 /// - The ACME cache directory cannot be created.
 /// - The self-signed certificate cannot be generated or written to disk.
-pub fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<Acceptor>> {
+pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<Acceptor>> {
     if !cfg.enabled {
         return Ok(None);
     }
@@ -69,16 +73,19 @@ pub fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<Accepto
             "TLS: starting ACME / Let's Encrypt provisioning (cache: {})",
             cfg.acme.cache_dir.as_str()
         );
-        let already_init = ACME_INITIALIZED.swap(true, Ordering::Relaxed);
-        if already_init {
-            log::warn!("TLS: ACME already initialized elsewhere; skipping duplicate spawn");
-        }
-        let (acme_acceptor, server_cfg) = acme::build_acme_acceptor(&cfg.acme, data_dir)?;
-        return Ok(Some(Acceptor::Acme(acme_acceptor, server_cfg)));
+        // Duplicate-initialization is now enforced by the OnceLock guard
+        // inside acme::build_acme_acceptor — a second call returns an error.
+        let (acme_acceptor, server_cfg, event_loop) =
+            acme::build_acme_acceptor(&cfg.acme, data_dir)?;
+        return Ok(Some(Acceptor::Acme(
+            acme_acceptor,
+            server_cfg,
+            Arc::new(event_loop),
+        )));
     }
 
     log::info!("TLS: no cert configured — generating/loading self-signed dev certificate");
-    let acceptor = self_signed::generate_or_load(data_dir)?;
+    let acceptor = self_signed::generate_or_load(data_dir).await?;
     log::warn!(
         "TLS: using self-signed localhost dev cert (INSECURE FOR PROD — configure manual_cert or acme)"
     );

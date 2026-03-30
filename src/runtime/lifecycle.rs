@@ -283,19 +283,10 @@ async fn setup_tls(
         return;
     }
 
-    // Clone owned copies so they can be moved into the 'static spawn_blocking
-    // closure.
-    let tls_cfg = config.tls.clone();
-    let dd = data_dir.to_path_buf();
-
-    let tls_result =
-        match tokio::task::spawn_blocking(move || tls::build_acceptor(&tls_cfg, &dd)).await {
-            Ok(inner) => inner,
-            Err(e) => {
-                log::error!("TLS initialisation task panicked: {e}. Continuing in HTTP-only mode.");
-                return;
-            }
-        };
+    // build_acceptor is async and manages its own spawn_blocking internally
+    // for any blocking I/O (e.g. self-signed cert generation). No outer
+    // spawn_blocking wrapper is needed or correct here.
+    let tls_result = tls::build_acceptor(&config.tls, data_dir).await;
 
     match tls_result {
         Err(e) => {

@@ -404,7 +404,9 @@ pub async fn run_https(
                         // Clone the acceptor handle cheaply — both variants are Arc-backed.
                         let acceptor = match &tls_acceptor {
                             Acceptor::Static(a) => Acceptor::Static(Arc::clone(a)),
-                            Acceptor::Acme(a, cfg) => Acceptor::Acme(Arc::clone(a), Arc::clone(cfg)),
+                            Acceptor::Acme(a, cfg, h) => {
+                                Acceptor::Acme(Arc::clone(a), Arc::clone(cfg), Arc::clone(h))
+                            }
                         };
                         let peer_ip = peer.ip();
                         let Ok(ip_guard) = try_acquire_per_ip(&ctx.per_ip_map, peer_ip, ctx.max_per_ip) else {
@@ -462,7 +464,7 @@ pub async fn run_https(
                                         }
                                     }
                                 }
-                                Acceptor::Acme(a, server_cfg) => {
+                                Acceptor::Acme(a, server_cfg, _handle) => {
                                     // AcmeAcceptor::accept needs futures-io AsyncRead/AsyncWrite,
                                     // so adapt the tokio TcpStream before passing it in.
                                     let compat_stream = tcp_stream.compat();
