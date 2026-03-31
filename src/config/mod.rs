@@ -1,23 +1,20 @@
 //! # Config Module
 //!
-//! **Directory:** `src/config/`
-
+//! **File:** `mod.rs`
+//! **Location:** `src/config/mod.rs`
 pub mod defaults;
 pub mod loader;
-
+use log::LevelFilter;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::net::IpAddr;
 use std::num::NonZeroU16;
 
-use log::LevelFilter;
-use serde::{Deserialize, Deserializer, Serialize};
-
 // ─── Log level ───────────────────────────────────────────────────────────────
-
 /// Typed log-level value that serde deserialises directly from the TOML string.
 ///
 /// Replaces the `level: String` field + the duplicate `parse_level` /
 /// validation logic that previously existed in both `loader.rs` and
-/// `logging/mod.rs` (fix 4.2).  An invalid value (e.g. `level = "verbose"`)
+/// `logging/mod.rs`. An invalid value (e.g. `level = "verbose"`)
 /// is now rejected at parse time with a clear serde error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -28,7 +25,6 @@ pub enum LogLevel {
     Warn,
     Error,
 }
-
 impl From<LogLevel> for LevelFilter {
     fn from(level: LogLevel) -> Self {
         match level {
@@ -42,7 +38,6 @@ impl From<LogLevel> for LevelFilter {
 }
 
 // ─── Serde helpers ────────────────────────────────────────────────────────────
-
 /// Deserialise `bind` from a TOML string directly into `IpAddr`.
 ///
 /// Replaces the post-parse `.parse::<IpAddr>()` check in `loader.rs` with a
@@ -57,15 +52,102 @@ fn serialize_ip_addr<S: serde::Serializer>(addr: &IpAddr, s: S) -> Result<S::Ok,
     s.serialize_str(&addr.to_string())
 }
 
-// ─── CSP level ───────────────────────────────────────────────────────────────
+// ─── Default value helpers (for serde + Config::default) ─────────────────────
+// Numeric / bool / enum helpers are `const fn` (compile-time evaluable).
+// String helpers are ordinary `fn` for maximum Rust version compatibility
+// (`String::from` is not `const` in all MSRV versions).
 
+const fn default_https_port() -> NonZeroU16 {
+    match NonZeroU16::new(8443) {
+        Some(v) => v,
+        None => NonZeroU16::MIN,
+    }
+}
+const fn default_http_port() -> NonZeroU16 {
+    match NonZeroU16::new(8080) {
+        Some(v) => v,
+        None => NonZeroU16::MIN,
+    }
+}
+fn default_acme_dir() -> String {
+    String::from("tls/acme")
+}
+const fn default_redirect_status() -> u16 {
+    301
+}
+const fn default_max_connections_per_ip() -> u32 {
+    16
+}
+const fn default_shutdown_grace_secs() -> u64 {
+    30
+}
+const fn default_tor_shutdown_grace_secs() -> u64 {
+    5
+}
+const fn default_true() -> bool {
+    true
+}
+const fn default_tor_enabled() -> bool {
+    true
+}
+
+/// Server defaults
+const fn default_server_port() -> NonZeroU16 {
+    match NonZeroU16::new(8080) {
+        Some(v) => v,
+        None => NonZeroU16::MIN,
+    }
+}
+const fn default_bind() -> IpAddr {
+    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+}
+const fn default_max_connections() -> u32 {
+    256
+}
+
+/// Site defaults
+fn default_site_directory() -> String {
+    String::from("site")
+}
+fn default_index_file() -> String {
+    String::from("index.html")
+}
+
+/// Logging defaults
+const fn default_logging_enabled() -> bool {
+    true
+}
+const fn default_logging_level() -> LogLevel {
+    LogLevel::Info
+}
+fn default_logging_file() -> String {
+    String::from("logs/rusthost.log")
+}
+
+/// Console defaults
+const fn default_console_interactive() -> bool {
+    true
+}
+const fn default_console_refresh_rate() -> u64 {
+    500
+}
+const fn default_console_timestamps() -> bool {
+    false
+}
+
+/// Identity default
+fn default_instance_name() -> String {
+    String::from("RustHost")
+}
+
+// ─── CSP level ───────────────────────────────────────────────────────────────
 /// Preset Content-Security-Policy levels selectable in `settings.toml`.
 ///
-/// | Level     | CSP header sent                                           | Use case                      |
+/// | Level | CSP header sent | Use case |
 /// |-----------|-----------------------------------------------------------|-------------------------------|
-/// | `off`     | *(none)*                                                  | Dev / any site, zero friction |
-/// | `relaxed` | `default-src * 'unsafe-inline' 'unsafe-eval' data: blob:` | Sites with external CDNs      |
-/// | `strict`  | same-origin only + inline scripts/styles                  | High-security deployments     |
+/// | `off` | *(none)* | Dev / any site, zero friction |
+/// | `relaxed` | `default-src * 'unsafe-inline' 'unsafe-eval' data: blob:` | Sites with external CDNs |
+/// | `strict` | same-origin only + inline scripts/styles | High-security deployments |
 ///
 /// The default is `off` so pages render correctly out of the box.
 /// Tighten once you know which external origins your site actually needs.
@@ -77,6 +159,7 @@ fn serialize_ip_addr<S: serde::Serializer>(addr: &IpAddr, s: S) -> Result<S::Ok,
 pub enum CspLevel {
     /// No `Content-Security-Policy` header is sent. The browser applies its
     /// own defaults. Recommended starting point — tighten once the site works.
+    #[default]
     Off,
     /// Sends `default-src * 'unsafe-inline' 'unsafe-eval' data: blob:`.
     ///
@@ -90,10 +173,8 @@ pub enum CspLevel {
     /// font-src 'self' data:`
     ///
     /// Suitable for self-contained sites that serve all assets locally.
-    #[default]
     Strict,
 }
-
 impl CspLevel {
     /// Return the literal CSP header value for this level, or an empty string
     /// when the level is [`CspLevel::Off`] (no header should be sent).
@@ -114,24 +195,11 @@ impl CspLevel {
 }
 
 // ─── TLS config ──────────────────────────────────────────────────────────────
-
-fn default_https_port() -> NonZeroU16 {
-    NonZeroU16::new(8443).unwrap_or(NonZeroU16::MIN)
-}
-
-fn default_http_port() -> NonZeroU16 {
-    NonZeroU16::new(8080).unwrap_or(NonZeroU16::MIN)
-}
-
-fn default_acme_dir() -> String {
-    "tls/acme".into()
-}
-
 /// Top-level TLS configuration block (`[tls]` in `settings.toml`).
 ///
 /// All fields default to off/safe values so existing configs with no `[tls]`
 /// section continue to work identically (`TlsConfig::default()` → HTTP-only).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TlsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -145,7 +213,6 @@ pub struct TlsConfig {
     pub acme: AcmeConfig,
     pub manual_cert: Option<ManualCertConfig>,
 }
-
 impl Default for TlsConfig {
     fn default() -> Self {
         Self {
@@ -160,7 +227,7 @@ impl Default for TlsConfig {
 }
 
 /// Let's Encrypt / ACME configuration (`[tls.acme]` in `settings.toml`).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AcmeConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -181,7 +248,7 @@ pub struct AcmeConfig {
 /// (`[tls.manual_cert]` in `settings.toml`).
 ///
 /// Both paths are resolved relative to the data directory at runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManualCertConfig {
     pub cert_path: String,
     pub key_path: String,
@@ -196,7 +263,7 @@ pub struct ManualCertConfig {
 /// to = "/new-page"
 /// status = 301
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RedirectRule {
     /// Source URL path to match (exact match).
@@ -208,11 +275,7 @@ pub struct RedirectRule {
     pub status: u16,
 }
 
-const fn default_redirect_status() -> u16 {
-    301
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
@@ -223,33 +286,38 @@ pub struct Config {
     pub identity: IdentityConfig,
     /// URL redirect/rewrite rules evaluated before filesystem resolution.
     /// Declared as `[[redirects]]` array-of-tables in `settings.toml`.
-    /// Addresses M-13.
     #[serde(default)]
     pub redirects: Vec<RedirectRule>,
-
-    /// TLS / HTTPS configuration.  All fields default to disabled so existing
+    /// TLS / HTTPS configuration. All fields default to disabled so existing
     /// configs without a `[tls]` section are unaffected.
     #[serde(default)]
     pub tls: TlsConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Non-zero port number.  `NonZeroU16` prevents port 0 at the type level:
+    /// Non-zero port number. `NonZeroU16` prevents port 0 at the type level:
     /// serde rejects a zero value during deserialisation.
+    #[serde(default = "default_server_port")]
     pub port: NonZeroU16,
 
-    /// Network interface to bind to.  Parsed from TOML string at load time;
+    /// Network interface to bind to. Parsed from TOML string at load time;
     /// an invalid IP address is rejected immediately.
     #[serde(
+        default = "default_bind",
         deserialize_with = "deserialize_ip_addr",
         serialize_with = "serialize_ip_addr"
     )]
     pub bind: IpAddr,
 
+    #[serde(default)]
     pub auto_port_fallback: bool,
+
+    #[serde(default)]
     pub open_browser_on_start: bool,
+
+    #[serde(default = "default_max_connections")]
     pub max_connections: u32,
 
     /// Maximum concurrent connections from a single IP address.
@@ -258,35 +326,50 @@ pub struct ServerConfig {
     /// When the limit is reached the connection is dropped at the TCP level —
     /// the OS sends a RST so no HTTP overhead is incurred.
     ///
-    /// Must be ≥ 1 and ≤ `max_connections`.  Validated in `loader.rs`.
+    /// Must be ≥ 1 and ≤ `max_connections`. Validated in `loader.rs`.
     /// Defaults to 16, which is generous for browsers (typically 6–8 parallel
     /// connections) while preventing trivial single-client exhaustion attacks.
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: u32,
 
-    /// Content-Security-Policy preset.  See [`CspLevel`] for available values
+    /// Maximum time to allow active HTTP/HTTPS connections to drain during
+    /// graceful shutdown before the process gives up and aborts remaining work.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
+
+    /// Content-Security-Policy preset. See [`CspLevel`] for available values
     /// (`"off"`, `"relaxed"`, `"strict"`) and the header each one sends.
     /// Defaults to `"off"` — no CSP header, maximum browser compatibility.
     #[serde(default)]
     pub csp_level: CspLevel,
+
+    /// IPs trusted to set the `X-Forwarded-For` header. When `None` or empty,
+    /// the header is ignored and the TCP peer address is always used for
+    /// rate-limiting and logging. This is the safe default for direct-edge
+    /// deployments; set it only when running behind a known reverse proxy.
+    ///
+    /// Example `settings.toml` entry:
+    /// ```toml
+    /// trusted_proxies = ["127.0.0.1", "::1"]
+    /// ```
+    #[serde(default)]
+    pub trusted_proxies: Option<Vec<IpAddr>>,
 }
 
-/// Default per-IP connection limit.
-///
-/// 16 is generous for browsers (6–8 parallel connections per origin) while
-/// making single-client denial-of-service attacks impractical without many IPs.
-const fn default_max_connections_per_ip() -> u32 {
-    16
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SiteConfig {
+    #[serde(default = "default_site_directory")]
     pub directory: String,
+
+    #[serde(default = "default_index_file")]
     pub index_file: String,
+
+    #[serde(default)]
     pub enable_directory_listing: bool,
+
     /// When `true`, directory listings and direct requests expose dot-files
-    /// (e.g. `.git/`, `.env`).  Defaults to `false` so hidden files are not
+    /// (e.g. `.git/`, `.env`). Defaults to `false` so hidden files are not
     /// accidentally served.
     #[serde(default)]
     pub expose_dotfiles: bool,
@@ -301,7 +384,7 @@ pub struct SiteConfig {
 
     /// Optional custom 404 page path, relative to the site directory.
     /// When set and the file exists, it is served with status 404 for all
-    /// requests that resolve to `NotFound`.  Addresses H-10.
+    /// requests that resolve to `NotFound`. Addresses H-10.
     #[serde(default)]
     pub error_404: Option<String>,
 
@@ -312,95 +395,103 @@ pub struct SiteConfig {
     pub error_503: Option<String>,
 }
 
-/// Controls Tor integration.
-///
-/// All paths (`tor_data/`, `tor_hidden_service/`, `torrc`) are derived
-/// automatically from the binary's data directory — no user configuration
-/// needed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TorConfig {
     /// Master on/off switch. When `false`, Tor is never started and the
     /// onion address section of the dashboard is hidden.
+    #[serde(default = "default_tor_enabled")]
     pub enabled: bool,
+
+    /// Maximum time to allow active onion-service streams to drain during
+    /// graceful shutdown before remaining tasks are aborted.
+    #[serde(default = "default_tor_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
+    #[serde(default = "default_logging_enabled")]
     pub enabled: bool,
 
     /// Log level, parsed from a lowercase string (`"trace"` … `"error"`).
-    /// Invalid values are rejected at config-load time (fix 4.2).
+    /// Invalid values are rejected at config-load time.
+    #[serde(default = "default_logging_level")]
     pub level: LogLevel,
 
+    #[serde(default = "default_logging_file")]
     pub file: String,
 
     /// When `true` (default), suppress `Info`-and-below records from
     /// third-party crates (Arti, Tokio, TLS internals) so the log file stays
-    /// focused on application events.  Warnings and errors from all crates are
-    /// always passed through.  Set `false` for full dependency tracing (fix 4.3).
+    /// focused on application events. Warnings and errors from all crates are
+    /// always passed through. Set `false` for full dependency tracing.
     #[serde(default = "default_true")]
     pub filter_dependencies: bool,
 }
 
-const fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsoleConfig {
+    #[serde(default = "default_console_interactive")]
     pub interactive: bool,
+
+    #[serde(default = "default_console_refresh_rate")]
     pub refresh_rate_ms: u64,
+
+    #[serde(default = "default_console_timestamps")]
     pub show_timestamps: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityConfig {
+    #[serde(default = "default_instance_name")]
     pub instance_name: String,
 }
 
 // ─── Default config ──────────────────────────────────────────────────────────
-
 impl Default for Config {
     fn default() -> Self {
         Self {
             server: ServerConfig {
-                port: NonZeroU16::new(8080).unwrap_or(NonZeroU16::MIN),
-                bind: "127.0.0.1"
-                    .parse()
-                    .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-                auto_port_fallback: true,
+                port: default_server_port(),
+                bind: default_bind(),
+                auto_port_fallback: false,
                 open_browser_on_start: false,
-                max_connections: 256,
+                max_connections: default_max_connections(),
                 max_connections_per_ip: default_max_connections_per_ip(),
-                csp_level: CspLevel::Strict,
+                shutdown_grace_secs: default_shutdown_grace_secs(),
+                csp_level: CspLevel::Off,
+                trusted_proxies: None,
             },
             site: SiteConfig {
-                directory: "site".into(),
-                index_file: "index.html".into(),
+                directory: default_site_directory(),
+                index_file: default_index_file(),
                 enable_directory_listing: false,
                 expose_dotfiles: false,
                 spa_routing: false,
                 error_404: None,
                 error_503: None,
             },
-            tor: TorConfig { enabled: true },
+            tor: TorConfig {
+                enabled: default_tor_enabled(),
+                shutdown_grace_secs: default_tor_shutdown_grace_secs(),
+            },
             logging: LoggingConfig {
-                enabled: true,
-                level: LogLevel::Info,
-                file: "logs/rusthost.log".into(),
+                enabled: default_logging_enabled(),
+                level: default_logging_level(),
+                file: default_logging_file(),
                 filter_dependencies: true,
             },
             console: ConsoleConfig {
-                interactive: true,
-                refresh_rate_ms: 500,
-                show_timestamps: false,
+                interactive: default_console_interactive(),
+                refresh_rate_ms: default_console_refresh_rate(),
+                show_timestamps: default_console_timestamps(),
             },
             identity: IdentityConfig {
-                instance_name: "RustHost".into(),
+                instance_name: default_instance_name(),
             },
             redirects: Vec::new(),
             tls: TlsConfig::default(),

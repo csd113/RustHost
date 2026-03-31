@@ -1,6 +1,7 @@
 //! # Console Module
 //!
-//! **Directory:** `src/console/`
+//! **File:** `mod.rs`
+//! **Location:** `src/console/mod.rs`
 //!
 //! Manages the interactive terminal UI: raw-mode setup, render loop, and
 //! key input.
@@ -68,7 +69,6 @@ pub fn start(
     // crossterm 0.27+ enables Windows VT (Virtual Terminal) processing
     // automatically — no manual call needed.
 
-    // 4.1 — map crossterm io errors to AppError::Console.
     terminal::enable_raw_mode()
         .map_err(|e| AppError::Console(format!("Failed to enable raw mode: {e}")))?;
     execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide)

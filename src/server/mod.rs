@@ -1,11 +1,12 @@
 //! # Server Module
 //!
-//! **Directory:** `src/server/`
+//! **File:** `mod.rs`
+//! **Location:** `src/server/mod.rs`
 //!
-//! Provides a safe HTTP/1.1 static-file server. Phase 3 migrated the
+//! Provides a safe HTTP/1.1 static-file server. The implementation migrated
 //! per-connection handler from a hand-rolled single-shot parser to
-//! [`hyper`]'s keep-alive connection loop, eliminating the 30–45 s Tor
-//! page-load penalty caused by `Connection: close` on every response (C-1).
+//! [`hyper`]'s keep-alive connection loop, eliminating the large Tor
+//! page-load penalty caused by `Connection: close` on every response.
 //!
 //! Sub-modules:
 //! - [`handler`] — per-connection request handling and file serving
@@ -109,19 +110,26 @@ fn try_acquire_per_ip(
 /// Extracting these into a struct keeps [`run`] under the 100-line limit
 /// imposed by `clippy::nursery::too_many_lines` while grouping the values
 /// that every spawned handler task needs.
+#[allow(clippy::struct_excessive_bools)]
 struct ServerContext {
     canonical_root: Arc<Path>,
     index_file: Arc<str>,
     csp_header: Arc<str>,
+    state: SharedState,
+    keep_alive: bool,
     dir_list: bool,
     expose_dots: bool,
     spa_routing: bool,
-    error_404_path: Option<std::path::PathBuf>,
+    error_404_page: Option<Arc<handler::CustomErrorPage>>,
+    error_503_page: Option<Arc<handler::CustomErrorPage>>,
     redirects: Arc<Vec<crate::config::RedirectRule>>,
     semaphore: Arc<Semaphore>,
     per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
     max_conns: usize,
-    max_per_ip: u32,
+    max_per_ip: Option<u32>,
+    /// IPs whose X-Forwarded-For header is trusted.
+    /// Defaults to empty (XFF ignored) for direct-edge deployments.
+    trusted_proxies: Arc<Vec<IpAddr>>,
 }
 impl ServerContext {
     /// Variant used when the HTTP and HTTPS listeners must share the same
@@ -131,9 +139,12 @@ impl ServerContext {
     /// opening connections on both ports simultaneously.
     fn with_shared(
         config: &Config,
+        state: SharedState,
         data_dir: &Path,
         semaphore: Arc<Semaphore>,
         per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
+        max_per_ip: Option<u32>,
+        keep_alive: bool,
     ) -> Option<Self> {
         let site_root = data_dir.join(&config.site.directory);
         let canonical_root: Arc<Path> = match site_root.canonicalize() {
@@ -149,29 +160,48 @@ impl ServerContext {
         };
         #[allow(clippy::cast_possible_truncation)]
         let max_conns = config.server.max_connections as usize;
-        // H-10 / C-6 — resolve custom error page paths once at startup.
         let site_dir = data_dir.join(&config.site.directory);
-        let error_404_path = config.site.error_404.as_deref().map(|p| site_dir.join(p));
+        let error_404_page = config.site.error_404.as_deref().and_then(|p| {
+            handler::load_custom_error_page(
+                canonical_root.as_ref(),
+                &site_dir.join(p),
+                "error_404",
+                hyper::StatusCode::NOT_FOUND,
+            )
+        });
+        let error_503_page = config.site.error_503.as_deref().and_then(|p| {
+            handler::load_custom_error_page(
+                canonical_root.as_ref(),
+                &site_dir.join(p),
+                "error_503",
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+            )
+        });
         Some(Self {
             canonical_root,
             index_file: Arc::from(config.site.index_file.as_str()),
             csp_header: Arc::from(config.server.csp_level.as_header_value()),
+            state,
+            keep_alive,
             dir_list: config.site.enable_directory_listing,
             expose_dots: config.site.expose_dotfiles,
             spa_routing: config.site.spa_routing,
-            error_404_path,
+            error_404_page,
+            error_503_page,
             redirects: Arc::new(config.redirects.clone()),
             semaphore,
             per_ip_map,
             max_conns,
-            max_per_ip: config.server.max_connections_per_ip,
+            max_per_ip,
+            // When empty, X-Forwarded-For is ignored on every connection.
+            trusted_proxies: Arc::new(config.server.trusted_proxies.clone().unwrap_or_default()),
         })
     }
     /// Attempt to spawn a handler task for one accepted connection.
     ///
     /// Returns `false` when the global semaphore has been closed (shutdown),
     /// `true` in all other cases (connection accepted, rejected, or dropped).
-    async fn spawn_connection(
+    fn spawn_connection(
         &self,
         stream: tokio::net::TcpStream,
         peer: std::net::SocketAddr,
@@ -179,40 +209,58 @@ impl ServerContext {
         join_set: &mut JoinSet<()>,
     ) -> bool {
         let peer_ip = peer.ip();
-        let Ok(ip_guard) = try_acquire_per_ip(&self.per_ip_map, peer_ip, self.max_per_ip) else {
+        let ip_guard = if let Some(limit) = self.max_per_ip {
+            let Ok(ip_guard) = try_acquire_per_ip(&self.per_ip_map, peer_ip, limit) else {
+                log::warn!("Per-IP limit ({limit}) reached for {peer_ip}; dropping connection");
+                drop(stream);
+                return true;
+            };
+            Some(ip_guard)
+        } else {
+            None
+        };
+        let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
             log::warn!(
-                "Per-IP limit ({}) reached for {peer_ip}; dropping connection",
-                self.max_per_ip
+                "Connection limit ({}) reached; rejecting connection from {peer_ip}",
+                self.max_conns
             );
             drop(stream);
             return true;
         };
-        let Ok(permit) = Arc::clone(&self.semaphore).acquire_owned().await else {
-            return false; // semaphore closed — signal shutdown to caller
-        };
-        if self.semaphore.available_permits() == 0 {
-            log::warn!(
-                "Connection limit ({}) reached; further connections will queue",
-                self.max_conns
-            );
-        }
         let site = Arc::clone(&self.canonical_root);
         let idx = Arc::clone(&self.index_file);
         let met = Arc::clone(metrics);
+        let state = Arc::clone(&self.state);
         let csp = Arc::clone(&self.csp_header);
         let flags = handler::FeatureFlags {
             dir_listing: self.dir_list,
             expose_dotfiles: self.expose_dots,
             spa_routing: self.spa_routing,
             is_https: false,
+            keep_alive: self.keep_alive,
         };
-        let e404 = self.error_404_path.clone();
+        let e404 = self.error_404_page.clone();
+        let e503 = self.error_503_page.clone();
         let redirects = Arc::clone(&self.redirects);
+        let trusted_proxies = Arc::clone(&self.trusted_proxies);
         join_set.spawn(async move {
             let _permit = permit;
             let _ip_guard = ip_guard;
-            if let Err(e) =
-                handler::handle(stream, site, idx, flags, met, csp, e404, redirects).await
+            if let Err(e) = handler::handle(
+                stream,
+                peer,
+                site,
+                idx,
+                flags,
+                met,
+                state,
+                csp,
+                e404,
+                e503,
+                redirects,
+                trusted_proxies,
+            )
+            .await
             {
                 log::debug!("Handler error: {e}");
             }
@@ -261,6 +309,17 @@ pub async fn run(
     if bound_port != base_port {
         log::warn!("Configured port {base_port} was in use; bound to {bound_port} instead.");
     }
+    let Some(mut ctx) = ServerContext::with_shared(
+        &config,
+        Arc::clone(&state),
+        &data_dir,
+        shared_semaphore,
+        shared_per_ip_map,
+        Some(config.server.max_connections_per_ip),
+        true,
+    ) else {
+        return;
+    };
     {
         let mut s = state.write().await;
         s.actual_port = bound_port;
@@ -268,11 +327,6 @@ pub async fn run(
     }
     let _ = port_tx.send(bound_port);
     log::info!("HTTP server listening on {bind_addr}:{bound_port}");
-    let Some(mut ctx) =
-        ServerContext::with_shared(&config, &data_dir, shared_semaphore, shared_per_ip_map)
-    else {
-        return;
-    };
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
     loop {
@@ -290,8 +344,11 @@ pub async fn run(
                 match result {
                     Ok((stream, peer)) => {
                         backoff_ms = 1;
+                        if let Err(e) = stream.set_nodelay(true) {
+                            log::debug!("Could not enable TCP_NODELAY for {peer}: {e}");
+                        }
                         log::debug!("Connection from {peer}");
-                        if !ctx.spawn_connection(stream, peer, &metrics, &mut join_set).await {
+                        if !ctx.spawn_connection(stream, peer, &metrics, &mut join_set) {
                             break; // semaphore closed — shutting down
                         }
                     }
@@ -310,6 +367,11 @@ pub async fn run(
                     }
                 }
             }
+            Some(result) = join_set.join_next(), if !join_set.is_empty() => {
+                if let Err(e) = result {
+                    log::debug!("HTTP connection task join error: {e}");
+                }
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { break; }
             }
@@ -318,7 +380,11 @@ pub async fn run(
     state.write().await.server_running = false;
     log::info!("HTTP server stopped accepting; draining in-flight connections…");
     let drain = async { while join_set.join_next().await.is_some() {} };
-    let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(config.server.shutdown_grace_secs),
+        drain,
+    )
+    .await;
     log::info!("HTTP server drained.");
 }
 /// Start the HTTPS server.
@@ -350,13 +416,15 @@ pub async fn run_https(
     data_dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
     tls_acceptor: Acceptor,
+    port_tx: oneshot::Sender<u16>,
     shared_semaphore: Arc<Semaphore>,
     shared_per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
     mut root_watch: watch::Receiver<Arc<Path>>,
 ) {
     let bind_addr = config.server.bind;
     let port = config.tls.port.get();
-    let std_listener = match StdTcpListener::bind(format!("{bind_addr}:{port}")) {
+    let bind_socket = std::net::SocketAddr::new(bind_addr, port);
+    let std_listener = match StdTcpListener::bind(bind_socket) {
         Ok(l) => l,
         Err(e) => {
             log::error!("HTTPS server failed to bind {bind_addr}:{port}: {e}");
@@ -374,17 +442,24 @@ pub async fn run_https(
             return;
         }
     };
+    let Some(mut ctx) = ServerContext::with_shared(
+        &config,
+        Arc::clone(&state),
+        &data_dir,
+        shared_semaphore,
+        shared_per_ip_map,
+        Some(config.server.max_connections_per_ip),
+        true,
+    ) else {
+        return;
+    };
     {
         let mut s = state.write().await;
         s.tls_running = true;
         s.tls_port = Some(port);
     }
+    let _ = port_tx.send(port);
     log::info!("HTTPS server listening on {bind_addr}:{port}");
-    let Some(mut ctx) =
-        ServerContext::with_shared(&config, &data_dir, shared_semaphore, shared_per_ip_map)
-    else {
-        return;
-    };
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
     loop {
@@ -400,36 +475,54 @@ pub async fn run_https(
                 match result {
                     Ok((tcp_stream, peer)) => {
                         backoff_ms = 1;
+                        if let Err(e) = tcp_stream.set_nodelay(true) {
+                            log::debug!("Could not enable TCP_NODELAY for TLS peer {peer}: {e}");
+                        }
                         log::debug!("TLS connection from {peer}");
                         // Clone the acceptor handle cheaply — both variants are Arc-backed.
                         let acceptor = match &tls_acceptor {
                             Acceptor::Static(a) => Acceptor::Static(Arc::clone(a)),
-                            Acceptor::Acme(a, cfg) => Acceptor::Acme(Arc::clone(a), Arc::clone(cfg)),
+                            Acceptor::Acme(a, cfg) => {
+                                Acceptor::Acme(Arc::clone(a), Arc::clone(cfg))
+                            }
                         };
                         let peer_ip = peer.ip();
-                        let Ok(ip_guard) = try_acquire_per_ip(&ctx.per_ip_map, peer_ip, ctx.max_per_ip) else {
+                        let ip_guard = if let Some(limit) = ctx.max_per_ip {
+                            let Ok(ip_guard) = try_acquire_per_ip(&ctx.per_ip_map, peer_ip, limit) else {
+                                log::warn!(
+                                    "Per-IP limit ({limit}) reached for {peer_ip}; dropping TLS connection"
+                                );
+                                drop(tcp_stream);
+                                continue;
+                            };
+                            Some(ip_guard)
+                        } else {
+                            None
+                        };
+                        let Ok(permit) = Arc::clone(&ctx.semaphore).try_acquire_owned() else {
                             log::warn!(
-                                "Per-IP limit ({}) reached for {peer_ip}; dropping TLS connection",
-                                ctx.max_per_ip
+                                "Connection limit ({}) reached; rejecting TLS connection from {peer_ip}",
+                                ctx.max_conns
                             );
                             drop(tcp_stream);
                             continue;
                         };
-                        let Ok(permit) = Arc::clone(&ctx.semaphore).acquire_owned().await else {
-                            break; // semaphore closed — shutting down
-                        };
                         let site = Arc::clone(&ctx.canonical_root);
                         let idx = Arc::clone(&ctx.index_file);
                         let met = Arc::clone(&metrics);
+                        let state = Arc::clone(&ctx.state);
                         let csp = Arc::clone(&ctx.csp_header);
                         let flags = handler::FeatureFlags {
                             dir_listing: ctx.dir_list,
                             expose_dotfiles: ctx.expose_dots,
                             spa_routing: ctx.spa_routing,
                             is_https: true,
+                            keep_alive: ctx.keep_alive,
                         };
-                        let e404 = ctx.error_404_path.clone();
+                        let e404 = ctx.error_404_page.clone();
+                        let e503 = ctx.error_503_page.clone();
                         let redirects = Arc::clone(&ctx.redirects);
+                        let trusted_proxies = Arc::clone(&ctx.trusted_proxies);
                         join_set.spawn(async move {
                             // Items must appear before any statements (clippy::items_after_statements).
                             use tokio_util::compat::{
@@ -494,13 +587,17 @@ pub async fn run_https(
                             };
                             if let Err(e) = handler::handle(
                                 tls_stream,
+                                peer,
                                 site,
                                 idx,
                                 flags,
                                 met,
+                                state,
                                 csp,
                                 e404,
+                                e503,
                                 redirects,
+                                trusted_proxies,
                             )
                             .await
                             {
@@ -521,6 +618,11 @@ pub async fn run_https(
                     }
                 }
             }
+            Some(result) = join_set.join_next(), if !join_set.is_empty() => {
+                if let Err(e) = result {
+                    log::debug!("HTTPS connection task join error: {e}");
+                }
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { break; }
             }
@@ -529,8 +631,114 @@ pub async fn run_https(
     state.write().await.tls_running = false;
     log::info!("HTTPS server stopped accepting; draining in-flight connections…");
     let drain = async { while join_set.join_next().await.is_some() {} };
-    let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(config.server.shutdown_grace_secs),
+        drain,
+    )
+    .await;
     log::info!("HTTPS server drained.");
+}
+
+/// Start a loopback-only HTTP listener used exclusively by the Tor proxy.
+///
+/// This listener serves the same site tree as the main HTTP server but bypasses
+/// per-IP admission control because every Tor stream originates from loopback
+/// once Arti proxies it into the local process. It still shares the global
+/// connection semaphore so Tor traffic participates in the overall capacity
+/// budget instead of becoming an unbounded side channel.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tor_ingress(
+    config: Arc<Config>,
+    state: SharedState,
+    metrics: SharedMetrics,
+    data_dir: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+    port_tx: oneshot::Sender<u16>,
+    shared_semaphore: Arc<Semaphore>,
+    root_watch: watch::Receiver<Arc<Path>>,
+) {
+    let bind_addr = tor_loopback_addr(config.server.bind);
+    let listener = match TcpListener::bind(std::net::SocketAddr::new(bind_addr, 0)).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            log::error!("Tor ingress server failed to bind {bind_addr}:0: {e}");
+            return;
+        }
+    };
+    let bound_port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => {
+            log::error!("Tor ingress server could not read bound port: {e}");
+            return;
+        }
+    };
+    let Some(mut ctx) = ServerContext::with_shared(
+        &config,
+        state,
+        &data_dir,
+        shared_semaphore,
+        Arc::new(DashMap::new()),
+        None,
+        false,
+    ) else {
+        return;
+    };
+    let _ = port_tx.send(bound_port);
+    log::info!("Tor ingress server listening on {bind_addr}:{bound_port}");
+    let mut join_set: JoinSet<()> = JoinSet::new();
+    let mut root_watch = root_watch;
+    let mut backoff_ms: u64 = 1;
+    loop {
+        if root_watch.has_changed().unwrap_or(false) {
+            let new_root = Arc::clone(&root_watch.borrow_and_update());
+            log::info!("Tor ingress: site root refreshed: {}", new_root.display());
+            ctx.canonical_root = new_root;
+        }
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, peer)) => {
+                        backoff_ms = 1;
+                        if let Err(e) = stream.set_nodelay(true) {
+                            log::debug!("Could not enable TCP_NODELAY for Tor ingress peer {peer}: {e}");
+                        }
+                        log::debug!("Tor ingress connection from {peer}");
+                        if !ctx.spawn_connection(stream, peer, &metrics, &mut join_set) {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if is_fd_exhaustion(&e) {
+                            log::error!(
+                                "Tor ingress accept error — file-descriptor limit reached \
+                                 (EMFILE/ENFILE): {e}. Reduce max_connections or raise the OS ulimit."
+                            );
+                        } else {
+                            log::debug!("Tor ingress accept error (transient): {e}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = backoff_ms.saturating_mul(2).min(1_000);
+                    }
+                }
+            }
+            Some(result) = join_set.join_next(), if !join_set.is_empty() => {
+                if let Err(e) = result {
+                    log::debug!("Tor ingress connection task join error: {e}");
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+    log::info!("Tor ingress server stopped accepting; draining in-flight connections…");
+    let drain = async { while join_set.join_next().await.is_some() {} };
+    let _ = tokio::time::timeout(
+        Duration::from_secs(config.server.shutdown_grace_secs),
+        drain,
+    )
+    .await;
+    log::info!("Tor ingress server drained.");
 }
 // ─── Port binding ─────────────────────────────────────────────────────────────
 /// Try to bind to `addr:port`. When `fallback` is true, increments the port
@@ -539,8 +747,8 @@ fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpLis
     let max_attempts: u16 = if fallback { 10 } else { 1 };
     for attempt in 0..max_attempts {
         let try_port = port.saturating_add(attempt);
-        let addr_str = format!("{addr}:{try_port}");
-        match StdTcpListener::bind(&addr_str) {
+        let socket_addr = std::net::SocketAddr::new(addr, try_port);
+        match StdTcpListener::bind(socket_addr) {
             Ok(std_listener) => {
                 std_listener.set_nonblocking(true)?;
                 let listener = TcpListener::from_std(std_listener)?;
@@ -568,6 +776,14 @@ fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpLis
             ),
         ),
     })
+}
+
+#[must_use]
+pub const fn tor_loopback_addr(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    }
 }
 /// Return `true` when `e` represents file-descriptor exhaustion.
 ///
@@ -608,12 +824,12 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 const MAX_SCAN_DEPTH: usize = 64;
 /// Recursively count files and total bytes in `site_root` (BFS traversal).
 ///
-/// Returns `Err` if any `read_dir` call fails so callers can log a warning
-/// instead of silently reporting zeros.
+/// Unreadable directories are skipped with a warning so one bad subtree does
+/// not prevent the rest of the site from being counted.
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Io`] if any directory in the tree cannot be read.
+/// Returns [`AppError::Io`] only if the initial traversal setup itself fails.
 ///
 /// # Panics
 ///
@@ -655,39 +871,33 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
             }
         };
         for entry in entries.flatten() {
-            // Use symlink_metadata (does not follow symlinks) to detect symlinked
-            // directories before following them into potential cycles.
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_file() {
+            let path = entry.path();
+            // Inspect the link itself first so directory symlinks cannot walk
+            // outside the site root during a background metrics scan.
+            let Ok(link_meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if link_meta.file_type().is_symlink() {
+                log::warn!("Skipping symlink during site scan: {}", path.display());
+                continue;
+            }
+            if link_meta.is_file() {
                 count = count.saturating_add(1);
-                bytes = bytes.saturating_add(meta.len());
-            } else if meta.is_dir() {
+                bytes = bytes.saturating_add(link_meta.len());
+            } else if link_meta.is_dir() {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::MetadataExt;
-                    let ino = meta.ino();
+                    let ino = link_meta.ino();
                     if !visited_inodes.insert(ino) {
                         log::warn!(
-                            "Symlink cycle detected at {} (inode {ino}), skipping",
-                            entry.path().display()
+                            "Directory cycle detected at {} (inode {ino}), skipping",
+                            path.display()
                         );
                         continue;
                     }
                 }
-                #[cfg(not(unix))]
-                {
-                    // On non-Unix, skip symlinked directories to avoid cycles.
-                    if let Ok(sym_meta) = entry.path().symlink_metadata() {
-                        if sym_meta.file_type().is_symlink() {
-                            log::warn!(
-                                "Skipping symlinked directory {} (no inode tracking on this platform)",
-                                entry.path().display()
-                            );
-                            continue;
-                        }
-                    }
-                }
-                queue.push_back((entry.path(), depth.saturating_add(1)));
+                queue.push_back((path, depth.saturating_add(1)));
             }
         }
     }

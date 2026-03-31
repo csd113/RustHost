@@ -7,6 +7,42 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.1.3]
+
+### Simplified updates
+
+- Added stronger static-file delivery polish with `Last-Modified` revalidation, precompressed asset sidecar support (`.br` / `.gz`), and a lighter-weight identity streaming path for common uncompressed responses.
+- Moved the initial site scan off the startup critical path, skipping it in headless mode so the server can begin accepting traffic sooner.
+- Added a shared reload path that also responds to `SIGHUP`, making headless deployments easier to operate without relying on the interactive dashboard.
+- Improved headless runtime output so startup summarizes HTTP/HTTPS/site/Tor state, and Tor now logs the full onion address explicitly when it becomes ready.
+- Removed a small hot-path allocation from `Accept-Encoding` parsing by switching quality-value parsing to a fixed-width stack-only loop.
+- Reworked listener lifecycle management so HTTP, HTTPS, and redirect servers continuously reap completed connection tasks instead of retaining them until shutdown.
+- Moved access-log disk writes onto a bounded background worker, preventing request handling from blocking on synchronous access-log I/O and surfacing dropped-log backpressure when the queue overflows.
+- Hardened HTTPS redirect startup by validating redirect configs up front and requiring the redirect listener to bind successfully before startup continues.
+- Switched generated defaults to safer production behavior by disabling automatic port fallback and built-in Tor until an operator explicitly enables them.
+- Made graceful shutdown budgets configurable and applied them consistently to HTTP, HTTPS, redirect, and Tor drain behavior so normal restarts are less likely to cut off slow transfers.
+- Made HTTPS startup fail closed so TLS configuration or HTTPS bind failures now stop startup instead of silently falling back to insecure HTTP-only serving.
+- Fixed Tor's internal upstream address selection so onion traffic always connects back through loopback when the public listener is bound to `0.0.0.0` or `::`.
+- Moved per-request filesystem path resolution onto Tokio's blocking pool to avoid starving the async runtime under slow-disk or hostile request load.
+- Tightened connection admission so HTTP, HTTPS, and redirect listeners reject overflow immediately instead of holding accepted sockets open while waiting for permits.
+- Completed the shared response hardening path so redirects, `OPTIONS`, `405`, `304`, and other non-file responses now receive the full security-header set consistently.
+- Added automatic `Onion-Location` headers on clearnet HTTPS responses when the built-in Tor onion service is ready, so supporting browsers can surface the `.onion` version of the current page.
+- Re-enabled built-in Tor by default for newly generated configs and shortened the default Tor shutdown drain window from 30 seconds to 5 seconds.
+- Wired `site.error_503` into runtime serving and preload custom error pages at startup with size limits, removing per-request reloads and dead config.
+- Improved access-log accuracy by recording real `Content-Length` values when known and `-` when a streamed/compressed size is not known ahead of time.
+- Made compression more production-friendly by honoring `Accept-Encoding` quality values and skipping obviously poor candidates such as tiny or already-compressed assets.
+- Hardened private filesystem creation further by validating directory chains, rejecting symlink hops, and keeping restrictive permissions in place for Tor and TLS state.
+- Cleaned up startup and shutdown reliability by draining failed startup tasks, allowing structured access-log reinitialization after shutdown, and holding ACME lifecycle ownership in runtime state instead of a permanent one-shot global.
+- Fixed IPv6 listener binding and local URL rendering so HTTP, HTTPS, redirect, dashboard, and localhost flows all handle bracketed IPv6 addresses correctly.
+- Corrected the Arti relay timeout behavior so active long-lived transfers are limited by idle time instead of a mistaken full-session wall clock.
+- Bounded directory listings during traversal instead of collecting and sorting an entire hostile directory before truncation.
+- Expanded test coverage with HTTPS handshake tests, IPv6 HTTP tests, ACME restart lifecycle coverage, redirect handling, proxy IP resolution, custom `503` pages, and connection-limit rejection.
+- Added top-of-file file/location reference headers across the codebase, removed stale issue-fix annotations, and continued splitting logic into smaller focused modules.
+- Rewrote the README and setup guide to better document production scope, cross-platform behavior, HTTPS/Tor setup, headless operation, and static-hosting-only expectations.
+- Removed duplicate setup filename variants so the repository stays clean on case-insensitive macOS and Windows filesystems.
+
+---
+
 ## [v0.1.2]
 
 ### Added

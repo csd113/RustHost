@@ -43,8 +43,12 @@ confidence-threshold = 0.8
 multiple-versions = "warn"
 deny = []
 skip = [
-    # crossterm 0.27 still pulls mio 0.8.x; tokio requires mio 1.x
-    { name = "mio" },
+    # crossterm 0.28 uses rustix 0.38.x / linux-raw-sys 0.4.x; the async-io /
+    # rustls-acme / tempfile stack uses rustix 1.x / linux-raw-sys 0.12.x.
+    # Both generations are transitive-only; upgrade blocked on crossterm's
+    # upstream adoption of rustix 1.x.
+    { name = "rustix" },
+    { name = "linux-raw-sys" },
     # Various crates in the tokio/crossterm/arti tree pin different windows-sys generations
     { name = "windows-sys" },
     # Arti 0.40 dependency tree spans multiple generations of these crates;
@@ -92,8 +96,7 @@ skip = [
     { name = "asn1-rs-derive" },
     # der-parser 9.0.0 (x509-parser → rustls-acme) vs 10.0.0 (tor-llcrypto → arti-client)
     { name = "der-parser" },
-    # hermit-abi 0.1.19 (atty → rusthost) vs 0.5.2 (polling → async-io → rustls-acme)
-    { name = "hermit-abi" },
+
 ]
 
 # ─── Advisories ───────────────────────────────────────────────────────────────
@@ -110,10 +113,6 @@ ignore = [
     # paste 1.0.15 — unmaintained (RUSTSEC-2024-0436).
     # Transitive dep via tor-rtcompat → arti-client.
     { id = "RUSTSEC-2024-0436", reason = "transitive dep via arti-client/tor-rtcompat; no direct upgrade path available" },
-
-    # atty 0.2.14 — unmaintained (RUSTSEC-2024-0375).
-    # Direct dep of rusthost; replace with std::io::IsTerminal when time allows.
-    { id = "RUSTSEC-2024-0375", reason = "direct dep of rusthost; migrate to std::io::IsTerminal (stable since 1.70.0)" },
 
     # rustls-pemfile 2.2.0 — unmaintained (RUSTSEC-2025-0134).
     # Direct dep of rusthost; migrate to rustls-pki-types PemObject trait when time allows.

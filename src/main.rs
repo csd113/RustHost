@@ -1,5 +1,8 @@
 //! # rusthost-cli
 //!
+//! **File:** `main.rs`
+//! **Location:** `src/main.rs`
+//!
 //! Binary entry point. Parses CLI arguments then delegates all startup logic
 //! to [`rusthost::runtime::lifecycle::run`].
 //!
@@ -16,7 +19,15 @@
 //! -h, --help          Print usage and exit
 //! ```
 
+#![deny(warnings)]
 #![deny(clippy::all, clippy::pedantic)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented
+)]
 #![warn(clippy::nursery)]
 
 use std::io::Write as _;
@@ -39,6 +50,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// initialized. [`std::sync::Once`] is thread-safe and guarantees
 /// exactly-one execution.
 ///
+/// Cleanup is performed on a dedicated thread with a 2-second timeout.
+/// This prevents an infinite hang if `cleanup()` deadlocks (e.g. on a
+/// poisoned `Mutex`): a stalled cleanup must never prevent the process from
+/// exiting.
+///
 /// Any panic inside `cleanup()` is caught and written to stderr so that a
 /// failing cleanup never triggers a double-panic abort when called from the
 /// panic hook.
@@ -47,21 +63,58 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// `rusthost::console::cleanup()` is assumed to be unwind-safe: it must not
 /// leave shared state inconsistent if it panics. If that assumption ever
-/// changes, this wrapper must be revisited.
+/// changes this wrapper must be revisited. Any `Mutex` acquired inside
+/// `cleanup()` must not be held across the point where a panic could occur.
 fn safe_cleanup() {
     static CLEANUP: Once = Once::new();
     CLEANUP.call_once(|| {
-        if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            rusthost::console::cleanup();
-        })) {
-            let msg = payload
-                .downcast_ref::<&str>()
-                .copied()
-                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("<non-string panic payload>");
-            // Use `writeln!` on a raw stderr handle to reduce the risk of a
-            // secondary panic from the formatting machinery in `eprintln!`.
-            let _ = writeln!(std::io::stderr(), "\nconsole cleanup panicked: {msg}");
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let spawn_result = std::thread::Builder::new()
+            .name("rusthost-cleanup".to_owned())
+            .spawn(move || {
+                if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    rusthost::console::cleanup();
+                })) {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("<non-string panic payload>");
+                    let _ = writeln!(std::io::stderr(), "\nconsole cleanup panicked: {msg}");
+                }
+                // Signal completion; ignore send errors (receiver may be gone
+                // if the timeout already elapsed).
+                let _ = done_tx.send(());
+            });
+
+        match spawn_result {
+            Ok(_handle) => {
+                // Wait up to 2 s for cleanup to finish. If it times out, log
+                // and move on — a deadlocked cleanup must not stall exit.
+                if done_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_err()
+                {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "\nwarn: console cleanup timed out after 2 s; \
+                         terminal state may not be fully restored"
+                    );
+                }
+            }
+            Err(e) => {
+                // Thread spawn failed (extremely unlikely: system thread limit).
+                // Fall back to running cleanup inline at the risk of hanging.
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "\nwarn: could not spawn cleanup thread ({e}); \
+                     running cleanup inline"
+                );
+                let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    rusthost::console::cleanup();
+                }));
+            }
         }
     });
 }
@@ -177,15 +230,16 @@ fn reject_inline_value(inline: Option<&str>, flag: &str) -> Result<(), ArgError>
 /// the valid port range (1–65 535). Port `0` is explicitly rejected because it
 /// requests an OS-assigned ephemeral port, which is not a useful target here.
 fn parse_port(raw: &str) -> Result<u16, ArgError> {
-    // `u16` already rejects values > 65 535; the explicit zero-check below
-    // handles port 0, which would otherwise parse successfully.
-    let port = raw.parse::<u16>().map_err(|_| {
-        ArgError::InvalidValue("--port value must be a valid port number (1–65535)".to_owned())
-    })?;
+    /// Shared error message for both the parse and range-check failure paths.
+    /// Defined once here to prevent the two copies diverging during maintenance.
+    const PORT_ERR: &str = "--port value must be a valid port number (1–65535)";
+
+    let port = raw
+        .parse::<u16>()
+        .map_err(|_| ArgError::InvalidValue(PORT_ERR.to_owned()))?;
+
     if port == 0 {
-        return Err(ArgError::InvalidValue(
-            "--port value must be a valid port number (1–65535)".to_owned(),
-        ));
+        return Err(ArgError::InvalidValue(PORT_ERR.to_owned()));
     }
     Ok(port)
 }
@@ -223,7 +277,22 @@ fn validate_serve_flags(
 
 // ─── CLI argument parsing ─────────────────────────────────────────────────────
 
-/// Parse an iterator of raw argument strings into a [`CliArgs`] value.
+/// Outcome of a successful [`parse_args_from`] call.
+///
+/// Separating the early-exit cases from the happy path means
+/// [`parse_args_from`] never calls [`std::process::exit`] directly, making it
+/// fully testable without killing the test-runner process.
+#[derive(Debug)]
+enum ParseOutcome {
+    /// Fully parsed arguments; the caller should proceed with startup.
+    Args(CliArgs),
+    /// A flag like `--help` or `--version` was handled; the caller should
+    /// exit with the given code. Any required output has already been written
+    /// to stdout.
+    EarlyExit(i32),
+}
+
+/// Parse an iterator of raw argument strings into a [`ParseOutcome`].
 ///
 /// Both `--flag value` and `--flag=value` forms are accepted. Use `--` to
 /// signal the end of options; any tokens after `--` are currently unused and
@@ -234,7 +303,7 @@ fn validate_serve_flags(
 /// Returns an [`ArgError`] for unrecognised flags, missing values, duplicate
 /// flags, invalid values, or unsupported flag combinations.
 #[allow(clippy::too_many_lines)]
-fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs, ArgError> {
+fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<ParseOutcome, ArgError> {
     let mut config_path: Option<PathBuf> = None;
     let mut data_dir: Option<PathBuf> = None;
     let mut serve_dir: Option<PathBuf> = None;
@@ -245,12 +314,18 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs, Ar
 
     while let Some(raw_flag) = args.next() {
         if raw_flag == "--" {
-            // Warn rather than silently discard tokens after `--`: dropping
-            // them without feedback is a confusing footgun for users who
+            // Drain and warn about any positional arguments after `--`:
+            // silently dropping them is a confusing footgun for users who
             // expect positional arguments to be honoured.
+            // `args.collect()` exhausts the iterator; the enclosing
+            // `while let` exits naturally on its next evaluation.
             let extras: Vec<String> = args.collect();
             if !extras.is_empty() {
-                eprintln!(
+                // Use writeln! on raw stderr for consistency with the rest of
+                // the error-output strategy in this binary. Warnings go to
+                // stderr so they don't pollute stdout in scripted use.
+                let _ = writeln!(
+                    std::io::stderr(),
                     "warning: positional arguments after '--' are not yet \
                      supported and will be ignored: {}",
                     extras.join(", ")
@@ -267,13 +342,16 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs, Ar
         match flag.as_str() {
             "--version" | "-V" => {
                 reject_inline_value(inline_value.as_deref(), &flag)?;
+                // Print to stdout and signal the caller to exit 0.
+                // We intentionally do NOT call process::exit here so that
+                // parse_args_from remains fully testable.
                 println!("rusthost {VERSION}");
-                std::process::exit(0);
+                return Ok(ParseOutcome::EarlyExit(0));
             }
             "--help" | "-h" => {
                 reject_inline_value(inline_value.as_deref(), &flag)?;
                 print_help();
-                std::process::exit(0);
+                return Ok(ParseOutcome::EarlyExit(0));
             }
             "--config" => {
                 check_duplicate(config_path.is_some(), "--config")?;
@@ -332,37 +410,53 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<CliArgs, Ar
 
     validate_serve_flags(serve_dir.is_some(), explicit_port, no_tor)?;
 
-    Ok(CliArgs {
+    Ok(ParseOutcome::Args(CliArgs {
         config_path,
         data_dir,
         serve_dir,
         serve_port,
         no_tor,
         headless,
-    })
+    }))
 }
 
 /// Parse `std::env::args()` into a [`CliArgs`] value, exiting the process on
-/// any error.
+/// early-exit flags (`--help`, `--version`) or any argument error.
 ///
-/// Thin wrapper around [`parse_args_from`] that sources from the real process
-/// argument list. Argument errors produce a message on stderr followed by
-/// `exit(2)`.
+/// This is the only location in the binary where [`std::process::exit`] is
+/// called for argument-related outcomes, keeping the underlying
+/// [`parse_args_from`] fully testable.
+///
+/// Argument errors exit with code `2` (POSIX convention for command-line
+/// syntax errors); early-exit flags exit with code `0`.
 #[must_use]
 fn parse_args() -> CliArgs {
-    parse_args_from(std::env::args().skip(1)).unwrap_or_else(|err| {
-        eprintln!("{err}");
-        std::process::exit(2);
-    })
+    match parse_args_from(std::env::args().skip(1)) {
+        Ok(ParseOutcome::Args(args)) => args,
+        Ok(ParseOutcome::EarlyExit(code)) => std::process::exit(code),
+        Err(err) => {
+            // Use writeln! on raw stderr: same rationale as in main() —
+            // reduces secondary-panic risk vs eprintln! when stderr is in a
+            // broken state.
+            let _ = writeln!(std::io::stderr(), "{err}");
+            std::process::exit(2);
+        }
+    }
 }
 
 fn print_help() {
+    // Prefer the actual argv[0] so the usage line stays accurate when the
+    // binary is installed under an alias or symlink.
+    let bin = std::env::args()
+        .next()
+        .unwrap_or_else(|| "rusthost-cli".to_owned());
+
     println!(
         "rusthost {ver}
 {desc}
 
 USAGE:
-    rusthost-cli [OPTIONS]
+    {bin} [OPTIONS]
 
 OPTIONS:
     --config   <path>   Override the path to settings.toml
@@ -370,7 +464,7 @@ OPTIONS:
     --data-dir <path>   Override the data-directory root
                         (default: <exe-dir>/rusthost-data/)
     --serve    <dir>    Serve a directory directly — no first-run setup needed
-                        Example: rusthost-cli --serve ./docs --port 3000 --no-tor
+                        Example: {bin} --serve ./docs --port 3000 --no-tor
     --port     <n>      Port for --serve mode (default: 8080)
     --no-tor            Disable Tor in --serve mode
     --headless          Disable the interactive console (applies to all modes;
@@ -397,7 +491,7 @@ fn main() {
     // Install ring as the process-level rustls CryptoProvider.
     //
     // Must happen before *any* TLS initialisation (including the tokio runtime
-    // and any dependency init code that touches rustls).  Without this call,
+    // and any dependency init code that touches rustls). Without this call,
     // rustls panics at the first TLS operation when more than one provider is
     // compiled into the binary — which happens here because rustls-acme's
     // transitive dependencies can pull in aws-lc-rs alongside our explicit
@@ -418,9 +512,12 @@ fn main() {
     std::panic::set_hook(Box::new(|info| {
         safe_cleanup();
 
-        // Use `writeln!` on a raw stderr handle rather than `eprintln!` to
-        // reduce the risk of a secondary panic from the formatting machinery
-        // when stderr is in a broken state (e.g. a closed pipe).
+        // Use `writeln!` on a raw stderr handle throughout this hook rather
+        // than `eprintln!`, which goes through the same formatting machinery
+        // but with a higher risk of a secondary panic when stderr is in a
+        // broken state (e.g. a closed pipe). Explicit `let _ =` suppresses
+        // the unused-result lint without risking a secondary panic on write
+        // failure.
         //
         // The version is embedded so that panic reports are unambiguously
         // tied to a specific release without needing additional context.
@@ -440,34 +537,49 @@ fn main() {
         }
     }));
 
-    // Name the worker threads so they appear meaningfully in profilers,
-    // debuggers, and crash reports rather than as generic "tokio-runtime-worker".
+    // Build the async runtime. Worker threads are given unique, indexed names
+    // so they appear meaningfully in profilers, debuggers, and crash reports
+    // rather than as a wall of identical entries.
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_name("rusthost-worker")
+        .thread_name_fn(|| {
+            static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("rusthost-worker-{id}")
+        })
         .build()
     {
         Ok(rt) => rt,
         Err(err) => {
-            eprintln!("Fatal error: failed to create Tokio runtime: {err}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "Fatal error: failed to create Tokio runtime: {err}"
+            );
             std::process::exit(1);
         }
     };
 
-    rt.block_on(async {
-        if let Err(err) = rusthost::runtime::lifecycle::run(args).await {
-            // `safe_cleanup` is idempotent — it is a no-op if the panic hook
-            // already ran it. When `run` returns `Err` without panicking, this
-            // call is the only cleanup path.
-            //
-            // NOTE: A teardown race is inherent here: if the process receives
-            // a signal between `block_on` returning and `safe_cleanup`
-            // finishing, the terminal may not be fully restored. Eliminating
-            // this race would require signal-handler integration beyond the
-            // scope of this binary.
-            safe_cleanup();
-            eprintln!("\nFatal error: {err}");
-            std::process::exit(1);
-        }
-    });
+    // Run the application. `block_on` drives the top-level future to
+    // completion on this thread while worker threads handle spawned tasks.
+    let result = rt.block_on(rusthost::runtime::lifecycle::run(args));
+
+    // Drop the runtime *before* calling process::exit so that Tokio performs
+    // a graceful shutdown: in-flight tasks are cancelled, connection drains
+    // can complete, and file handles are flushed. Calling exit() inside
+    // block_on (as a prior version did) would abandon all live tasks
+    // mid-operation.
+    //
+    // NOTE: A teardown race is inherent here: if the process receives a signal
+    // between `block_on` returning and `safe_cleanup` finishing, the terminal
+    // may not be fully restored. Eliminating this race would require
+    // signal-handler integration beyond the scope of this binary.
+    drop(rt);
+
+    if let Err(err) = result {
+        // `safe_cleanup` is idempotent — it is a no-op if the panic hook
+        // already ran it.
+        safe_cleanup();
+        let _ = writeln!(std::io::stderr(), "\nFatal error: {err}");
+        std::process::exit(1);
+    }
 }
