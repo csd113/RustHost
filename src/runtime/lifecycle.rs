@@ -700,6 +700,7 @@ const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RustHost</title>
+  <link rel="icon" href="data:,">
   <style>
     body { font-family: system-ui, sans-serif; max-width: 600px;
            margin: 4rem auto; padding: 0 1rem; color: #1a1a1a; }

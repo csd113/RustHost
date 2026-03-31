@@ -65,7 +65,10 @@ fn ensure_real_directory(path: &std::path::Path) -> std::io::Result<()> {
             if file_type.is_symlink() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    format!("refusing to use symlink in private directory path: {}", path.display()),
+                    format!(
+                        "refusing to use symlink in private directory path: {}",
+                        path.display()
+                    ),
                 ));
             }
             if !file_type.is_dir() {

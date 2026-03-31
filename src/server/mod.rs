@@ -343,6 +343,9 @@ pub async fn run(
                 match result {
                     Ok((stream, peer)) => {
                         backoff_ms = 1;
+                        if let Err(e) = stream.set_nodelay(true) {
+                            log::debug!("Could not enable TCP_NODELAY for {peer}: {e}");
+                        }
                         log::debug!("Connection from {peer}");
                         if !ctx.spawn_connection(stream, peer, &metrics, &mut join_set) {
                             break; // semaphore closed — shutting down
@@ -471,6 +474,9 @@ pub async fn run_https(
                 match result {
                     Ok((tcp_stream, peer)) => {
                         backoff_ms = 1;
+                        if let Err(e) = tcp_stream.set_nodelay(true) {
+                            log::debug!("Could not enable TCP_NODELAY for TLS peer {peer}: {e}");
+                        }
                         log::debug!("TLS connection from {peer}");
                         // Clone the acceptor handle cheaply — both variants are Arc-backed.
                         let acceptor = match &tls_acceptor {
@@ -692,6 +698,9 @@ pub async fn run_tor_ingress(
                 match result {
                     Ok((stream, peer)) => {
                         backoff_ms = 1;
+                        if let Err(e) = stream.set_nodelay(true) {
+                            log::debug!("Could not enable TCP_NODELAY for Tor ingress peer {peer}: {e}");
+                        }
                         log::debug!("Tor ingress connection from {peer}");
                         if !ctx.spawn_connection(stream, peer, &metrics, &mut join_set) {
                             break;

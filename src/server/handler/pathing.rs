@@ -17,7 +17,7 @@ const MAX_DIRECTORY_LISTING_ENTRIES: usize = 512;
 
 pub(super) fn cache_control_for(content_type: &str, path: &str) -> &'static str {
     if content_type.starts_with("text/html") {
-        return "no-store";
+        return "no-cache";
     }
     let file_name = Path::new(path)
         .file_name()

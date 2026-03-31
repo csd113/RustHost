@@ -1524,10 +1524,10 @@ mod cache_tests {
     use super::{cache_control_for, pathing::is_hashed_asset};
 
     #[test]
-    fn html_gets_no_store() {
+    fn html_gets_no_cache() {
         assert_eq!(
             cache_control_for("text/html; charset=utf-8", "/index.html"),
-            "no-store"
+            "no-cache"
         );
     }
     #[test]
