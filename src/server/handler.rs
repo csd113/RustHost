@@ -247,7 +247,8 @@ async fn dispatch_resolved(
     Ok(match resolved {
         Resolved::File(abs_path) => serve_file(req, &abs_path, is_head, metrics, csp).await?,
         Resolved::NotFound => {
-            log::debug!("404 Not Found: {decoded}");
+            let decoded_for_log = sanitize_header_value(decoded);
+            log::debug!("404 Not Found: {decoded_for_log}");
             metrics.add_request();
             text_response(StatusCode::NOT_FOUND, "Not Found", csp, "")
         }
@@ -267,7 +268,8 @@ async fn dispatch_resolved(
             )
         }
         Resolved::Forbidden => {
-            log::warn!("403 Forbidden: {decoded}");
+            let decoded_for_log = sanitize_header_value(decoded);
+            log::warn!("403 Forbidden: {decoded_for_log}");
             metrics.add_error();
             text_response(StatusCode::FORBIDDEN, "Forbidden", csp, "")
         }
@@ -1016,8 +1018,21 @@ fn resolve_not_found(
     if spa_routing {
         let spa_index = canonical_root.join(index_file);
         if spa_index.exists() {
-            let resolved = spa_index.canonicalize().unwrap_or(spa_index);
-            return Resolved::File(resolved);
+            match spa_index.canonicalize() {
+                Ok(resolved) if resolved.starts_with(canonical_root) => {
+                    return Resolved::File(resolved);
+                }
+                Ok(resolved) => {
+                    log::warn!(
+                        "Refusing SPA fallback outside the site root: {}",
+                        resolved.display()
+                    );
+                    return Resolved::Forbidden;
+                }
+                Err(_) => {
+                    return Resolved::NotFound;
+                }
+            }
         }
     }
     // H-10 — custom 404 page.

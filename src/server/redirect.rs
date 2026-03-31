@@ -57,7 +57,7 @@ pub async fn run_redirect_server(
                     Ok((mut stream, peer)) => {
                         log::debug!("Redirect connection from {peer}");
                         tokio::spawn(async move {
-                            handle_redirect(&mut stream, tls_port).await;
+                            handle_redirect(&mut stream, bind_addr, tls_port).await;
                         });
                     }
                     Err(e) => {
@@ -78,14 +78,13 @@ pub async fn run_redirect_server(
 ///
 /// The function is best-effort: if the client sends a malformed request or
 /// the write fails we simply drop the connection — there is no retry.
-async fn handle_redirect(stream: &mut tokio::net::TcpStream, https_port: u16) {
+async fn handle_redirect(stream: &mut tokio::net::TcpStream, bind_addr: IpAddr, https_port: u16) {
     use tokio::io::AsyncBufReadExt as _;
     use tokio::io::BufReader;
 
     // Cap at 8 KiB total to defend against slow-loris-style connections.
     const MAX_HEADER_BYTES: usize = 8 * 1024;
 
-    let mut host = String::new();
     let mut path = String::from("/");
 
     // Scope the BufReader so the &mut borrow of stream is released before
@@ -108,7 +107,7 @@ async fn handle_redirect(stream: &mut tokio::net::TcpStream, https_port: u16) {
             _ => return,
         }
 
-        // --- headers (scan for Host only) -----------------------------------
+        // --- headers (drain to the end of the request) ----------------------
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line).await {
@@ -122,29 +121,17 @@ async fn handle_redirect(stream: &mut tokio::net::TcpStream, https_port: u16) {
                     if trimmed.is_empty() {
                         break; // end of headers
                     }
-                    if let Some(val) = trimmed
-                        .strip_prefix("Host:")
-                        .or_else(|| trimmed.strip_prefix("host:"))
-                    {
-                        host = sanitize_header_value(val.trim());
-                    }
                 }
             }
         }
     } // reader dropped here — &mut borrow of stream released
 
     // Build the target URL.
+    let host = redirect_host_for(bind_addr);
     let location = if https_port == 443 {
-        if host.is_empty() {
-            return;
-        }
         format!("https://{host}{path}")
     } else {
-        let bare_host = host.split(':').next().unwrap_or(&host);
-        if bare_host.is_empty() {
-            return;
-        }
-        format!("https://{bare_host}:{https_port}{path}")
+        format!("https://{host}:{https_port}{path}")
     };
 
     let response = format!(
@@ -157,6 +144,15 @@ async fn handle_redirect(stream: &mut tokio::net::TcpStream, https_port: u16) {
 
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
+}
+
+fn redirect_host_for(bind_addr: IpAddr) -> String {
+    match bind_addr {
+        IpAddr::V4(addr) if addr.is_unspecified() => "127.0.0.1".to_owned(),
+        IpAddr::V4(addr) => addr.to_string(),
+        IpAddr::V6(addr) if addr.is_unspecified() => "[::1]".to_owned(),
+        IpAddr::V6(addr) => format!("[{addr}]"),
+    }
 }
 
 /// Keep only the path+query portion of a request target.
@@ -175,7 +171,28 @@ fn sanitize_path(raw: &str) -> String {
     }
 }
 
-/// Strip control characters and whitespace from a header value.
-fn sanitize_header_value(raw: &str) -> String {
-    raw.chars().filter(|c| !matches!(c, '\r' | '\n')).collect()
+#[cfg(test)]
+mod tests {
+    use super::{redirect_host_for, sanitize_path};
+
+    #[test]
+    fn redirect_host_for_unspecified_ipv4_uses_loopback() {
+        assert_eq!(
+            redirect_host_for("0.0.0.0".parse().expect("valid ip")),
+            "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn redirect_host_for_ipv6_is_bracketed() {
+        assert_eq!(
+            redirect_host_for("2001:db8::1".parse().expect("valid ip")),
+            "[2001:db8::1]"
+        );
+    }
+
+    #[test]
+    fn sanitize_path_removes_control_chars_and_spaces() {
+        assert_eq!(sanitize_path("/foo bar\r\nbaz"), "/foobarbaz");
+    }
 }

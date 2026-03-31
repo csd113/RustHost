@@ -51,15 +51,24 @@ pub struct AccessRecord<'a> {
 impl std::fmt::Display for AccessRecord<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let now = chrono::Local::now().format("%d/%b/%Y:%H:%M:%S %z");
-        let ua = self.user_agent.unwrap_or("-");
-        let referer = self.referer.unwrap_or("-");
+        let method = escape_clf_field(self.method);
+        let path = escape_clf_field(self.path);
+        let protocol = escape_clf_field(self.protocol);
+        let ua = self
+            .user_agent
+            .map(escape_clf_field)
+            .unwrap_or_else(|| "-".to_owned());
+        let referer = self
+            .referer
+            .map(escape_clf_field)
+            .unwrap_or_else(|| "-".to_owned());
         write!(
             f,
             "{} - - [{now}] \"{} {} {}\" {} {} \"{}\" \"{}\"",
             self.remote_addr,
-            self.method,
-            self.path,
-            self.protocol,
+            method,
+            path,
+            protocol,
             self.status,
             self.bytes_sent,
             referer,
@@ -565,6 +574,19 @@ const fn level_label(level: Level) -> &'static str {
     }
 }
 
+fn escape_clf_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_ascii_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -573,6 +595,7 @@ mod tests {
     // Task 1.3 — validate_windows_name unit tests.
     // These run on all platforms (cfg(test) is not gated on windows) so CI
     // catches regressions even on Linux/macOS build runners.
+    use crate::logging::AccessRecord;
     #[cfg(windows)]
     use super::validate_windows_name;
 
@@ -654,5 +677,24 @@ mod tests {
     fn validate_windows_name_accepts_domain_user_with_space() {
         // Enterprise usernames like "John Smith" are valid.
         assert!(validate_windows_name("John Smith").is_ok());
+    }
+
+    #[test]
+    fn access_record_escapes_quotes_and_backslashes() {
+        let record = AccessRecord {
+            remote_addr: "127.0.0.1".parse().expect("valid ip"),
+            method: "GET",
+            path: "/a\"b\\c\nd",
+            protocol: "HTTP/1.1",
+            status: 200,
+            bytes_sent: 12,
+            user_agent: Some("agent\"name\\"),
+            referer: Some("ref\r\nline"),
+        };
+        let rendered = record.to_string();
+        assert!(rendered.contains("\\\""));
+        assert!(rendered.contains("\\\\"));
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\r'));
     }
 }

@@ -154,7 +154,27 @@ impl ServerContext {
         let max_conns = config.server.max_connections as usize;
         // H-10 / C-6 — resolve custom error page paths once at startup.
         let site_dir = data_dir.join(&config.site.directory);
-        let error_404_path = config.site.error_404.as_deref().map(|p| site_dir.join(p));
+        let error_404_path = config.site.error_404.as_deref().and_then(|p| {
+            let candidate = site_dir.join(p);
+            match candidate.canonicalize() {
+                Ok(resolved) if resolved.starts_with(canonical_root.as_ref()) => Some(resolved),
+                Ok(resolved) => {
+                    log::warn!(
+                        "Ignoring [site] error_404 path {} because it resolves outside the site root: {}",
+                        candidate.display(),
+                        resolved.display()
+                    );
+                    None
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Ignoring [site] error_404 path {} because it could not be resolved: {e}",
+                        candidate.display()
+                    );
+                    None
+                }
+            }
+        });
         Some(Self {
             canonical_root,
             index_file: Arc::from(config.site.index_file.as_str()),
@@ -279,6 +299,11 @@ pub async fn run(
     if bound_port != base_port {
         log::warn!("Configured port {base_port} was in use; bound to {bound_port} instead.");
     }
+    let Some(mut ctx) =
+        ServerContext::with_shared(&config, &data_dir, shared_semaphore, shared_per_ip_map)
+    else {
+        return;
+    };
     {
         let mut s = state.write().await;
         s.actual_port = bound_port;
@@ -286,11 +311,6 @@ pub async fn run(
     }
     let _ = port_tx.send(bound_port);
     log::info!("HTTP server listening on {bind_addr}:{bound_port}");
-    let Some(mut ctx) =
-        ServerContext::with_shared(&config, &data_dir, shared_semaphore, shared_per_ip_map)
-    else {
-        return;
-    };
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
     loop {
@@ -392,17 +412,17 @@ pub async fn run_https(
             return;
         }
     };
+    let Some(mut ctx) =
+        ServerContext::with_shared(&config, &data_dir, shared_semaphore, shared_per_ip_map)
+    else {
+        return;
+    };
     {
         let mut s = state.write().await;
         s.tls_running = true;
         s.tls_port = Some(port);
     }
     log::info!("HTTPS server listening on {bind_addr}:{port}");
-    let Some(mut ctx) =
-        ServerContext::with_shared(&config, &data_dir, shared_semaphore, shared_per_ip_map)
-    else {
-        return;
-    };
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
     loop {

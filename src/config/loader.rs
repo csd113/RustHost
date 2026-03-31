@@ -28,6 +28,22 @@ pub fn load(path: &Path) -> Result<Config> {
 fn validate(cfg: &Config) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
 
+    fn reject_parent_dir(value: &str, label: &str, errors: &mut Vec<String>) {
+        let path = std::path::Path::new(value);
+        if path.has_root() {
+            errors.push(format!("[site] {label} must not be an absolute path"));
+            return;
+        }
+        if path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            errors.push(format!(
+                "[site] {label} must not contain '..' components"
+            ));
+        }
+    }
+
     // [server]
     // max_connections = 0 deadlocks the semaphore (never grants permits).
     // Values > 65_535 are impractical for most OS-level connection limits.
@@ -90,6 +106,13 @@ fn validate(cfg: &Config) -> Result<()> {
         {
             errors.push("[site] directory must be a directory name only, not a path".into());
         }
+    }
+
+    if let Some(error_404) = &cfg.site.error_404 {
+        reject_parent_dir(error_404, "error_404", &mut errors);
+    }
+    if let Some(error_503) = &cfg.site.error_503 {
+        reject_parent_dir(error_503, "error_503", &mut errors);
     }
 
     // [logging]
@@ -262,6 +285,30 @@ mod tests {
             matches!(&result, Err(AppError::ConfigValidation(e))
                 if e.iter().any(|s| s.contains("[logging] file"))),
             "expected ConfigValidation error with '[logging] file', got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_error_404_traversal() {
+        let mut cfg = valid();
+        cfg.site.error_404 = Some("../outside.html".into());
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("error_404"))),
+            "expected ConfigValidation error mentioning error_404, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_error_503_absolute_path() {
+        let mut cfg = valid();
+        cfg.site.error_503 = Some("/tmp/error.html".into());
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("error_503"))),
+            "expected ConfigValidation error mentioning error_503, got: {result:?}"
         );
     }
 
