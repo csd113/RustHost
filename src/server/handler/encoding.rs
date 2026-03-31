@@ -99,6 +99,10 @@ pub(super) fn should_compress(content_type: &str, file_len: u64) -> bool {
         return false;
     }
 
+    is_compressible_content_type(content_type)
+}
+
+pub(super) fn is_compressible_content_type(content_type: &str) -> bool {
     content_type.starts_with("text/")
         || matches!(
             content_type,

@@ -473,6 +473,7 @@ fn build_test_config(
     config.server.auto_port_fallback = false;
     config.server.open_browser_on_start = false;
     config.server.max_connections = 16;
+    config.server.csp_level = rusthost::config::CspLevel::Strict;
     // Use the directory basename; server joins data_dir + this name.
     config.site.directory = dir_name;
     config.site.index_file = "index.html".into();
@@ -1225,6 +1226,7 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
     };
     let tls_port = 8443;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
     let handle = tokio::spawn(async move {
         rusthost::server::redirect::run_redirect_server(
             rusthost::server::redirect::RedirectServerConfig {
@@ -1235,14 +1237,17 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
                 drain_timeout: Duration::from_secs(5),
             },
             shutdown_rx,
-            tokio::sync::oneshot::channel::<u16>().0,
+            port_tx,
             Arc::new(Semaphore::new(8)),
             Arc::new(DashMap::new()),
         )
         .await;
     });
 
-    let addr: SocketAddr = format!("127.0.0.1:{plain_port}").parse()?;
+    let bound_port = tokio::time::timeout(Duration::from_secs(5), port_rx)
+        .await
+        .map_err(|_| "redirect server did not signal readiness within 5 s")??;
+    let addr: SocketAddr = format!("127.0.0.1:{bound_port}").parse()?;
     let mut stream = match TcpStream::connect(addr).await {
         Ok(stream) => stream,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {

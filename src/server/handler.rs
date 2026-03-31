@@ -24,7 +24,7 @@
 mod encoding;
 mod pathing;
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::TryStreamExt as _;
@@ -630,14 +630,10 @@ async fn serve_file(
         };
     }
 
-    let preferred_encoding = if should_compress(content_type, file_len) {
-        best_encoding(req)
-    } else {
-        Encoding::Identity
-    };
+    let accepted_encoding = best_encoding(req);
 
     if let Some(sidecar) =
-        open_precompressed_variant(abs_path, preferred_encoding, content_type).await?
+        open_precompressed_variant(abs_path, accepted_encoding, content_type).await?
     {
         let etag = strong_variant_etag(&sidecar.metadata, sidecar.encoding_token);
         let last_modified = last_modified_header(&sidecar.metadata);
@@ -654,6 +650,12 @@ async fn serve_file(
         metrics.add_request();
         return build_precompressed_response(sidecar, content_type, path_str, is_head, csp, &etag);
     }
+
+    let preferred_encoding = if should_compress(content_type, file_len) {
+        accepted_encoding
+    } else {
+        Encoding::Identity
+    };
 
     // ── Full-file response ────────────────────────────────────────────────────
     metrics.add_request();
@@ -682,7 +684,7 @@ async fn open_precompressed_variant(
     preferred: Encoding,
     content_type: &str,
 ) -> std::result::Result<Option<PrecompressedVariant>, std::io::Error> {
-    if !should_compress(content_type, 1_024) {
+    if preferred == Encoding::Identity || !encoding::is_compressible_content_type(content_type) {
         return Ok(None);
     }
 
@@ -940,7 +942,21 @@ fn client_not_modified_since<B>(req: &Request<B>, metadata: &std::fs::Metadata) 
     let Ok(modified) = metadata.modified() else {
         return false;
     };
-    modified <= client_time
+    let Some(modified_secs) = modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+    else {
+        return false;
+    };
+    let Some(client_secs) = client_time
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+    else {
+        return false;
+    };
+    modified_secs <= client_secs
 }
 
 fn not_modified_response(
@@ -1042,7 +1058,7 @@ pub fn parse_range<B>(
 ///
 /// | Header                     | Condition  | Value                                          |
 /// |----------------------------|------------|------------------------------------------------|
-/// | `Strict-Transport-Security`| HTTPS only | `max-age=63072000; includeSubDomains`          |
+/// | `Strict-Transport-Security`| HTTPS only | `max-age=31536000; includeSubDomains`          |
 /// | `X-Content-Type-Options`   | always     | `nosniff`                                      |
 /// | `X-Frame-Options`          | always     | `SAMEORIGIN`                                   |
 ///
@@ -1062,7 +1078,7 @@ async fn inject_security_headers(
     if is_https {
         h.insert(
             header::STRICT_TRANSPORT_SECURITY,
-            header::HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+            header::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
         );
         if let Some(value) = onion_location_header_value(req, state).await {
             h.insert(header::HeaderName::from_static("onion-location"), value);
