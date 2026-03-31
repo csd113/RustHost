@@ -72,17 +72,15 @@ fn parse_quality_value(raw: &str) -> Option<u16> {
     let (whole, fractional) = raw.split_once('.').map_or((raw, ""), |parts| parts);
     match whole {
         "0" => {
-            let digits = fractional
-                .chars()
-                .take(3)
-                .map(|c| c.to_digit(10))
-                .collect::<Option<Vec<_>>>()?;
             let mut thousandths = 0u16;
-            for digit in digits {
+            let mut seen = 0usize;
+            for ch in fractional.chars().take(3) {
+                let digit = ch.to_digit(10)?;
                 thousandths = thousandths.saturating_mul(10);
                 thousandths = thousandths.saturating_add(u16::try_from(digit).ok()?);
+                seen = seen.saturating_add(1);
             }
-            let scale = 3usize.saturating_sub(fractional.len().min(3));
+            let scale = 3usize.saturating_sub(seen);
             Some(thousandths.saturating_mul(10u16.saturating_pow(u32::try_from(scale).ok()?)))
         }
         "1" => {

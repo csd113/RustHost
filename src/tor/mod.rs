@@ -273,6 +273,7 @@ fn log_onion_banner(onion_name: &str) {
     log::info!(
         "Tor onion service active: {display_prefix}….onion (full address visible in dashboard)"
     );
+    log::info!("Tor onion service address: {onion_name}");
 }
 
 async fn process_streams(
@@ -557,7 +558,9 @@ fn backoff_delay(attempt: u32, base_secs: u64, max_secs: u64) -> Duration {
 
 fn format_local_addr(addr: IpAddr, port: u16) -> String {
     match addr {
+        IpAddr::V4(a) if a.is_unspecified() => format!("127.0.0.1:{port}"),
         IpAddr::V4(a) => format!("{a}:{port}"),
+        IpAddr::V6(a) if a.is_unspecified() => format!("[::1]:{port}"),
         IpAddr::V6(a) => format!("[{a}]:{port}"),
     }
 }
@@ -642,7 +645,8 @@ mod backoff_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::onion_address_from_pubkey;
+    use super::{format_local_addr, onion_address_from_pubkey};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     const ZERO_KEY_ONION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaam2dqd.onion";
 
@@ -676,6 +680,22 @@ mod tests {
         assert_ne!(
             onion_address_from_pubkey(&[0u8; 32]),
             onion_address_from_pubkey(&[1u8; 32])
+        );
+    }
+
+    #[test]
+    fn unspecified_ipv4_formats_as_loopback_for_local_proxying() {
+        assert_eq!(
+            format_local_addr(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080),
+            "127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn unspecified_ipv6_formats_as_loopback_for_local_proxying() {
+        assert_eq!(
+            format_local_addr(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8080),
+            "[::1]:8080"
         );
     }
 }

@@ -11,6 +11,19 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Simplified updates
 
+- Added stronger static-file delivery polish with `Last-Modified` revalidation, precompressed asset sidecar support (`.br` / `.gz`), and a lighter-weight identity streaming path for common uncompressed responses.
+- Moved the initial site scan off the startup critical path, skipping it in headless mode so the server can begin accepting traffic sooner.
+- Added a shared reload path that also responds to `SIGHUP`, making headless deployments easier to operate without relying on the interactive dashboard.
+- Improved headless runtime output so startup summarizes HTTP/HTTPS/site/Tor state, and Tor now logs the full onion address explicitly when it becomes ready.
+- Removed a small hot-path allocation from `Accept-Encoding` parsing by switching quality-value parsing to a fixed-width stack-only loop.
+- Reworked listener lifecycle management so HTTP, HTTPS, and redirect servers continuously reap completed connection tasks instead of retaining them until shutdown.
+- Moved access-log disk writes onto a bounded background worker, preventing request handling from blocking on synchronous access-log I/O and surfacing dropped-log backpressure when the queue overflows.
+- Hardened HTTPS redirect startup by validating redirect configs up front and requiring the redirect listener to bind successfully before startup continues.
+- Switched generated defaults to safer production behavior by disabling automatic port fallback and built-in Tor until an operator explicitly enables them.
+- Made graceful shutdown budgets configurable and applied them consistently to HTTP, HTTPS, redirect, and Tor drain behavior so normal restarts are less likely to cut off slow transfers.
+- Made HTTPS startup fail closed so TLS configuration or HTTPS bind failures now stop startup instead of silently falling back to insecure HTTP-only serving.
+- Fixed Tor's internal upstream address selection so onion traffic always connects back through loopback when the public listener is bound to `0.0.0.0` or `::`.
+- Moved per-request filesystem path resolution onto Tokio's blocking pool to avoid starving the async runtime under slow-disk or hostile request load.
 - Tightened connection admission so HTTP, HTTPS, and redirect listeners reject overflow immediately instead of holding accepted sockets open while waiting for permits.
 - Completed the shared response hardening path so redirects, `OPTIONS`, `405`, `304`, and other non-file responses now receive the full security-header set consistently.
 - Wired `site.error_503` into runtime serving and preload custom error pages at startup with size limits, removing per-request reloads and dead config.

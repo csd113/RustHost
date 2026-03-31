@@ -114,6 +114,7 @@ hyper      = { version = "1",   features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 bytes          = "1"
+httpdate       = "1"
 
 # async-compression provides Brotli and Gzip stream encoders. Brotli gives
 # significantly better compression ratios than Gzip, which matters a lot for

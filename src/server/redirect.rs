@@ -25,11 +25,20 @@ use dashmap::DashMap;
 use tokio::{
     io::AsyncWriteExt as _,
     net::TcpListener,
-    sync::{watch, Semaphore},
+    sync::{oneshot, watch, Semaphore},
+    task::JoinSet,
 };
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub struct RedirectServerConfig {
+    pub bind_addr: IpAddr,
+    pub plain_port: u16,
+    pub tls_port: u16,
+    pub max_per_ip: u32,
+    pub drain_timeout: Duration,
+}
 
 struct PerIpGuard {
     counter: Arc<AtomicU32>,
@@ -97,14 +106,19 @@ fn try_acquire_per_ip(
 /// This avoids pulling the request body, keep-alive handling, or any response
 /// body into what is effectively a TCP-level redirect pump.
 pub async fn run_redirect_server(
-    bind_addr: IpAddr,
-    plain_port: u16,
-    tls_port: u16,
+    config: RedirectServerConfig,
     mut shutdown: watch::Receiver<bool>,
+    port_tx: oneshot::Sender<u16>,
     semaphore: Arc<Semaphore>,
     per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
-    max_per_ip: u32,
 ) {
+    let RedirectServerConfig {
+        bind_addr,
+        plain_port,
+        tls_port,
+        max_per_ip,
+        drain_timeout,
+    } = config;
     let bind_socket = std::net::SocketAddr::new(bind_addr, plain_port);
     let listener = match TcpListener::bind(bind_socket).await {
         Ok(l) => l,
@@ -113,10 +127,12 @@ pub async fn run_redirect_server(
             return;
         }
     };
+    let _ = port_tx.send(plain_port);
     log::info!(
         "HTTP-redirect server listening on {bind_addr}:{plain_port} \
          → HTTPS port {tls_port}"
     );
+    let mut join_set: JoinSet<()> = JoinSet::new();
 
     loop {
         tokio::select! {
@@ -139,7 +155,7 @@ pub async fn run_redirect_server(
                             drop(stream);
                             continue;
                         };
-                        tokio::spawn(async move {
+                        join_set.spawn(async move {
                             let _permit = permit;
                             let _ip_guard = ip_guard;
                             handle_redirect(&mut stream, bind_addr, tls_port).await;
@@ -150,12 +166,19 @@ pub async fn run_redirect_server(
                     }
                 }
             }
+            Some(result) = join_set.join_next(), if !join_set.is_empty() => {
+                if let Err(e) = result {
+                    log::debug!("Redirect connection task join error: {e}");
+                }
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { break; }
             }
         }
     }
 
+    let drain = async { while join_set.join_next().await.is_some() {} };
+    let _ = tokio::time::timeout(drain_timeout, drain).await;
     log::info!("HTTP-redirect server stopped.");
 }
 

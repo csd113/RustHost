@@ -103,6 +103,9 @@ fn validate(cfg: &Config) -> Result<()> {
             cfg.server.max_connections_per_ip, cfg.server.max_connections
         ));
     }
+    if cfg.server.shutdown_grace_secs == 0 {
+        errors.push("[server] shutdown_grace_secs must be at least 1".into());
+    }
 
     // [site]
     if cfg.site.directory.is_empty() {
@@ -193,6 +196,21 @@ fn validate(cfg: &Config) -> Result<()> {
 
     validate_redirects(cfg, &mut errors);
 
+    if cfg.tor.shutdown_grace_secs == 0 {
+        errors.push("[tor] shutdown_grace_secs must be at least 1".into());
+    }
+
+    if cfg.tls.redirect_http {
+        if !cfg.tls.enabled {
+            errors.push("[tls] redirect_http requires [tls] enabled = true".into());
+        }
+        if cfg.tls.http_port == cfg.server.port {
+            errors.push(
+                "[tls] http_port must differ from [server] port when redirect_http = true".into(),
+            );
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -249,6 +267,46 @@ mod tests {
         cfg.server.max_connections = 32;
         cfg.server.max_connections_per_ip = 32;
         assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_shutdown_grace_zero_is_rejected() {
+        let mut cfg = valid();
+        cfg.server.shutdown_grace_secs = 0;
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("shutdown_grace_secs"))),
+            "expected ConfigValidation error mentioning shutdown_grace_secs, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_redirect_http_requires_tls_enabled() {
+        let mut cfg = valid();
+        cfg.tls.redirect_http = true;
+        cfg.tls.enabled = false;
+        cfg.tls.http_port = std::num::NonZeroU16::new(8081).unwrap_or(std::num::NonZeroU16::MIN);
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("redirect_http requires"))),
+            "expected ConfigValidation error mentioning redirect_http requires tls, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_redirect_http_rejects_port_conflict() {
+        let mut cfg = valid();
+        cfg.tls.enabled = true;
+        cfg.tls.redirect_http = true;
+        cfg.tls.http_port = cfg.server.port;
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("http_port must differ"))),
+            "expected ConfigValidation error mentioning http_port conflict, got: {result:?}"
+        );
     }
 
     // ── validate — [site] directory ─────────────────────────────────────────

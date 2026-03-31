@@ -132,10 +132,11 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
             bind: "127.0.0.1"
                 .parse()
                 .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-            auto_port_fallback: true,
+            auto_port_fallback: false,
             open_browser_on_start: false,
             max_connections: 256,
             max_connections_per_ip: 16,
+            shutdown_grace_secs: 30,
             csp_level: CspLevel::Off,
             trusted_proxies: None,
         },
@@ -150,6 +151,7 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
         },
         tor: TorConfig {
             enabled: tor_enabled,
+            shutdown_grace_secs: 30,
         },
         logging: LoggingConfig {
             enabled: false,
@@ -233,24 +235,33 @@ async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
 // ─── Extracted helpers for normal_run_with_config ─────────────────────────────
 
 /// Scan the site directory and populate initial file stats in shared state.
-async fn init_site_scan(config: &Config, state: &SharedState, data_dir: &Path) {
-    let site_root = data_dir.join(&config.site.directory);
-    let scan_root = site_root.clone();
-    let (count, bytes) =
-        match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                log::warn!("Could not scan site directory on startup: {e}");
-                (0, 0)
-            }
-            Err(e) => {
-                log::warn!("Site scan task panicked on startup: {e}");
-                (0, 0)
-            }
-        };
-    let mut s = state.write().await;
-    s.site_file_count = count;
-    s.site_total_bytes = bytes;
+fn schedule_initial_site_scan(config: &Arc<Config>, state: &SharedState, data_dir: &Path) {
+    if !config.console.interactive {
+        return;
+    }
+
+    let cfg = Arc::clone(config);
+    let st = Arc::clone(state);
+    let data_dir = data_dir.to_path_buf();
+    tokio::spawn(async move {
+        let site_root = data_dir.join(&cfg.site.directory);
+        let scan_root = site_root.clone();
+        let (count, bytes) =
+            match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    log::warn!("Could not scan site directory on startup: {e}");
+                    (0, 0)
+                }
+                Err(e) => {
+                    log::warn!("Site scan task panicked on startup: {e}");
+                    (0, 0)
+                }
+            };
+        let mut s = st.write().await;
+        s.site_file_count = count;
+        s.site_total_bytes = bytes;
+    });
 }
 
 // ─── Core startup ─────────────────────────────────────────────────────────────
@@ -282,13 +293,10 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
         state.write().await.tor_status = TorStatus::Disabled;
     }
 
-    // 5. Scan site directory for initial file stats.
-    init_site_scan(&config, &state, &data_dir).await;
-
-    // 6. Shutdown channels.
+    // 5. Shutdown channels.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // 7. Start HTTP server task.
+    // 6. Start HTTP server task.
     let (port_tx, port_rx) = oneshot::channel::<u16>();
     #[allow(clippy::cast_possible_truncation)]
     let budget = SharedConnectionBudget {
@@ -308,7 +316,7 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     );
 
     // Wait for the server to signal its bound port via the oneshot channel.
-    let bind_port = match wait_for_bind_port(port_rx).await {
+    let bind_port = match wait_for_bind_port(port_rx, "HTTP server").await {
         Ok(port) => port,
         Err(err) => {
             let _ = shutdown_tx.send(true);
@@ -322,7 +330,7 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
         }
     };
 
-    // 7b. TLS / HTTPS — optional, non-fatal.
+    // 6b. TLS / HTTPS — optional, non-fatal.
     let background_tasks = setup_tls(
         &config,
         &state,
@@ -332,9 +340,12 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
         &budget,
         &root_tx,
     )
-    .await;
+    .await
+    .inspect_err(|_| {
+        let _ = shutdown_tx.send(true);
+    })?;
 
-    // 8. Start Tor (if enabled).
+    // 7. Start Tor (if enabled).
     //    tor::init() spawns a Tokio task and returns its JoinHandle.
     //    Pass shutdown_rx so Tor's stream loop exits on clean shutdown.
     let tor_handle = if config.tor.enabled {
@@ -352,17 +363,19 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
         None
     };
 
-    // 9. Start console UI.
-    let key_rx = start_console(&config, &state, &metrics, shutdown_rx.clone()).await?;
+    schedule_initial_site_scan(&config, &state, &data_dir);
 
-    // 10. Open browser (if configured).
+    // 8. Start console UI.
+    let key_rx = start_console(&config, &state, &metrics, shutdown_rx.clone(), &data_dir).await?;
+
+    // 9. Open browser (if configured).
     maybe_open_browser(&config, &state).await;
 
-    // 11. Event dispatch loop.
+    // 10. Event dispatch loop.
     event_loop(key_rx, &config, &state, &metrics, data_dir, root_tx).await?;
 
-    // 12. Graceful shutdown.
-    graceful_shutdown(shutdown_tx, server_handle, tor_handle, background_tasks).await;
+    // 11. Graceful shutdown.
+    graceful_shutdown(&config, shutdown_tx, server_handle, tor_handle, background_tasks).await;
     Ok(())
 }
 
@@ -419,6 +432,7 @@ async fn start_console(
     state: &SharedState,
     metrics: &SharedMetrics,
     shutdown: watch::Receiver<bool>,
+    data_dir: &Path,
 ) -> Result<Option<mpsc::UnboundedReceiver<events::KeyEvent>>> {
     if config.console.interactive {
         let rx = console::start(
@@ -429,10 +443,39 @@ async fn start_console(
         )?;
         Ok(Some(rx))
     } else {
-        let port = state.read().await.actual_port;
-        println!("RustHost running on http://{}:{port}", config.server.bind);
+        let snapshot = state.read().await.clone();
+        println!("RustHost running");
+        println!(" HTTP : http://{}:{}", config.server.bind, snapshot.actual_port);
+        if snapshot.tls_running {
+            if let Some(tls_port) = snapshot.tls_port {
+                println!(" HTTPS: https://{}:{tls_port}", config.server.bind);
+            }
+        }
+        println!(" Site : {}", data_dir.join(&config.site.directory).display());
+        println!(
+            " Tor  : {}",
+            if config.tor.enabled { "enabled" } else { "disabled" }
+        );
         Ok(None)
     }
+}
+
+#[cfg(unix)]
+fn make_sighup_signal() -> Option<tokio::signal::unix::Signal> {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    match signal(SignalKind::hangup()) {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            log::warn!("Could not register SIGHUP handler: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn make_sighup_signal() -> Option<()> {
+    None
 }
 
 // ─── SIGTERM helper ───────────────────────────────────────────────────────────
@@ -501,6 +544,7 @@ async fn event_loop(
     // Pin ctrl_c so it can be polled repeatedly inside select! without moving.
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    let mut sighup = make_sighup_signal();
 
     // SIGTERM handling — cross-platform design note
     // ─────────────────────────────────────────────
@@ -528,6 +572,21 @@ async fn event_loop(
             if let Some(rx) = key_rx.as_mut() {
                 rx.recv().await
             } else {
+                std::future::pending().await
+            }
+        };
+        let sighup_fut = async {
+            #[cfg(unix)]
+            {
+                if let Some(stream) = sighup.as_mut() {
+                    stream.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = &sighup;
                 std::future::pending().await
             }
         };
@@ -567,6 +626,12 @@ async fn event_loop(
             () = &mut sigterm => {
                 log::info!("SIGTERM received — shutting down gracefully.");
                 break;
+            }
+            maybe_hup = sighup_fut => {
+                if maybe_hup.is_some() {
+                    log::info!("SIGHUP received — reloading site state.");
+                    events::reload_site(config, Arc::clone(state), data_dir.clone(), &root_tx).await?;
+                }
             }
         }
     }

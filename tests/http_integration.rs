@@ -333,6 +333,7 @@ impl HttpsTestServer {
         let config = Arc::new(config);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let cert_path = data_dir.join("tls/dev/self-signed.crt");
+        let (tls_port_tx, _tls_port_rx) = tokio::sync::oneshot::channel::<u16>();
         let handle = tokio::spawn(async move {
             rusthost::server::run_https(
                 config,
@@ -341,6 +342,7 @@ impl HttpsTestServer {
                 data_dir,
                 shutdown_rx,
                 acceptor,
+                tls_port_tx,
                 conn_semaphore,
                 ip_connections,
                 root_rx,
@@ -877,6 +879,78 @@ async fn get_nonexistent_file_returns_404() -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn last_modified_supports_if_modified_since_revalidation(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"<h1>cache me</h1>")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let initial = server
+        .send(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let last_modified = header_value(&initial, "last-modified")?
+        .ok_or("expected Last-Modified header on initial response")?;
+
+    let revalidated = server
+        .send(
+            format!(
+                "GET /index.html HTTP/1.1\r\nHost: localhost\r\nIf-Modified-Since: {last_modified}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&revalidated)?, 304);
+    assert!(
+        body_is_empty(&revalidated)?,
+        "304 response must not include a body:\n{}",
+        response_to_str(&revalidated)?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn serves_precompressed_sidecar_when_client_accepts_brotli(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[
+        ("app.js", b"console.log('original');"),
+        ("app.js.br", b"pretend-brotli-bytes"),
+    ])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(
+            b"GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br, gzip\r\n\r\n",
+        )
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert_eq!(
+        header_value(&response, "content-encoding")?.as_deref(),
+        Some("br")
+    );
+    assert_eq!(
+        header_value(&response, "vary")?.as_deref(),
+        Some("Accept-Encoding")
+    );
+    assert!(
+        response_to_str(&response)?.contains("pretend-brotli-bytes"),
+        "expected server to return sidecar contents:\n{}",
+        response_to_str(&response)?
+    );
+    Ok(())
+}
+
 // This test previously asserted status 400 for a POST request, which encoded
 // the *incorrect* behaviour (RFC 9110 §15.5.6 requires 405 + Allow header for
 // known-but-disallowed methods).  The old assertion would pass when the bug was
@@ -1090,13 +1164,17 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let handle = tokio::spawn(async move {
         rusthost::server::redirect::run_redirect_server(
-            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            plain_port,
-            tls_port,
+            rusthost::server::redirect::RedirectServerConfig {
+                bind_addr: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                plain_port,
+                tls_port,
+                max_per_ip: 8,
+                drain_timeout: Duration::from_secs(5),
+            },
             shutdown_rx,
+            tokio::sync::oneshot::channel::<u16>().0,
             Arc::new(Semaphore::new(8)),
             Arc::new(DashMap::new()),
-            8,
         )
         .await;
     });

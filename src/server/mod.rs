@@ -345,6 +345,11 @@ pub async fn run(
                     }
                 }
             }
+            Some(result) = join_set.join_next(), if !join_set.is_empty() => {
+                if let Err(e) = result {
+                    log::debug!("HTTP connection task join error: {e}");
+                }
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { break; }
             }
@@ -353,7 +358,11 @@ pub async fn run(
     state.write().await.server_running = false;
     log::info!("HTTP server stopped accepting; draining in-flight connections…");
     let drain = async { while join_set.join_next().await.is_some() {} };
-    let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(config.server.shutdown_grace_secs),
+        drain,
+    )
+    .await;
     log::info!("HTTP server drained.");
 }
 /// Start the HTTPS server.
@@ -385,6 +394,7 @@ pub async fn run_https(
     data_dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
     tls_acceptor: Acceptor,
+    port_tx: oneshot::Sender<u16>,
     shared_semaphore: Arc<Semaphore>,
     shared_per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
     mut root_watch: watch::Receiver<Arc<Path>>,
@@ -420,6 +430,7 @@ pub async fn run_https(
         s.tls_running = true;
         s.tls_port = Some(port);
     }
+    let _ = port_tx.send(port);
     log::info!("HTTPS server listening on {bind_addr}:{port}");
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
@@ -569,6 +580,11 @@ pub async fn run_https(
                     }
                 }
             }
+            Some(result) = join_set.join_next(), if !join_set.is_empty() => {
+                if let Err(e) = result {
+                    log::debug!("HTTPS connection task join error: {e}");
+                }
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() { break; }
             }
@@ -577,7 +593,11 @@ pub async fn run_https(
     state.write().await.tls_running = false;
     log::info!("HTTPS server stopped accepting; draining in-flight connections…");
     let drain = async { while join_set.join_next().await.is_some() {} };
-    let _ = tokio::time::timeout(Duration::from_secs(5), drain).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(config.server.shutdown_grace_secs),
+        drain,
+    )
+    .await;
     log::info!("HTTPS server drained.");
 }
 // ─── Port binding ─────────────────────────────────────────────────────────────

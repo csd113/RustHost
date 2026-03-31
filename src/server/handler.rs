@@ -29,6 +29,7 @@ use std::{path::Path, sync::Arc};
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use http_body_util::{BodyExt as _, Full, StreamBody};
+use httpdate::{fmt_http_date, parse_http_date};
 use hyper::{body::Incoming, header, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
@@ -50,6 +51,7 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 
 const MAX_REQUEST_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_CUSTOM_ERROR_PAGE_BYTES: u64 = 64 * 1024;
+const IDENTITY_STREAM_CHUNK_BYTES: usize = 128 * 1024;
 fn full_body(data: impl Into<Bytes>) -> BoxBody {
     Full::new(data.into()).map_err(|e| match e {}).boxed()
 }
@@ -63,6 +65,17 @@ where
     R: tokio::io::AsyncRead + Send + Sync + 'static,
 {
     StreamBody::new(ReaderStream::new(reader).map_ok(hyper::body::Frame::data)).boxed()
+}
+
+fn identity_reader_body<R>(reader: R) -> BoxBody
+where
+    R: tokio::io::AsyncRead + Send + Sync + 'static,
+{
+    StreamBody::new(
+        ReaderStream::with_capacity(reader, IDENTITY_STREAM_CHUNK_BYTES)
+            .map_ok(hyper::body::Frame::data),
+    )
+    .boxed()
 }
 
 // ─── Feature flags ───────────────────────────────────────────────────────────
@@ -305,18 +318,31 @@ async fn route(
         }
     }
 
-    let opts = ResolveOptions {
-        canonical_root: &cfg.canonical_root,
-        url_path: &decoded,
-        index_file: &cfg.index_file,
-        dir_listing: cfg.flags.dir_listing,
-        expose_dotfiles: cfg.flags.expose_dotfiles,
-        spa_routing: cfg.flags.spa_routing,
-        error_404_page: cfg.error_404_page.clone(),
-    };
+    let canonical_root = Arc::clone(&cfg.canonical_root);
+    let index_file = Arc::clone(&cfg.index_file);
+    let decoded_for_resolve = decoded.clone();
+    let error_404_page = cfg.error_404_page.clone();
+    let dir_listing = cfg.flags.dir_listing;
+    let expose_dotfiles = cfg.flags.expose_dotfiles;
+    let spa_routing = cfg.flags.spa_routing;
+
+    let resolved = tokio::task::spawn_blocking(move || {
+        let opts = ResolveOptions {
+            canonical_root: canonical_root.as_ref(),
+            url_path: &decoded_for_resolve,
+            index_file: index_file.as_ref(),
+            dir_listing,
+            expose_dotfiles,
+            spa_routing,
+            error_404_page,
+        };
+        resolve_path(&opts)
+    })
+        .await
+        .map_err(|e| std::io::Error::other(format!("path resolution task panicked: {e}")))?;
 
     let resp = dispatch_resolved(
-        resolve_path(&opts),
+        resolved,
         &req,
         is_head,
         metrics,
@@ -492,6 +518,7 @@ fn external_redirect_response(
 
 /// Serve a file, honouring conditional GET (H-9), Range (H-13), and
 /// Accept-Encoding compression (H-8).
+#[allow(clippy::too_many_lines)] // file serving intentionally centralizes validators and sidecar selection
 async fn serve_file(
     req: &Request<Incoming>,
     abs_path: &std::path::Path,
@@ -528,25 +555,35 @@ async fn serve_file(
     let content_type = mime::for_extension(ext);
     let path_str = abs_path.to_str().unwrap_or("");
     let etag = weak_etag(&metadata);
+    let last_modified = last_modified_header(&metadata);
 
     // ── ETag / conditional GET (H-9) ─────────────────────────────────────────
     if client_etag_matches(req, &etag) {
         metrics.add_request();
-        let resp = Response::builder()
-            .status(StatusCode::NOT_MODIFIED)
-            .header("ETag", &etag)
-            .header("Cache-Control", cache_control_for(content_type, path_str))
-            .body(empty_body())
-            .unwrap_or_default();
+        let resp = not_modified_response(&etag, last_modified.as_deref(), content_type, path_str);
+        return Ok(resp);
+    }
+    if client_not_modified_since(req, &metadata) {
+        metrics.add_request();
+        let resp = not_modified_response(&etag, last_modified.as_deref(), content_type, path_str);
         return Ok(resp);
     }
 
     // ── Range request (H-13) ─────────────────────────────────────────────────
     if let Some(range_result) = parse_range(req, file_len) {
         return if let Ok(range) = range_result {
-            let response =
-                build_range_response(file, range, file_len, content_type, path_str, is_head, csp, &etag)
-                    .await?;
+            let response = build_range_response(
+                file,
+                range,
+                file_len,
+                content_type,
+                path_str,
+                is_head,
+                csp,
+                &etag,
+                last_modified.as_deref(),
+            )
+            .await?;
             metrics.add_request();
             Ok(response)
         } else {
@@ -561,9 +598,90 @@ async fn serve_file(
         };
     }
 
+    let preferred_encoding = if should_compress(content_type, file_len) {
+        best_encoding(req)
+    } else {
+        Encoding::Identity
+    };
+
+    if let Some(sidecar) =
+        open_precompressed_variant(abs_path, preferred_encoding, content_type).await?
+    {
+        let etag = strong_variant_etag(&sidecar.metadata, sidecar.encoding_token);
+        let last_modified = last_modified_header(&sidecar.metadata);
+        if client_etag_matches(req, &etag) || client_not_modified_since(req, &sidecar.metadata) {
+            metrics.add_request();
+            return Ok(not_modified_variant_response(
+                &etag,
+                last_modified.as_deref(),
+                content_type,
+                path_str,
+                sidecar.content_encoding,
+            ));
+        }
+        metrics.add_request();
+        return build_precompressed_response(sidecar, content_type, path_str, is_head, csp, &etag);
+    }
+
     // ── Full-file response ────────────────────────────────────────────────────
     metrics.add_request();
-    build_full_response(req, file, file_len, content_type, path_str, is_head, csp, &etag)
+    build_full_response(
+        preferred_encoding,
+        file,
+        file_len,
+        content_type,
+        path_str,
+        is_head,
+        csp,
+        &etag,
+        last_modified.as_deref(),
+    )
+}
+
+struct PrecompressedVariant {
+    file: tokio::fs::File,
+    metadata: std::fs::Metadata,
+    content_encoding: &'static str,
+    encoding_token: &'static str,
+}
+
+async fn open_precompressed_variant(
+    abs_path: &std::path::Path,
+    preferred: Encoding,
+    content_type: &str,
+) -> std::result::Result<Option<PrecompressedVariant>, std::io::Error> {
+    if !should_compress(content_type, 1_024) {
+        return Ok(None);
+    }
+
+    let candidates: &[(&str, &str)] = match preferred {
+        Encoding::Brotli => &[("br", "br"), ("gz", "gzip")],
+        Encoding::Gzip => &[("gz", "gzip")],
+        Encoding::Identity => &[],
+    };
+
+    for (suffix, content_encoding) in candidates {
+        let variant_path = abs_path.with_extension(format!(
+            "{}.{suffix}",
+            abs_path.extension().and_then(|ext| ext.to_str()).unwrap_or("")
+        ));
+        let file = match tokio::fs::File::open(&variant_path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let metadata = file.metadata().await?;
+        if metadata.is_file() {
+            return Ok(Some(PrecompressedVariant {
+                file,
+                metadata,
+                content_encoding,
+                encoding_token: suffix,
+            }));
+        }
+    }
+
+    Ok(None)
 }
 
 async fn build_range_response(
@@ -575,6 +693,7 @@ async fn build_range_response(
     is_head: bool,
     csp: &str,
     etag: &str,
+    last_modified: Option<&str>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
     use tokio::io::AsyncSeekExt as _;
 
@@ -583,7 +702,7 @@ async fn build_range_response(
     let (body, content_encoding) = if is_head {
         (empty_body(), None)
     } else {
-        compress_body(file, send_len, Encoding::Identity)
+        stream_body(file, send_len, Encoding::Identity)
     };
 
     let mut builder = Response::builder()
@@ -596,6 +715,9 @@ async fn build_range_response(
         .header("ETag", etag)
         .header("Cache-Control", cache_control_for(content_type, path_str))
         .header(header::CONTENT_TYPE, content_type);
+    if let Some(last_modified) = last_modified {
+        builder = builder.header(header::LAST_MODIFIED, last_modified);
+    }
     builder = security_headers(builder, csp, content_type);
     if let Some(enc) = content_encoding {
         builder = builder
@@ -609,7 +731,7 @@ async fn build_range_response(
 }
 
 fn build_full_response(
-    req: &Request<Incoming>,
+    encoding: Encoding,
     file: tokio::fs::File,
     file_len: u64,
     content_type: &str,
@@ -617,24 +739,25 @@ fn build_full_response(
     is_head: bool,
     csp: &str,
     etag: &str,
+    last_modified: Option<&str>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
-    let encoding = if should_compress(content_type, file_len) {
-        best_encoding(req)
-    } else {
-        Encoding::Identity
-    };
     let (body, content_encoding) = if is_head {
         (empty_body(), None)
     } else {
-        compress_body(file, file_len, encoding)
+        stream_body(file, file_len, encoding)
     };
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .header("Accept-Ranges", "bytes")
         .header("ETag", etag)
         .header("Cache-Control", cache_control_for(content_type, path_str));
+    if let Some(last_modified) = last_modified {
+        builder = builder.header(header::LAST_MODIFIED, last_modified);
+    }
+    if content_encoding.is_none() {
+        builder = builder.header("Accept-Ranges", "bytes");
+    }
     builder = security_headers(builder, csp, content_type);
     if let Some(enc) = content_encoding {
         builder = builder
@@ -647,13 +770,44 @@ fn build_full_response(
     finalize_response(builder, body, "file response")
 }
 
+fn build_precompressed_response(
+    variant: PrecompressedVariant,
+    content_type: &str,
+    path_str: &str,
+    is_head: bool,
+    csp: &str,
+    etag: &str,
+) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    let last_modified = last_modified_header(&variant.metadata);
+    let content_length = variant.metadata.len();
+    let body = if is_head {
+        empty_body()
+    } else {
+        identity_reader_body(variant.file.take(content_length))
+    };
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_ENCODING, variant.content_encoding)
+        .header(header::VARY, "Accept-Encoding")
+        .header(header::CONTENT_LENGTH, content_length)
+        .header("ETag", etag)
+        .header("Cache-Control", cache_control_for(content_type, path_str));
+    if let Some(last_modified) = last_modified.as_deref() {
+        builder = builder.header(header::LAST_MODIFIED, last_modified);
+    }
+    builder = security_headers(builder, csp, content_type);
+    finalize_response(builder, body, "precompressed response")
+}
+
 /// Read up to `len` bytes from `file`, compressing according to `encoding`.
 ///
 /// Returns `(body, Some("br"|"gzip"))` when compression is applied, or
 /// `(body, None)` for identity encoding.
 ///
 /// The `len` cap respects Range requests — only the requested slice is read.
-fn compress_body(
+fn stream_body(
     file: tokio::fs::File,
     len: u64,
     encoding: Encoding,
@@ -671,7 +825,7 @@ fn compress_body(
             use tokio::io::BufReader;
             (reader_body(GzipEncoder::new(BufReader::new(handle))), Some("gzip"))
         }
-        Encoding::Identity => (reader_body(handle), None),
+        Encoding::Identity => (identity_reader_body(handle), None),
     }
 }
 
@@ -703,6 +857,20 @@ fn weak_etag(metadata: &std::fs::Metadata) -> String {
     format!("W/\"{}-{}\"", mtime, metadata.len())
 }
 
+fn strong_variant_etag(metadata: &std::fs::Metadata, suffix: &str) -> String {
+    use std::time::UNIX_EPOCH;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    format!("\"{}-{}-{suffix}\"", mtime, metadata.len())
+}
+
+fn last_modified_header(metadata: &std::fs::Metadata) -> Option<String> {
+    metadata.modified().ok().map(fmt_http_date)
+}
+
 /// Return `true` when the client's `If-None-Match` header matches `etag`.
 fn client_etag_matches<B>(req: &Request<B>, etag: &str) -> bool {
     req.headers()
@@ -716,6 +884,57 @@ fn client_etag_matches<B>(req: &Request<B>, etag: &str) -> bool {
             }
             strip(client_etag) == strip(etag) || client_etag == "*"
         })
+}
+
+fn client_not_modified_since<B>(req: &Request<B>, metadata: &std::fs::Metadata) -> bool {
+    let Some(if_modified_since) = req.headers().get(header::IF_MODIFIED_SINCE) else {
+        return false;
+    };
+    let Ok(if_modified_since) = if_modified_since.to_str() else {
+        return false;
+    };
+    let Ok(client_time) = parse_http_date(if_modified_since) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified <= client_time
+}
+
+fn not_modified_response(
+    etag: &str,
+    last_modified: Option<&str>,
+    content_type: &str,
+    path_str: &str,
+) -> Response<BoxBody> {
+    let mut builder = Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header("ETag", etag)
+        .header("Cache-Control", cache_control_for(content_type, path_str));
+    if let Some(last_modified) = last_modified {
+        builder = builder.header(header::LAST_MODIFIED, last_modified);
+    }
+    builder.body(empty_body()).unwrap_or_default()
+}
+
+fn not_modified_variant_response(
+    etag: &str,
+    last_modified: Option<&str>,
+    content_type: &str,
+    path_str: &str,
+    content_encoding: &str,
+) -> Response<BoxBody> {
+    let mut builder = Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header("ETag", etag)
+        .header("Cache-Control", cache_control_for(content_type, path_str))
+        .header(header::CONTENT_ENCODING, content_encoding)
+        .header(header::VARY, "Accept-Encoding");
+    if let Some(last_modified) = last_modified {
+        builder = builder.header(header::LAST_MODIFIED, last_modified);
+    }
+    builder.body(empty_body()).unwrap_or_default()
 }
 
 // ─── Range request parsing (H-13) ────────────────────────────────────────────

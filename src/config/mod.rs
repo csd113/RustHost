@@ -78,8 +78,14 @@ const fn default_redirect_status() -> u16 {
 const fn default_max_connections_per_ip() -> u32 {
     16
 }
+const fn default_shutdown_grace_secs() -> u64 {
+    30
+}
 const fn default_true() -> bool {
     true
+}
+const fn default_false() -> bool {
+    false
 }
 
 /// Server defaults
@@ -323,6 +329,11 @@ pub struct ServerConfig {
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: u32,
 
+    /// Maximum time to allow active HTTP/HTTPS connections to drain during
+    /// graceful shutdown before the process gives up and aborts remaining work.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
+
     /// Content-Security-Policy preset. See [`CspLevel`] for available values
     /// (`"off"`, `"relaxed"`, `"strict"`) and the header each one sends.
     /// Defaults to `"off"` — no CSP header, maximum browser compatibility.
@@ -386,8 +397,13 @@ pub struct SiteConfig {
 pub struct TorConfig {
     /// Master on/off switch. When `false`, Tor is never started and the
     /// onion address section of the dashboard is hidden.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub enabled: bool,
+
+    /// Maximum time to allow active onion-service streams to drain during
+    /// graceful shutdown before remaining tasks are aborted.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,10 +455,11 @@ impl Default for Config {
             server: ServerConfig {
                 port: default_server_port(),
                 bind: default_bind(),
-                auto_port_fallback: true,
+                auto_port_fallback: false,
                 open_browser_on_start: false,
                 max_connections: default_max_connections(),
                 max_connections_per_ip: default_max_connections_per_ip(),
+                shutdown_grace_secs: default_shutdown_grace_secs(),
                 csp_level: CspLevel::Off,
                 trusted_proxies: None,
             },
@@ -455,7 +472,10 @@ impl Default for Config {
                 error_404: None,
                 error_503: None,
             },
-            tor: TorConfig { enabled: true },
+            tor: TorConfig {
+                enabled: false,
+                shutdown_grace_secs: default_shutdown_grace_secs(),
+            },
             logging: LoggingConfig {
                 enabled: default_logging_enabled(),
                 level: default_logging_level(),

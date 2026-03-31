@@ -20,14 +20,19 @@ port = 8080
 # "0.0.0.0"   — reachable from LAN (use with care)
 bind = "127.0.0.1"
 
-# Silently try the next free port on conflict (up to 10 attempts).
-auto_port_fallback = true
+# Fail startup if the configured port is unavailable.
+# This is safer for production because firewalls, reverse proxies, and monitors
+# keep pointing at the configured port instead of a surprise fallback.
+auto_port_fallback = false
 
 # Open the system default browser at startup.
 open_browser_on_start = false
 
 # Maximum concurrent HTTP connections.
 max_connections = 256
+
+# Grace period for active HTTP/HTTPS requests during shutdown.
+shutdown_grace_secs = 30
 
 # Content-Security-Policy preset: "off" | "relaxed" | "strict"
 # (see full explanation below)
@@ -49,8 +54,12 @@ enable_directory_listing = false
 
 [tor]
 # Enable built-in Tor onion service (Arti client, no external binary needed).
-# First run downloads ~2 MB consensus (~30 s). Later runs are instant.
-enabled = true
+# Disabled by default so first-run installs do not publish an onion service
+# unless the operator explicitly opts in.
+enabled = false
+
+# Grace period for active Tor streams during shutdown.
+shutdown_grace_secs = 30
 
 # ─── [logging] ────────────────────────────────────────────────────────────────
 

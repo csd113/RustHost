@@ -29,6 +29,48 @@ pub enum KeyEvent {
     Other,
 }
 
+/// Reload site stats and refresh the canonical site root used by listeners.
+///
+/// # Errors
+///
+/// Returns [`AppError`] only if spawning the blocking rescan task fails at the
+/// Tokio task level. Filesystem scan failures are logged and degraded to a
+/// no-op so operators can retry reload without crashing the service.
+pub async fn reload_site(
+    config: &Config,
+    state: SharedState,
+    data_dir: PathBuf,
+    root_tx: &tokio::sync::watch::Sender<std::sync::Arc<std::path::Path>>,
+) -> Result<()> {
+    let site_root = data_dir.join(&config.site.directory);
+    let scan_root = site_root.clone();
+    let (count, bytes) = match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            log::warn!("Site rescan failed: {e}");
+            return Ok(());
+        }
+        Err(e) => {
+            log::warn!("Site rescan task panicked: {e}");
+            return Ok(());
+        }
+    };
+    {
+        let mut s = state.write().await;
+        s.site_file_count = count;
+        s.site_total_bytes = bytes;
+    }
+    if let Ok(new_root) = site_root.canonicalize() {
+        let _ = root_tx.send(Arc::from(new_root.as_path()));
+    }
+    log::info!(
+        "Site reloaded — {} files, {}",
+        count,
+        crate::runtime::state::format_bytes(bytes)
+    );
+    Ok(())
+}
+
 /// Dispatch a single key event, mutating shared state as needed.
 ///
 /// Returns `true` when the event is [`KeyEvent::Quit`] (the caller should
@@ -92,37 +134,7 @@ pub async fn handle(
         }
 
         KeyEvent::Reload => {
-            let site_root = data_dir.join(&config.site.directory);
-            // scan_site now returns Result and must run on a blocking
-            // thread (read_dir is not async-safe).
-            let scan_root = site_root.clone();
-            let (count, bytes) =
-                match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
-                    Ok(Ok(v)) => v,
-                    Ok(Err(e)) => {
-                        log::warn!("Site rescan failed: {e}");
-                        return Ok(false);
-                    }
-                    Err(e) => {
-                        log::warn!("Site rescan task panicked: {e}");
-                        return Ok(false);
-                    }
-                };
-            {
-                let mut s = state.write().await;
-                s.site_file_count = count;
-                s.site_total_bytes = bytes;
-            }
-            // push the newly-canonicalized site root to the server accept
-            // loop so it picks up any directory change without a restart.
-            if let Ok(new_root) = site_root.canonicalize() {
-                let _ = root_tx.send(Arc::from(new_root.as_path()));
-            }
-            log::info!(
-                "Site reloaded — {} files, {}",
-                count,
-                crate::runtime::state::format_bytes(bytes)
-            );
+            reload_site(config, state.clone(), data_dir.clone(), root_tx).await?;
         }
 
         KeyEvent::Open => {

@@ -3374,6 +3374,7 @@ dependencies = [
  "data-encoding",
  "futures",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "libc",

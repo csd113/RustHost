@@ -20,7 +20,12 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     path::Path,
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
+        Mutex, OnceLock,
+    },
+    thread,
 };
 
 use chrono::Local;
@@ -78,7 +83,21 @@ impl std::fmt::Display for AccessRecord<'_> {
 }
 
 /// Global access log writer.  Initialised by [`init_access_log`]; no-op until then.
-static ACCESS_LOG: OnceLock<Mutex<Option<LogFile>>> = OnceLock::new();
+static ACCESS_LOG: OnceLock<Mutex<Option<AccessLogState>>> = OnceLock::new();
+static ACCESS_LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+const ACCESS_LOG_QUEUE_CAPACITY: usize = 4_096;
+
+enum AccessLogCommand {
+    Line(String),
+    Shutdown,
+}
+
+struct AccessLogState {
+    path: std::path::PathBuf,
+    tx: SyncSender<AccessLogCommand>,
+    handle: thread::JoinHandle<()>,
+}
 
 /// Initialise the access log file.
 ///
@@ -139,6 +158,7 @@ pub fn init_access_log(data_dir: &Path) -> Result<()> {
         writes_since_check: 0,
         cached_size: 0,
     };
+    let new_state = spawn_access_log_worker(log_path.clone(), new_log)?;
 
     if let Some(existing) = ACCESS_LOG.get() {
         let mut guard = existing
@@ -148,13 +168,16 @@ pub fn init_access_log(data_dir: &Path) -> Result<()> {
             drop(guard);
             return Ok(());
         }
-        *guard = Some(new_log);
+        let old_state = guard.replace(new_state);
         drop(guard);
+        if let Some(old_state) = old_state {
+            stop_access_log_worker(old_state);
+        }
         return Ok(());
     }
 
     ACCESS_LOG
-        .set(Mutex::new(Some(new_log)))
+        .set(Mutex::new(Some(new_state)))
         .map_err(|_| AppError::LogInit("access log already initialized".into()))?;
     Ok(())
 }
@@ -165,9 +188,14 @@ pub fn init_access_log(data_dir: &Path) -> Result<()> {
 /// the file mutex for the duration of the write only.
 pub fn log_access(record: &AccessRecord<'_>) {
     if let Some(log) = ACCESS_LOG.get() {
-        if let Ok(mut lf) = log.lock() {
-            if let Some(file) = lf.as_mut() {
-                file.write_line(&record.to_string());
+        if let Ok(guard) = log.lock() {
+            if let Some(state) = guard.as_ref() {
+                match state.tx.try_send(AccessLogCommand::Line(record.to_string())) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                        let _ = ACCESS_LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
         }
     }
@@ -180,10 +208,10 @@ pub fn log_access(record: &AccessRecord<'_>) {
 pub fn shutdown_access_log() {
     if let Some(log) = ACCESS_LOG.get() {
         if let Ok(mut guard) = log.lock() {
-            if let Some(file) = guard.as_mut() {
-                let _ = file.file.flush();
+            if let Some(state) = guard.take() {
+                drop(guard);
+                stop_access_log_worker(state);
             }
-            *guard = None;
         }
     }
 }
@@ -321,6 +349,41 @@ impl LogFile {
             self.file = f;
             self.cached_size = 0;
         }
+    }
+}
+
+fn spawn_access_log_worker(path: std::path::PathBuf, file: LogFile) -> Result<AccessLogState> {
+    let (tx, rx) = sync_channel(ACCESS_LOG_QUEUE_CAPACITY);
+    let handle = thread::Builder::new()
+        .name("rusthost-access-log".into())
+        .spawn(move || access_log_worker(rx, file))
+        .map_err(|e| AppError::LogInit(format!("Cannot spawn access log worker: {e}")))?;
+    Ok(AccessLogState { path, tx, handle })
+}
+
+fn access_log_worker(rx: Receiver<AccessLogCommand>, mut file: LogFile) {
+    for command in rx {
+        match command {
+            AccessLogCommand::Line(line) => {
+                report_dropped_access_logs();
+                file.write_line(&line);
+            }
+            AccessLogCommand::Shutdown => break,
+        }
+    }
+    report_dropped_access_logs();
+    let _ = file.file.flush();
+}
+
+fn stop_access_log_worker(state: AccessLogState) {
+    let _ = state.tx.send(AccessLogCommand::Shutdown);
+    let _ = state.handle.join();
+}
+
+fn report_dropped_access_logs() {
+    let dropped = ACCESS_LOG_DROPPED.swap(0, Ordering::Relaxed);
+    if dropped > 0 {
+        log::warn!("Dropped {dropped} access log entries due to access-log backpressure");
     }
 }
 

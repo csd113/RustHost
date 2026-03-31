@@ -24,19 +24,22 @@ pub(super) struct BackgroundTasks {
     pub(super) acme_guard: Option<tls::acme::AcmeInitGuard>,
 }
 
-pub(super) async fn wait_for_bind_port(port_rx: oneshot::Receiver<u16>) -> Result<u16> {
+pub(super) async fn wait_for_bind_port(
+    port_rx: oneshot::Receiver<u16>,
+    label: &str,
+) -> Result<u16> {
     match tokio::time::timeout(Duration::from_secs(10), port_rx).await {
         Ok(Ok(port)) => Ok(port),
         Ok(Err(_)) => {
-            log::error!("Server port channel closed before sending — server failed to bind");
+            log::error!("{label} port channel closed before sending — startup failed");
             Err(AppError::ServerStartup(
-                "Server task exited before signalling its bound port".into(),
+                format!("{label} task exited before signalling its bound port"),
             ))
         }
         Err(_) => {
-            log::error!("Timed out waiting for server to bind");
+            log::error!("Timed out waiting for {label} to bind");
             Err(AppError::ServerStartup(
-                "Timed out waiting for server to bind (10 s)".into(),
+                format!("Timed out waiting for {label} to bind (10 s)"),
             ))
         }
     }
@@ -50,18 +53,19 @@ pub(super) async fn setup_tls(
     data_dir: &Path,
     budget: &SharedConnectionBudget,
     root_tx: &watch::Sender<Arc<std::path::Path>>,
-) -> BackgroundTasks {
+) -> Result<BackgroundTasks> {
     let mut tasks = BackgroundTasks::default();
 
     if !config.tls.enabled {
-        return tasks;
+        return Ok(tasks);
     }
 
     let tls_result = tls::build_acceptor(&config.tls, data_dir).await;
 
     match tls_result {
         Err(e) => {
-            log::error!("TLS init failed: {e}. Continuing in HTTP-only mode.");
+            log::error!("TLS init failed: {e}");
+            return Err(e);
         }
         Ok(None) => {}
         Ok(Some(tls_setup)) => {
@@ -98,6 +102,7 @@ pub(super) async fn setup_tls(
                 let tls_sem = std::sync::Arc::clone(&budget.semaphore);
                 let tls_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
                 let tls_root_rx = root_tx.subscribe();
+                let (tls_port_tx, tls_port_rx) = oneshot::channel::<u16>();
                 tasks.https = Some(tokio::spawn(async move {
                     server::run_https(
                         tls_config,
@@ -106,12 +111,14 @@ pub(super) async fn setup_tls(
                         tls_data_dir,
                         tls_shutdown,
                         acceptor,
+                        tls_port_tx,
                         tls_sem,
                         tls_ip_map,
                         tls_root_rx,
                     )
                     .await;
                 }));
+                wait_for_bind_port(tls_port_rx, "HTTPS server").await?;
             }
 
             if config.tls.redirect_http {
@@ -122,23 +129,31 @@ pub(super) async fn setup_tls(
                 let redir_sem = std::sync::Arc::clone(&budget.semaphore);
                 let redir_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
                 let redir_max_per_ip = config.server.max_connections_per_ip;
+                let redir_drain_timeout =
+                    Duration::from_secs(config.server.shutdown_grace_secs);
+                let (redir_port_tx, redir_port_rx) = oneshot::channel::<u16>();
                 tasks.redirect = Some(tokio::spawn(async move {
                     server::redirect::run_redirect_server(
-                        bind_addr,
-                        redir_plain_port,
-                        redir_tls_port,
+                        server::redirect::RedirectServerConfig {
+                            bind_addr,
+                            plain_port: redir_plain_port,
+                            tls_port: redir_tls_port,
+                            max_per_ip: redir_max_per_ip,
+                            drain_timeout: redir_drain_timeout,
+                        },
                         redir_shutdown,
+                        redir_port_tx,
                         redir_sem,
                         redir_ip_map,
-                        redir_max_per_ip,
                     )
                     .await;
                 }));
+                wait_for_bind_port(redir_port_rx, "HTTP redirect server").await?;
             }
         }
     }
 
-    tasks
+    Ok(tasks)
 }
 
 pub(super) async fn maybe_open_browser(config: &Config, state: &SharedState) {
@@ -159,11 +174,8 @@ pub(super) async fn maybe_open_browser(config: &Config, state: &SharedState) {
     super::super::open_browser(&url);
 }
 
-const DRAIN_HTTP_ONLY_SECS: u64 = 8;
-const DRAIN_HTTP_WITH_TOR_SECS: u64 = 5;
-const DRAIN_TOR_SECS: u64 = 10;
-
 pub(super) async fn graceful_shutdown(
+    config: &Config,
     shutdown_tx: watch::Sender<bool>,
     server_handle: tokio::task::JoinHandle<()>,
     tor_handle: Option<tokio::task::JoinHandle<()>>,
@@ -172,11 +184,7 @@ pub(super) async fn graceful_shutdown(
     log::info!("Shutting down…");
     let _ = shutdown_tx.send(true);
 
-    let http_budget = if tor_handle.is_some() {
-        Duration::from_secs(DRAIN_HTTP_WITH_TOR_SECS)
-    } else {
-        Duration::from_secs(DRAIN_HTTP_ONLY_SECS)
-    };
+    let http_budget = Duration::from_secs(config.server.shutdown_grace_secs);
 
     if tokio::time::timeout(http_budget, server_handle)
         .await
@@ -190,26 +198,28 @@ pub(super) async fn graceful_shutdown(
     }
 
     if let Some(handle) = tor_handle {
-        if tokio::time::timeout(Duration::from_secs(DRAIN_TOR_SECS), handle)
+        let tor_budget = Duration::from_secs(config.tor.shutdown_grace_secs);
+        if tokio::time::timeout(tor_budget, handle)
             .await
             .is_err()
         {
             log::warn!(
-                "Tor circuit teardown did not complete within {DRAIN_TOR_SECS} s; \
+                "Tor circuit teardown did not complete within {} s; \
                  active Tor streams will be forcibly closed",
+                tor_budget.as_secs(),
             );
         }
     }
 
     wait_for_background_task(
         background_tasks.redirect,
-        Duration::from_secs(5),
+        Duration::from_secs(config.server.shutdown_grace_secs.saturating_add(2)),
         "HTTP redirect server",
     )
     .await;
     wait_for_background_task(
         background_tasks.https,
-        Duration::from_secs(5),
+        Duration::from_secs(config.server.shutdown_grace_secs.saturating_add(2)),
         "HTTPS server",
     )
     .await;
