@@ -599,7 +599,10 @@ async fn event_loop(
     // Pin ctrl_c so it can be polled repeatedly inside select! without moving.
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    #[cfg(unix)]
     let mut sighup = make_sighup_signal();
+    #[cfg(not(unix))]
+    let sighup = make_sighup_signal();
 
     // SIGTERM handling — cross-platform design note
     // ─────────────────────────────────────────────
@@ -627,7 +630,7 @@ async fn event_loop(
             if let Some(rx) = key_rx.as_mut() {
                 rx.recv().await
             } else {
-                std::future::pending().await
+                std::future::pending::<Option<events::KeyEvent>>().await
             }
         };
         let sighup_fut = async {
@@ -636,13 +639,13 @@ async fn event_loop(
                 if let Some(stream) = sighup.as_mut() {
                     stream.recv().await
                 } else {
-                    std::future::pending().await
+                    std::future::pending::<Option<()>>().await
                 }
             }
             #[cfg(not(unix))]
             {
                 let _ = &sighup;
-                std::future::pending().await
+                std::future::pending::<Option<()>>().await
             }
         };
 
