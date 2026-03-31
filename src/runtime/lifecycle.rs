@@ -1,6 +1,7 @@
 //! # Lifecycle
 //!
-//! **Directory:** `src/runtime/`
+//! **File:** `lifecycle.rs`
+//! **Location:** `src/runtime/lifecycle.rs`
 //!
 //! Two paths:
 //! 1. **First run** — creates the directory tree, writes defaults, prints a
@@ -8,11 +9,13 @@
 //! 2. **Normal run** — loads config, starts every subsystem, enters the
 //!    event dispatch loop, then shuts down gracefully.
 //!
-//! ## CLI override support (5.5)
+//! ## CLI override support
 //!
 //! [`CliArgs`] carries optional path overrides from `--config` and `--data-dir`.
 //! When absent the original defaults (relative to `current_exe()`) are used,
 //! preserving backward compatibility for zero-argument invocations.
+
+mod support;
 
 use std::{
     path::{Path, PathBuf},
@@ -27,9 +30,12 @@ use crate::{
     console, logging,
     runtime::{
         events,
-        state::{AppState, CertStatus, Metrics, SharedMetrics, SharedState, TorStatus},
+        state::{AppState, Metrics, SharedMetrics, SharedState, TorStatus},
     },
-    server, tls, tor, AppError, Result,
+    server, tor, Result,
+};
+use support::{
+    graceful_shutdown, maybe_open_browser, setup_tls, wait_for_background_task, wait_for_bind_port,
 };
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -44,7 +50,7 @@ pub struct CliArgs {
     /// Explicit data-directory root; overrides `<exe-dir>/rusthost-data/`.
     pub data_dir: Option<PathBuf>,
     /// When `Some`, skip first-run setup and serve this directory directly.
-    /// Addresses M-15 — `--serve <dir>` one-shot CLI mode.
+    /// One-shot `--serve <dir>` mode.
     pub serve_dir: Option<PathBuf>,
     /// Port to use in `--serve` mode.  Ignored when `serve_dir` is `None`.
     pub serve_port: u16,
@@ -66,13 +72,6 @@ struct SharedConnectionBudget {
     >,
 }
 
-#[derive(Default)]
-struct BackgroundTasks {
-    https: Option<tokio::task::JoinHandle<()>>,
-    redirect: Option<tokio::task::JoinHandle<()>>,
-    acme: Option<tokio::task::JoinHandle<()>>,
-}
-
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /// Entry point for the `rusthost-cli` binary.
@@ -86,14 +85,14 @@ struct BackgroundTasks {
 /// initialised, or any other fatal startup condition occurs.
 /// Path overrides are supplied via [`CliArgs`].
 pub async fn run(args: CliArgs) -> Result<()> {
-    // M-15 — if --serve <dir> was passed, bypass settings.toml entirely and
-    // spin up a minimal server pointed at the given directory.
+    // If --serve <dir> was passed, bypass settings.toml entirely and spin up a
+    // minimal server pointed at the given directory.
     if let Some(dir) = args.serve_dir {
         return one_shot_serve(dir, args.serve_port, !args.no_tor, args.headless).await;
     }
 
-    // 4.4 + 5.5 — data_dir is computed exactly once and threaded everywhere.
-    // A CLI override takes precedence; the default is relative to current_exe().
+    // data_dir is computed exactly once and threaded everywhere. A CLI
+    // override takes precedence; the default is relative to current_exe().
     let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
 
     let settings_path = args
@@ -110,7 +109,7 @@ pub async fn run(args: CliArgs) -> Result<()> {
 /// Serve `dir` directly with minimal configuration — no `settings.toml` needed.
 ///
 /// Builds a `Config` in memory with sensible defaults, skips first-run setup,
-/// and calls [`normal_run`].  Addresses M-15.
+/// and calls [`normal_run`].
 async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bool) -> Result<()> {
     use crate::config::{
         ConsoleConfig, CspLevel, IdentityConfig, LogLevel, LoggingConfig, ServerConfig, SiteConfig,
@@ -254,152 +253,6 @@ async fn init_site_scan(config: &Config, state: &SharedState, data_dir: &Path) {
     s.site_total_bytes = bytes;
 }
 
-/// Wait for the server task to report its bound port via the oneshot channel.
-async fn wait_for_bind_port(port_rx: oneshot::Receiver<u16>) -> Result<u16> {
-    match tokio::time::timeout(Duration::from_secs(10), port_rx).await {
-        Ok(Ok(port)) => Ok(port),
-        Ok(Err(_)) => {
-            log::error!("Server port channel closed before sending — server failed to bind");
-            Err(AppError::ServerStartup(
-                "Server task exited before signalling its bound port".into(),
-            ))
-        }
-        Err(_) => {
-            log::error!("Timed out waiting for server to bind");
-            Err(AppError::ServerStartup(
-                "Timed out waiting for server to bind (10 s)".into(),
-            ))
-        }
-    }
-}
-
-/// Optionally set up TLS/HTTPS and the HTTP→HTTPS redirect server.
-///
-/// `build_acceptor` is synchronous and may perform blocking file I/O (reading
-/// cert/key files, parsing PEM, etc.).  It is offloaded to the blocking thread
-/// pool via `spawn_blocking` so it cannot stall the async runtime.
-async fn setup_tls(
-    config: &Arc<Config>,
-    state: &SharedState,
-    metrics: &SharedMetrics,
-    shutdown_rx: &watch::Receiver<bool>,
-    data_dir: &Path,
-    budget: &SharedConnectionBudget,
-    root_tx: &watch::Sender<Arc<std::path::Path>>,
-) -> BackgroundTasks {
-    let mut tasks = BackgroundTasks::default();
-
-    if !config.tls.enabled {
-        return tasks;
-    }
-
-    // build_acceptor is async and manages its own spawn_blocking internally
-    // for any blocking I/O (e.g. self-signed cert generation). No outer
-    // spawn_blocking wrapper is needed or correct here.
-    let tls_result = tls::build_acceptor(&config.tls, data_dir).await;
-
-    match tls_result {
-        Err(e) => {
-            log::error!("TLS init failed: {e}. Continuing in HTTP-only mode.");
-        }
-        Ok(None) => { /* enabled=false handled inside build_acceptor */ }
-        Ok(Some(tls_setup)) => {
-            let crate::tls::TlsSetup {
-                acceptor,
-                acme_task,
-            } = tls_setup;
-            tasks.acme = acme_task;
-
-            // Record cert type in shared state for the dashboard.
-            {
-                let mut s = state.write().await;
-                s.tls_cert_status = if config.tls.acme.enabled {
-                    config.tls.acme.domains.first().map_or(
-                        CertStatus::Acme {
-                            domain: String::new(),
-                        },
-                        |d| CertStatus::Acme { domain: d.clone() },
-                    )
-                } else if config.tls.manual_cert.is_some() {
-                    CertStatus::Manual
-                } else {
-                    CertStatus::SelfSigned
-                };
-            }
-
-            // Spawn the HTTPS accept loop.
-            {
-                let tls_config = Arc::clone(config);
-                let tls_state = Arc::clone(state);
-                let tls_metrics = Arc::clone(metrics);
-                let tls_shutdown = shutdown_rx.clone();
-                let tls_data_dir = data_dir.to_path_buf();
-                let tls_sem = std::sync::Arc::clone(&budget.semaphore);
-                let tls_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
-                let tls_root_rx = root_tx.subscribe();
-                tasks.https = Some(tokio::spawn(async move {
-                    server::run_https(
-                        tls_config,
-                        tls_state,
-                        tls_metrics,
-                        tls_data_dir,
-                        tls_shutdown,
-                        acceptor,
-                        tls_sem,
-                        tls_ip_map,
-                        tls_root_rx,
-                    )
-                    .await;
-                }));
-            }
-
-            // Optionally spawn the HTTP→HTTPS redirect server.
-            if config.tls.redirect_http {
-                let bind_addr = config.server.bind;
-                let redir_plain_port = config.tls.http_port.get();
-                let redir_tls_port = config.tls.port.get();
-                let redir_shutdown = shutdown_rx.clone();
-                let redir_sem = std::sync::Arc::clone(&budget.semaphore);
-                let redir_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
-                let redir_max_per_ip = config.server.max_connections_per_ip;
-                tasks.redirect = Some(tokio::spawn(async move {
-                    server::redirect::run_redirect_server(
-                        bind_addr,
-                        redir_plain_port,
-                        redir_tls_port,
-                        redir_shutdown,
-                        redir_sem,
-                        redir_ip_map,
-                        redir_max_per_ip,
-                    )
-                    .await;
-                }));
-            }
-        }
-    }
-
-    tasks
-}
-
-/// Open the user's browser if `open_browser_on_start` is set.
-async fn maybe_open_browser(config: &Config, state: &SharedState) {
-    if !config.server.open_browser_on_start {
-        return;
-    }
-    let port = state.read().await.actual_port;
-    let url = match config.server.bind {
-        std::net::IpAddr::V4(a) if a.is_unspecified() => {
-            format!("http://127.0.0.1:{port}")
-        }
-        std::net::IpAddr::V6(a) if a.is_unspecified() => {
-            format!("http://[::1]:{port}")
-        }
-        std::net::IpAddr::V6(a) => format!("http://[{a}]:{port}"),
-        std::net::IpAddr::V4(a) => format!("http://{a}:{port}"),
-    };
-    super::open_browser(&url);
-}
-
 // ─── Core startup ─────────────────────────────────────────────────────────────
 
 /// Core server startup given an already-built `Config`.
@@ -408,14 +261,13 @@ async fn maybe_open_browser(config: &Config, state: &SharedState) {
 async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Result<()> {
     // 2. Initialise logging.
     logging::init(&config.logging, &data_dir)?;
-    // M-16 — initialise the structured access log (Combined Log Format).
     if let Err(e) = logging::init_access_log(&data_dir) {
         log::warn!("Could not initialise access log: {e}");
     }
     log::info!("RustHost starting — version {}", env!("CARGO_PKG_VERSION"));
 
-    // 4.2 — config.server.bind is now IpAddr; use is_unspecified() instead of
-    //        string comparison.
+    // config.server.bind is typed as IpAddr, so use is_unspecified() instead
+    // of string comparison.
     if config.server.bind.is_unspecified() {
         log::warn!("[server] bind = \"0.0.0.0\" — server is reachable on all interfaces.");
     }
@@ -456,7 +308,19 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     );
 
     // Wait for the server to signal its bound port via the oneshot channel.
-    let bind_port = wait_for_bind_port(port_rx).await?;
+    let bind_port = match wait_for_bind_port(port_rx).await {
+        Ok(port) => port,
+        Err(err) => {
+            let _ = shutdown_tx.send(true);
+            wait_for_background_task(
+                Some(server_handle),
+                Duration::from_secs(5),
+                "HTTP server startup task",
+            )
+            .await;
+            return Err(err);
+        }
+    };
 
     // 7b. TLS / HTTPS — optional, non-fatal.
     let background_tasks = setup_tls(
@@ -500,123 +364,6 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     // 12. Graceful shutdown.
     graceful_shutdown(shutdown_tx, server_handle, tor_handle, background_tasks).await;
     Ok(())
-}
-
-// Shutdown drain budget constants (M-7).
-//
-// Previously the two drains (HTTP + Tor) shared a single 8-second wall-clock
-// budget.  If the HTTP drain ran long, Tor circuits received whatever
-// milliseconds were left — far too little for active streams to flush.
-// The fix gives each drain its own independently-bounded timeout.
-
-/// Shutdown budget (seconds) when Tor is **disabled**.
-const DRAIN_HTTP_ONLY_SECS: u64 = 8;
-
-/// Shutdown budget (seconds) for the HTTP drain when Tor is **enabled**.
-///
-/// Tor circuits need their own separate window after this.
-const DRAIN_HTTP_WITH_TOR_SECS: u64 = 5;
-
-/// Shutdown budget (seconds) for Tor circuit teardown.
-///
-/// Arti closes circuits asynchronously; waiting up to this long gives active
-/// Tor streams a chance to flush their final bytes before the process exits.
-const DRAIN_TOR_SECS: u64 = 10;
-
-/// Signal shutdown, then drain the HTTP server and (if Tor is enabled) the Tor
-/// circuits with separate, independently-bounded timeouts.
-///
-/// - **HTTP only** (Tor disabled): full [`DRAIN_HTTP_ONLY_SECS`] seconds.
-/// - **HTTP + Tor**: [`DRAIN_HTTP_WITH_TOR_SECS`] seconds for HTTP, then a
-///   fresh [`DRAIN_TOR_SECS`]-second budget for Tor circuit teardown.
-///
-/// The hard caps are intentional — the process must not hang forever.
-/// Callers drop the Tokio runtime after this function returns, which cancels
-/// any tasks that did not complete within their budget.
-async fn graceful_shutdown(
-    shutdown_tx: watch::Sender<bool>,
-    server_handle: tokio::task::JoinHandle<()>,
-    tor_handle: Option<tokio::task::JoinHandle<()>>,
-    background_tasks: BackgroundTasks,
-) {
-    log::info!("Shutting down…");
-    let _ = shutdown_tx.send(true);
-
-    // HTTP drain — budget depends on whether Tor needs its own window.
-    let http_budget = if tor_handle.is_some() {
-        Duration::from_secs(DRAIN_HTTP_WITH_TOR_SECS)
-    } else {
-        Duration::from_secs(DRAIN_HTTP_ONLY_SECS)
-    };
-
-    if tokio::time::timeout(http_budget, server_handle)
-        .await
-        .is_err()
-    {
-        let secs = http_budget.as_secs();
-        log::warn!(
-            "HTTP drain did not complete within {secs} s; \
-             some connections may be abruptly closed",
-        );
-    }
-
-    // Tor drain — only if Tor was started, with its own fresh budget so that
-    // a slow HTTP drain does not steal time from Tor circuit teardown.
-    if let Some(handle) = tor_handle {
-        if tokio::time::timeout(Duration::from_secs(DRAIN_TOR_SECS), handle)
-            .await
-            .is_err()
-        {
-            log::warn!(
-                "Tor circuit teardown did not complete within {DRAIN_TOR_SECS} s; \
-                 active Tor streams will be forcibly closed",
-            );
-        }
-    }
-
-    wait_for_background_task(
-        background_tasks.redirect,
-        Duration::from_secs(5),
-        "HTTP redirect server",
-    )
-    .await;
-    wait_for_background_task(
-        background_tasks.https,
-        Duration::from_secs(5),
-        "HTTPS server",
-    )
-    .await;
-    wait_for_background_task(
-        background_tasks.acme,
-        Duration::from_secs(5),
-        "ACME event loop",
-    )
-    .await;
-
-    log::info!("RustHost shut down cleanly.");
-    logging::flush();
-    console::cleanup();
-}
-
-async fn wait_for_background_task(
-    task: Option<tokio::task::JoinHandle<()>>,
-    timeout: Duration,
-    label: &str,
-) {
-    let Some(mut handle) = task else {
-        return;
-    };
-
-    match tokio::time::timeout(timeout, &mut handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            log::warn!("{label} task ended with a join error during shutdown: {e}");
-        }
-        Err(_) => {
-            log::warn!("{label} did not stop within {} s; aborting task", timeout.as_secs());
-            handle.abort();
-        }
-    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -683,7 +430,6 @@ async fn start_console(
         Ok(Some(rx))
     } else {
         let port = state.read().await.actual_port;
-        // 4.2 — config.server.bind is IpAddr, Display impl formats correctly.
         println!("RustHost running on http://{}:{port}", config.server.bind);
         Ok(None)
     }
@@ -752,8 +498,7 @@ async fn event_loop(
     // 2.8 — mutable so we can set to None when the channel closes.
     let mut key_rx = key_rx;
 
-    // 4.7 — tokio::signal::ctrl_c() replaces ctrlc crate's set_handler + mpsc.
-    //        Pinned so it can be polled repeatedly inside select! without moving.
+    // Pin ctrl_c so it can be polled repeatedly inside select! without moving.
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
@@ -800,7 +545,6 @@ async fn event_loop(
                     ).await?;
                     if quit { break; }
                 } else {
-                    // 2.8 — input task exited; disable key arm and warn operator.
                     log::warn!(
                         "Console input task exited — keyboard input disabled. \
                          Use Ctrl-C to quit."
@@ -808,7 +552,6 @@ async fn event_loop(
                     key_rx = None;
                 }
             }
-            // 4.7 — Ctrl-C handled directly through Tokio's signal machinery.
             result = &mut ctrl_c => {
                 if let Err(e) = result {
                     log::warn!("Ctrl-C signal error: {e}");

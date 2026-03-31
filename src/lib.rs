@@ -1,5 +1,8 @@
 //! # rusthost — library crate
 //!
+//! **File:** `lib.rs`
+//! **Location:** `src/lib.rs`
+//!
 //! Exposes the public API surface used by integration tests in `tests/` and
 //! by the binary entry point in `src/main.rs`.
 //!

@@ -1,4 +1,7 @@
-//! `src/tls/mod.rs`
+//! # TLS Module
+//!
+//! **File:** `mod.rs`
+//! **Location:** `src/tls/mod.rs`
 pub mod acme;
 pub mod self_signed;
 
@@ -100,8 +103,8 @@ pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<T
 fn load_manual_cert(cfg: &ManualCertConfig, data_dir: &Path) -> Result<Arc<TlsAcceptor>> {
     use std::path::Component;
 
-    // Task 1.1 (belt): Reject ParentDir components before joining with data_dir.
-    // A pure string/lexical starts_with check on the joined path can be fooled by
+    // Reject ParentDir components before joining with data_dir. A pure
+    // string/lexical starts_with check on the joined path can be fooled by
     // paths like "../outside.crt" — they pass the prefix test as a string but the
     // OS resolves them to a location entirely outside data_dir.
     // Mirror the pattern already used by validate_acme_config in acme.rs.
@@ -138,8 +141,8 @@ fn load_manual_cert(cfg: &ManualCertConfig, data_dir: &Path) -> Result<Arc<TlsAc
     let cert_path = data_dir.join(&cfg.cert_path);
     let key_path = data_dir.join(&cfg.key_path);
 
-    // Task 1.1 (suspenders): Canonicalize both the data_dir anchor and the
-    // resolved paths, then verify containment on the canonical forms.
+    // Canonicalize both the data_dir anchor and the resolved paths, then
+    // verify containment on the canonical forms.
     // This catches any remaining escapes via symlinks that survive the component
     // check above (e.g. a symlink inside data_dir pointing outside it).
     let canonical_data_dir = std::fs::canonicalize(data_dir)
@@ -221,7 +224,7 @@ pub(super) fn load_pem_as_acceptor(cert_path: &Path, key_path: &Path) -> Result<
 }
 
 // ---------------------------------------------------------------------------
-// Tests — Task 1.1 path traversal regression
+// Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {

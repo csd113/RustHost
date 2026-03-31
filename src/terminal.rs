@@ -1,5 +1,8 @@
 //! # terminal – cross-platform auto-terminal launcher
 //!
+//! **File:** `terminal.rs`
+//! **Location:** `src/terminal.rs`
+//!
 //! Detects whether the process is attached to a TTY. If it is not (e.g. the
 //! binary was double-clicked in a file manager), the process relaunches itself
 //! inside an appropriate terminal emulator and exits, so the user always sees

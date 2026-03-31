@@ -1,6 +1,7 @@
 //! # HTTP → HTTPS Redirect Server
 //!
-//! **Directory:** `src/server/`
+//! **File:** `redirect.rs`
+//! **Location:** `src/server/redirect.rs`
 //!
 //! A lightweight HTTP/1.1 listener that issues permanent `301` redirects to
 //! the HTTPS equivalent of every incoming request.  Activated when
@@ -104,7 +105,8 @@ pub async fn run_redirect_server(
     per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
     max_per_ip: u32,
 ) {
-    let listener = match TcpListener::bind(format!("{bind_addr}:{plain_port}")).await {
+    let bind_socket = std::net::SocketAddr::new(bind_addr, plain_port);
+    let listener = match TcpListener::bind(bind_socket).await {
         Ok(l) => l,
         Err(e) => {
             log::error!("HTTP-redirect server failed to bind {bind_addr}:{plain_port}: {e}");
@@ -130,8 +132,12 @@ pub async fn run_redirect_server(
                             drop(stream);
                             continue;
                         };
-                        let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
-                            break;
+                        let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+                            log::warn!(
+                                "Connection limit reached; rejecting redirect connection from {peer_ip}"
+                            );
+                            drop(stream);
+                            continue;
                         };
                         tokio::spawn(async move {
                             let _permit = permit;

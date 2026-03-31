@@ -1,4 +1,7 @@
-//! `src/tls/self_signed.rs`
+//! # Self-Signed TLS Certificates
+//!
+//! **File:** `self_signed.rs`
+//! **Location:** `src/tls/self_signed.rs`
 use crate::error::AppError;
 use crate::Result;
 use std::{path::Path, sync::Arc, time::SystemTime};
@@ -39,8 +42,8 @@ const CERT_SANS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 /// [`tokio::task::spawn_blocking`] (or equivalent) when invoked from inside
 /// an async Tokio context to avoid stalling the async runtime.
 pub async fn generate_or_load(data_dir: &Path) -> Result<Arc<TlsAcceptor>> {
-    // FIX (medium): all fs calls in this function are blocking. Offload to a
-    // dedicated thread so we never stall the Tokio executor.
+    // All filesystem calls in this function are blocking, so they are
+    // offloaded to a dedicated thread to avoid stalling the Tokio executor.
     let data_dir = data_dir.to_path_buf();
     tokio::task::spawn_blocking(move || generate_or_load_blocking(&data_dir))
         .await
@@ -90,7 +93,7 @@ fn write_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
         .map_err(|e| AppError::Tls(format!("rcgen self-sign failed: {e}")))?;
     let cert_pem = cert.pem();
 
-    // FIX (high): write the key first. If the cert write fails subsequently,
+    // Write the key first. If the cert write fails subsequently,
     // the key file exists and needs_regeneration() will return true on the
     // next startup (cert absent), so both files will be cleanly rewritten.
     // The reverse order left an orphaned cert with no matching key, causing
@@ -105,10 +108,8 @@ fn write_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
     Ok(())
 }
 
-// FIX (medium): removed `#[allow(clippy::arithmetic_side_effects)]`. The
-// cast `i64::from(CERT_VALIDITY_DAYS)` is a widening u32→i64 conversion that
-// can never overflow. The attribute was suppressing a non-existent risk while
-// masking any genuinely risky arithmetic that might be added in future.
+// The cast `i64::from(CERT_VALIDITY_DAYS)` is a widening u32→i64 conversion
+// that cannot overflow.
 fn build_cert_params() -> Result<rcgen::CertificateParams> {
     use rcgen::{
         CertificateParams, DistinguishedName, DnValue, ExtendedKeyUsagePurpose, KeyUsagePurpose,
@@ -142,8 +143,8 @@ fn build_cert_params() -> Result<rcgen::CertificateParams> {
 
     // Subject Alternative Names — required for modern browsers / TLS stacks
     for san in CERT_SANS {
-        // FIX (medium): san_for now returns Result, so errors propagate
-        // cleanly instead of panicking if rcgen tightens DnsName validation.
+        // san_for returns Result so validation errors are surfaced instead of
+        // panicking during startup.
         params.subject_alt_names.push(san_for(san)?);
     }
 
@@ -168,7 +169,6 @@ fn build_cert_params() -> Result<rcgen::CertificateParams> {
 /// Returns [`AppError::Tls`] if `s` is not a valid IP address and rcgen
 /// rejects it as a [`DnsName`].
 //
-// FIX (medium): removed #[allow(clippy::unwrap_used)] and the unwrap().
 // san_for is called in the production cert-generation path; a panic here
 // would crash the process at startup. Errors are now surfaced as AppError::Tls.
 fn san_for(s: &str) -> Result<rcgen::SanType> {
@@ -207,8 +207,8 @@ fn needs_regeneration(cert_path: &Path) -> bool {
 /// Parse the `notAfter` field of a PEM certificate and return how many whole
 /// days remain until expiry, or `None` on any failure.
 //
-// FIX (medium): each failure point now emits a debug log before returning
-// None. Operators can now distinguish "file missing" (expected on first run)
+// Each failure point emits a debug log before returning None. Operators can
+// now distinguish "file missing" (expected on first run)
 // from "cert is corrupted" or "system clock is wrong", all of which
 // previously produced identical silent regeneration with no diagnostic trail.
 fn remaining_validity_days(cert_path: &Path) -> Option<u64> {
@@ -260,36 +260,29 @@ fn remaining_validity_days(cert_path: &Path) -> Option<u64> {
 /// readable. On non-Unix platforms the write still succeeds but no
 /// permission change is attempted.
 ///
-/// On Unix, `set_permissions(0o600)` is called immediately after `open()` and
-/// before any bytes are written. The file is therefore empty during the brief
-/// window between creation (at process umask) and the `fchmod`. This limits
-/// the exposure of the race to an empty file rather than a live private key.
+/// On Unix, the file is opened with mode `0600` atomically so key material is
+/// never written under a broader umask-derived permission set.
 fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(unix)]
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| AppError::Tls(format!("cannot open {} for writing: {e}", path.display())))?;
+    #[cfg(not(unix))]
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .open(path)
         .map_err(|e| AppError::Tls(format!("cannot open {} for writing: {e}", path.display())))?;
-
-    // Set restrictive permissions *before* writing any key material so that
-    // the private key bytes never touch disk under the looser umask-derived
-    // mode. The file is empty at this point, bounding the race window.
-    #[cfg(unix)]
-    {
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| {
-                AppError::Tls(format!(
-                    "failed to set permissions on {}: {e}",
-                    path.display()
-                ))
-            })?;
-    }
 
     file.write_all(contents)
         .map_err(|e| AppError::Tls(format!("failed to write {}: {e}", path.display())))

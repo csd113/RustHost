@@ -1,6 +1,7 @@
 //! # Config Defaults
 //!
-//! **Directory:** `src/config/`
+//! **File:** `defaults.rs`
+//! **Location:** `src/config/defaults.rs`
 
 use crate::Result;
 use std::path::Path;

@@ -1,6 +1,7 @@
 //! # Tor Module — Arti (in-process)
 //!
-//! **Directory:** `src/tor/`
+//! **File:** `mod.rs`
+//! **Location:** `src/tor/mod.rs`
 //!
 //! Replaces the old subprocess + torrc approach with Arti, the official
 //! Tor implementation in Rust, running entirely in-process.
@@ -28,6 +29,8 @@
 //! `windows-sys` on Windows) or run the service as a dedicated user account
 //! with a private home directory.
 
+mod fs;
+
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,6 +49,7 @@ use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{config::OnionServiceConfigBuilder, handle_rend_requests, HsId, StreamRequest};
 
 use crate::runtime::state::{SharedState, TorStatus};
+use fs::ensure_private_dir;
 
 // ─── Timeout / retry constants ────────────────────────────────────────────────
 
@@ -236,11 +240,8 @@ async fn run(
     state: SharedState,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<bool> {
-    // Authoritative Starting state transition for every run attempt.
-    // The init() loop also calls this during backoff (which is intentional —
-    // it shows "Starting" while sleeping), making this a no-op double-set on
-    // reconnect paths. The double-set is harmless and simpler than splitting
-    // the responsibility.
+    // The init() loop also sets this during backoff so the UI reflects that a
+    // reconnect is already underway while the retry delay is running.
     set_starting_and_clear_onion(&state).await;
 
     let Some(session) = bootstrap_and_launch(&data_dir, shutdown.clone()).await? else {
@@ -350,7 +351,7 @@ fn handle_stream_request(
     let local_addr = local_addr.to_owned();
     active_tasks.spawn(async move {
         let _permit = permit;
-        if let Err(e) = proxy_stream(stream_req, &local_addr).await {
+        if let Err(e) = Box::pin(proxy_stream(stream_req, &local_addr)).await {
             log::debug!("Tor: stream closed: {e:#}");
         }
     });
@@ -419,7 +420,7 @@ async fn proxy_stream(stream_req: StreamRequest, local_addr: &str) -> anyhow::Re
     let local_result =
         tokio::time::timeout(LOCAL_CONNECT_TIMEOUT, TcpStream::connect(local_addr)).await;
 
-    let mut local = match local_result {
+    let local = match local_result {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             // drop(stream_req) sends RELAY_END to the Tor client.
@@ -437,20 +438,69 @@ async fn proxy_stream(stream_req: StreamRequest, local_addr: &str) -> anyhow::Re
         }
     };
 
-    let mut tor_stream = stream_req
+    let tor_stream = stream_req
         .accept(Connected::new_empty())
         .await
         .context("failed to accept Tor stream")?;
 
-    match tokio::time::timeout(
+    Box::pin(proxy_bidirectional_with_idle_timeout(
+        tor_stream,
+        local,
         IDLE_TIMEOUT,
-        tokio::io::copy_bidirectional(&mut tor_stream, &mut local),
-    )
+    ))
     .await
-    {
-        Ok(Ok(_byte_counts)) => Ok(()),
-        Ok(Err(e)) => Err(anyhow::Error::new(e).context("bidirectional proxy error")),
-        Err(_elapsed) => anyhow::bail!("stream idle timeout after {}s", IDLE_TIMEOUT.as_secs()),
+    .context("bidirectional proxy error")?;
+    Ok(())
+}
+
+async fn proxy_bidirectional_with_idle_timeout<A, B>(
+    stream_a: A,
+    stream_b: B,
+    idle_timeout: Duration,
+) -> std::io::Result<()>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (reader_a, writer_a) = tokio::io::split(stream_a);
+    let (reader_b, writer_b) = tokio::io::split(stream_b);
+
+    let client_to_local = relay_with_idle_timeout(reader_a, writer_b, idle_timeout);
+    let local_to_client = relay_with_idle_timeout(reader_b, writer_a, idle_timeout);
+
+    let (_uplink, _downlink) = tokio::try_join!(client_to_local, local_to_client)?;
+    Ok(())
+}
+
+async fn relay_with_idle_timeout<R, W>(
+    mut reader: R,
+    mut writer: W,
+    idle_timeout: Duration,
+) -> std::io::Result<u64>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut transferred = 0u64;
+    let mut buffer = [0u8; 16 * 1024];
+
+    loop {
+        let read = tokio::time::timeout(idle_timeout, tokio::io::AsyncReadExt::read(&mut reader, &mut buffer))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("stream idle timeout after {}s", idle_timeout.as_secs()),
+                )
+            })??;
+
+        if read == 0 {
+            tokio::io::AsyncWriteExt::shutdown(&mut writer).await?;
+            return Ok(transferred);
+        }
+
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &buffer[..read]).await?;
+        transferred = transferred.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
     }
 }
 
@@ -510,196 +560,6 @@ fn format_local_addr(addr: IpAddr, port: u16) -> String {
         IpAddr::V4(a) => format!("{a}:{port}"),
         IpAddr::V6(a) => format!("[{a}]:{port}"),
     }
-}
-
-/// Create a directory intended to be private to the current user and harden
-/// its permissions.
-///
-/// ## Security limitations
-///
-/// - Symlinks at the target path are rejected and the path is re-verified
-///   after creation, but the create → verify → harden sequence is **not**
-///   fully atomic with only `std`.
-/// - A local attacker who can race filesystem operations may still exploit
-///   TOCTOU windows. On hostile multi-user systems this is a real risk for
-///   Tor private key material.
-///
-/// ## Platform notes
-///
-/// - **Unix**: `chmod 0700` is applied after creation via `std::fs`.
-/// - **Windows**: ACLs are set via `icacls`. The identity is read from the
-///   `USERNAME` / `USERDOMAIN` process-environment variables (set
-///   unconditionally by the Windows kernel) rather than spawning `whoami`,
-///   avoiding PATH-dependency and subprocess stdout encoding issues.
-///   Both values are validated before use to prevent injection into the
-///   `icacls` argument string.
-///
-/// **Future work (Windows)**: replace the `icacls` subprocess with a direct
-/// call to `SetNamedSecurityInfoW` via the `windows-sys` crate. That
-/// eliminates the subprocess entirely and removes all injection surface.
-fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        let ft = meta.file_type();
-        if ft.is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "refusing to use symlink as private directory: {}",
-                    path.display()
-                ),
-            ));
-        }
-        if !ft.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("path exists but is not a directory: {}", path.display()),
-            ));
-        }
-    }
-
-    std::fs::create_dir_all(path)?;
-
-    #[cfg(unix)]
-    harden_unix_permissions(path)?;
-
-    #[cfg(windows)]
-    harden_windows_permissions(path)?;
-
-    Ok(())
-}
-
-/// Re-verify the path after creation and apply `0700` permissions.
-///
-/// Re-verifying catches a symlink swap that could occur in the window between
-/// the metadata check in `ensure_private_dir` and `create_dir_all`.
-#[cfg(unix)]
-fn harden_unix_permissions(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let meta = std::fs::symlink_metadata(path)?;
-    let ft = meta.file_type();
-    if ft.is_symlink() || !ft.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!(
-                "private dir path is not a real directory after creation: {}",
-                path.display()
-            ),
-        ));
-    }
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-}
-
-/// Set a Windows ACL on `path` granting the current user exclusive access.
-///
-/// Reads the identity from `USERNAME` / `USERDOMAIN` environment variables
-/// (set unconditionally by the Windows kernel) rather than spawning `whoami`,
-/// avoiding PATH-dependency and subprocess stdout encoding issues. Both values
-/// are validated against a strict allowlist before being passed to `icacls`.
-///
-/// **Future work**: replace `icacls` with `SetNamedSecurityInfoW` via the
-/// `windows-sys` crate to eliminate the subprocess and all injection surface.
-#[cfg(windows)]
-fn harden_windows_permissions(path: &std::path::Path) -> std::io::Result<()> {
-    /// Validate a Windows identity name component (username or domain).
-    ///
-    /// Rejects control characters and the icacls metacharacters that would
-    /// confuse the argument parser. Deliberately does NOT log the raw value on
-    /// failure — adversarial input should not reach log sinks.
-    fn validate_windows_name(s: &str) -> std::io::Result<()> {
-        if s.is_empty() || s.len() > 256 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Windows identity name has unexpected length: {} bytes",
-                    s.len()
-                ),
-            ));
-        }
-        // Illegal in Windows names: " / \ [ ] : ; | = , + * ? < >
-        // Also reject: ( ) — icacls grant-string metacharacters.
-        // Also reject: control characters.
-        let has_bad_char = s.chars().any(|c| {
-            c.is_control()
-                || matches!(
-                    c,
-                    '"' | '/'
-                        | '\\'
-                        | '['
-                        | ']'
-                        | ':'
-                        | ';'
-                        | '|'
-                        | '='
-                        | ','
-                        | '+'
-                        | '*'
-                        | '?'
-                        | '<'
-                        | '>'
-                        | '('
-                        | ')'
-                )
-        });
-        if has_bad_char {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                // Raw value intentionally omitted to avoid logging attacker input.
-                "Windows identity name component contains disallowed characters",
-            ));
-        }
-        Ok(())
-    }
-
-    let username = std::env::var("USERNAME").map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("USERNAME environment variable not available: {e}"),
-        )
-    })?;
-    let userdomain = std::env::var("USERDOMAIN").map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("USERDOMAIN environment variable not available: {e}"),
-        )
-    })?;
-
-    validate_windows_name(&username)?;
-    validate_windows_name(&userdomain)?;
-
-    // Build the icacls grant specifier as a single argument token.
-    // std::process::Command wraps arguments containing spaces in double
-    // quotes when constructing the CreateProcessW command-line string,
-    // so icacls receives the token correctly even for usernames with spaces
-    // (e.g. enterprise accounts like "John Smith").
-    //
-    // Format: "DOMAIN\user:(OI)(CI)F"
-    //   (OI) = object inherit, (CI) = container inherit, F = full control.
-    let grant_arg = format!("{userdomain}\\{username}:(OI)(CI)F");
-
-    let path_str = path.to_string_lossy();
-    let icacls_out = std::process::Command::new("icacls")
-        .args([
-            path_str.as_ref(),
-            "/inheritance:r", // strip inherited ACEs
-            "/grant:r",       // replace (not add to) explicit grant
-            grant_arg.as_str(),
-        ])
-        .output()?;
-
-    if !icacls_out.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "icacls failed (exit {:?}): {}",
-                icacls_out.status.code(),
-                String::from_utf8_lossy(&icacls_out.stderr).trim(),
-            ),
-        ));
-    }
-
-    Ok(())
 }
 
 /// Wait until the shutdown channel carries `true` or the sender is dropped.

@@ -35,6 +35,8 @@ One binary, TLS and Tor included. No separate installs, no messing with torrc fi
 
 **Perfect for:** Devs testing locally with privacy, self-hosters wanting HTTPS + Tor access, or anyone running a personal site without system tweaks.
 
+**Scope note:** RustHost is a public static-file server, not an authenticated admin panel. It does not implement users, sessions, or authorization. If you expose it beyond localhost, treat every served path as public and put any private/operator-only surface behind a separate authenticated reverse proxy or service.
+
 ---
 
 ## What it looks like

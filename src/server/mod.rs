@@ -1,11 +1,12 @@
 //! # Server Module
 //!
-//! **Directory:** `src/server/`
+//! **File:** `mod.rs`
+//! **Location:** `src/server/mod.rs`
 //!
-//! Provides a safe HTTP/1.1 static-file server. Phase 3 migrated the
+//! Provides a safe HTTP/1.1 static-file server. The implementation migrated
 //! per-connection handler from a hand-rolled single-shot parser to
-//! [`hyper`]'s keep-alive connection loop, eliminating the 30–45 s Tor
-//! page-load penalty caused by `Connection: close` on every response (C-1).
+//! [`hyper`]'s keep-alive connection loop, eliminating the large Tor
+//! page-load penalty caused by `Connection: close` on every response.
 //!
 //! Sub-modules:
 //! - [`handler`] — per-connection request handling and file serving
@@ -116,13 +117,14 @@ struct ServerContext {
     dir_list: bool,
     expose_dots: bool,
     spa_routing: bool,
-    error_404_path: Option<std::path::PathBuf>,
+    error_404_page: Option<Arc<handler::CustomErrorPage>>,
+    error_503_page: Option<Arc<handler::CustomErrorPage>>,
     redirects: Arc<Vec<crate::config::RedirectRule>>,
     semaphore: Arc<Semaphore>,
     per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
     max_conns: usize,
     max_per_ip: u32,
-    /// Task 1.2: IPs whose X-Forwarded-For header is trusted.
+    /// IPs whose X-Forwarded-For header is trusted.
     /// Defaults to empty (XFF ignored) for direct-edge deployments.
     trusted_proxies: Arc<Vec<IpAddr>>,
 }
@@ -152,28 +154,22 @@ impl ServerContext {
         };
         #[allow(clippy::cast_possible_truncation)]
         let max_conns = config.server.max_connections as usize;
-        // H-10 / C-6 — resolve custom error page paths once at startup.
         let site_dir = data_dir.join(&config.site.directory);
-        let error_404_path = config.site.error_404.as_deref().and_then(|p| {
-            let candidate = site_dir.join(p);
-            match candidate.canonicalize() {
-                Ok(resolved) if resolved.starts_with(canonical_root.as_ref()) => Some(resolved),
-                Ok(resolved) => {
-                    log::warn!(
-                        "Ignoring [site] error_404 path {} because it resolves outside the site root: {}",
-                        candidate.display(),
-                        resolved.display()
-                    );
-                    None
-                }
-                Err(e) => {
-                    log::warn!(
-                        "Ignoring [site] error_404 path {} because it could not be resolved: {e}",
-                        candidate.display()
-                    );
-                    None
-                }
-            }
+        let error_404_page = config.site.error_404.as_deref().and_then(|p| {
+            handler::load_custom_error_page(
+                canonical_root.as_ref(),
+                &site_dir.join(p),
+                "error_404",
+                hyper::StatusCode::NOT_FOUND,
+            )
+        });
+        let error_503_page = config.site.error_503.as_deref().and_then(|p| {
+            handler::load_custom_error_page(
+                canonical_root.as_ref(),
+                &site_dir.join(p),
+                "error_503",
+                hyper::StatusCode::SERVICE_UNAVAILABLE,
+            )
         });
         Some(Self {
             canonical_root,
@@ -182,13 +178,13 @@ impl ServerContext {
             dir_list: config.site.enable_directory_listing,
             expose_dots: config.site.expose_dotfiles,
             spa_routing: config.site.spa_routing,
-            error_404_path,
+            error_404_page,
+            error_503_page,
             redirects: Arc::new(config.redirects.clone()),
             semaphore,
             per_ip_map,
             max_conns,
             max_per_ip: config.server.max_connections_per_ip,
-            // Task 1.2: Read trusted proxy IPs from config (defaults to empty).
             // When empty, X-Forwarded-For is ignored on every connection.
             trusted_proxies: Arc::new(config.server.trusted_proxies.clone().unwrap_or_default()),
         })
@@ -197,7 +193,7 @@ impl ServerContext {
     ///
     /// Returns `false` when the global semaphore has been closed (shutdown),
     /// `true` in all other cases (connection accepted, rejected, or dropped).
-    async fn spawn_connection(
+    fn spawn_connection(
         &self,
         stream: tokio::net::TcpStream,
         peer: std::net::SocketAddr,
@@ -213,15 +209,14 @@ impl ServerContext {
             drop(stream);
             return true;
         };
-        let Ok(permit) = Arc::clone(&self.semaphore).acquire_owned().await else {
-            return false; // semaphore closed — signal shutdown to caller
-        };
-        if self.semaphore.available_permits() == 0 {
+        let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
             log::warn!(
-                "Connection limit ({}) reached; further connections will queue",
+                "Connection limit ({}) reached; rejecting connection from {peer_ip}",
                 self.max_conns
             );
-        }
+            drop(stream);
+            return true;
+        };
         let site = Arc::clone(&self.canonical_root);
         let idx = Arc::clone(&self.index_file);
         let met = Arc::clone(metrics);
@@ -232,7 +227,8 @@ impl ServerContext {
             spa_routing: self.spa_routing,
             is_https: false,
         };
-        let e404 = self.error_404_path.clone();
+        let e404 = self.error_404_page.clone();
+        let e503 = self.error_503_page.clone();
         let redirects = Arc::clone(&self.redirects);
         let trusted_proxies = Arc::clone(&self.trusted_proxies);
         join_set.spawn(async move {
@@ -247,6 +243,7 @@ impl ServerContext {
                 met,
                 csp,
                 e404,
+                e503,
                 redirects,
                 trusted_proxies,
             )
@@ -329,7 +326,7 @@ pub async fn run(
                     Ok((stream, peer)) => {
                         backoff_ms = 1;
                         log::debug!("Connection from {peer}");
-                        if !ctx.spawn_connection(stream, peer, &metrics, &mut join_set).await {
+                        if !ctx.spawn_connection(stream, peer, &metrics, &mut join_set) {
                             break; // semaphore closed — shutting down
                         }
                     }
@@ -394,7 +391,8 @@ pub async fn run_https(
 ) {
     let bind_addr = config.server.bind;
     let port = config.tls.port.get();
-    let std_listener = match StdTcpListener::bind(format!("{bind_addr}:{port}")) {
+    let bind_socket = std::net::SocketAddr::new(bind_addr, port);
+    let std_listener = match StdTcpListener::bind(bind_socket) {
         Ok(l) => l,
         Err(e) => {
             log::error!("HTTPS server failed to bind {bind_addr}:{port}: {e}");
@@ -455,8 +453,13 @@ pub async fn run_https(
                             drop(tcp_stream);
                             continue;
                         };
-                        let Ok(permit) = Arc::clone(&ctx.semaphore).acquire_owned().await else {
-                            break; // semaphore closed — shutting down
+                        let Ok(permit) = Arc::clone(&ctx.semaphore).try_acquire_owned() else {
+                            log::warn!(
+                                "Connection limit ({}) reached; rejecting TLS connection from {peer_ip}",
+                                ctx.max_conns
+                            );
+                            drop(tcp_stream);
+                            continue;
                         };
                         let site = Arc::clone(&ctx.canonical_root);
                         let idx = Arc::clone(&ctx.index_file);
@@ -468,7 +471,8 @@ pub async fn run_https(
                             spa_routing: ctx.spa_routing,
                             is_https: true,
                         };
-                        let e404 = ctx.error_404_path.clone();
+                        let e404 = ctx.error_404_page.clone();
+                        let e503 = ctx.error_503_page.clone();
                         let redirects = Arc::clone(&ctx.redirects);
                         let trusted_proxies = Arc::clone(&ctx.trusted_proxies);
                         join_set.spawn(async move {
@@ -542,6 +546,7 @@ pub async fn run_https(
                                 met,
                                 csp,
                                 e404,
+                                e503,
                                 redirects,
                                 trusted_proxies,
                             )
@@ -582,8 +587,8 @@ fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpLis
     let max_attempts: u16 = if fallback { 10 } else { 1 };
     for attempt in 0..max_attempts {
         let try_port = port.saturating_add(attempt);
-        let addr_str = format!("{addr}:{try_port}");
-        match StdTcpListener::bind(&addr_str) {
+        let socket_addr = std::net::SocketAddr::new(addr, try_port);
+        match StdTcpListener::bind(socket_addr) {
             Ok(std_listener) => {
                 std_listener.set_nonblocking(true)?;
                 let listener = TcpListener::from_std(std_listener)?;
@@ -651,12 +656,12 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 const MAX_SCAN_DEPTH: usize = 64;
 /// Recursively count files and total bytes in `site_root` (BFS traversal).
 ///
-/// Returns `Err` if any `read_dir` call fails so callers can log a warning
-/// instead of silently reporting zeros.
+/// Unreadable directories are skipped with a warning so one bad subtree does
+/// not prevent the rest of the site from being counted.
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Io`] if any directory in the tree cannot be read.
+/// Returns [`AppError::Io`] only if the initial traversal setup itself fails.
 ///
 /// # Panics
 ///

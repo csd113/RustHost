@@ -1,6 +1,7 @@
 //! # Config Loader
 //!
-//! **Directory:** `src/config/`
+//! **File:** `loader.rs`
+//! **Location:** `src/config/loader.rs`
 
 use super::Config;
 use crate::{AppError, Result};

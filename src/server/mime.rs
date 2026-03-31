@@ -1,6 +1,7 @@
 //! # MIME Type Mapping
 //!
-//! **Directory:** `src/server/`
+//! **File:** `mime.rs`
+//! **Location:** `src/server/mime.rs`
 //!
 //! Maps file extensions to MIME type strings.  Unknown extensions fall
 //! back to `application/octet-stream` so the browser offers a download
@@ -70,30 +71,30 @@ pub fn for_extension(ext: &str) -> &'static str {
         "wav" => "audio/wav",
         "mp4" | "m4v" => "video/mp4",
         "webm" => "video/webm",
-        // Modern audio (M-14)
+        // Modern audio
         "opus" => "audio/opus",
         "flac" => "audio/flac",
         "aac" => "audio/aac",
         "m4a" => "audio/mp4",
-        // Modern video (M-14)
+        // Modern video
         "mov" => "video/quicktime",
         "mkv" => "video/x-matroska",
         "avi" => "video/x-msvideo",
 
-        // Web app manifest — required for PWA installation (M-14)
+        // Web app manifest
         "webmanifest" => "application/manifest+json",
 
-        // 3D / WebGL (M-14)
+        // 3D / WebGL
         "glb" => "model/gltf-binary",
         "gltf" => "model/gltf+json",
 
-        // Data formats (M-14)
+        // Data formats
         "ndjson" => "application/x-ndjson",
         "geojson" => "application/geo+json",
         "toml" => "application/toml",
         "yaml" | "yml" => "application/yaml",
 
-        // Web fonts — additional (M-14)
+        // Additional web fonts
         "eot" => "application/vnd.ms-fontobject",
 
         // Fallback

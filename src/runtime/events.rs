@@ -1,6 +1,7 @@
 //! # Key Event Dispatch
 //!
-//! **Directory:** `src/runtime/`
+//! **File:** `events.rs`
+//! **Location:** `src/runtime/events.rs`
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -1,6 +1,7 @@
 //! # Config Module
 //!
-//! **Directory:** `src/config/`
+//! **File:** `mod.rs`
+//! **Location:** `src/config/mod.rs`
 pub mod defaults;
 pub mod loader;
 use log::LevelFilter;
@@ -13,7 +14,7 @@ use std::num::NonZeroU16;
 ///
 /// Replaces the `level: String` field + the duplicate `parse_level` /
 /// validation logic that previously existed in both `loader.rs` and
-/// `logging/mod.rs` (fix 4.2). An invalid value (e.g. `level = "verbose"`)
+/// `logging/mod.rs`. An invalid value (e.g. `level = "verbose"`)
 /// is now rejected at parse time with a clear serde error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -276,7 +277,6 @@ pub struct Config {
     pub identity: IdentityConfig,
     /// URL redirect/rewrite rules evaluated before filesystem resolution.
     /// Declared as `[[redirects]]` array-of-tables in `settings.toml`.
-    /// Addresses M-13.
     #[serde(default)]
     pub redirects: Vec<RedirectRule>,
     /// TLS / HTTPS configuration. All fields default to disabled so existing
@@ -397,7 +397,7 @@ pub struct LoggingConfig {
     pub enabled: bool,
 
     /// Log level, parsed from a lowercase string (`"trace"` … `"error"`).
-    /// Invalid values are rejected at config-load time (fix 4.2).
+    /// Invalid values are rejected at config-load time.
     #[serde(default = "default_logging_level")]
     pub level: LogLevel,
 
@@ -407,7 +407,7 @@ pub struct LoggingConfig {
     /// When `true` (default), suppress `Info`-and-below records from
     /// third-party crates (Arti, Tokio, TLS internals) so the log file stays
     /// focused on application events. Warnings and errors from all crates are
-    /// always passed through. Set `false` for full dependency tracing (fix 4.3).
+    /// always passed through. Set `false` for full dependency tracing.
     #[serde(default = "default_true")]
     pub filter_dependencies: bool,
 }

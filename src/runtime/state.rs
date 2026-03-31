@@ -1,6 +1,7 @@
 //! # Application State
 //!
-//! **Directory:** `src/runtime/`
+//! **File:** `state.rs`
+//! **Location:** `src/runtime/state.rs`
 //!
 //! Defines [`AppState`] — the single source of truth for all runtime values.
 //! Wrapped in [`SharedState`] (`Arc<RwLock<AppState>>`) so every subsystem

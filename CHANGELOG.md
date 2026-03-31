@@ -9,6 +9,18 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v0.1.3]
 
+### Simplified updates
+
+- Tightened connection admission so HTTP, HTTPS, and redirect listeners reject overflow immediately instead of holding accepted sockets open while waiting for permits.
+- Completed the shared response hardening path so redirects, `OPTIONS`, `405`, `304`, and other non-file responses now receive the full security-header set consistently.
+- Wired `site.error_503` into runtime serving and preload custom error pages at startup with size limits, removing per-request reloads and dead config.
+- Improved access-log accuracy by recording real `Content-Length` values when known and `-` when a streamed/compressed size is not known ahead of time.
+- Made compression more production-friendly by honoring `Accept-Encoding` quality values and skipping obviously poor candidates such as tiny or already-compressed assets.
+- Hardened private filesystem creation on Unix by creating Tor state directories and self-signed key files with restrictive permissions at creation time instead of relaxing them afterward.
+- Cleaned up startup and shutdown reliability by draining failed startup tasks, rejecting conflicting access-log reinitialization, and routing internal file-serving failures through one shared fallback path.
+- Split large server, runtime, and Tor helper sections into focused submodules and expanded test coverage for proxy IP resolution, custom `503` pages, redirect handling, and connection-limit rejection.
+- Bounded directory listings, clarified `scan_site` behavior, documented the lack of built-in auth/session features, and made the integration tests tolerate sandboxed environments that block loopback sockets.
+
 ## `tor/mod.rs`
 
 - **Fixed:** Rewrote `wait_for_shutdown_signal` to use `wait_for(|&v| v)` instead of `changed()` — prevents missed signals and silent sender-drop

@@ -1,6 +1,7 @@
 //! # Logging Module
 //!
-//! **Directory:** `src/logging/`
+//! **File:** `mod.rs`
+//! **Location:** `src/logging/mod.rs`
 //!
 //! Implements the [`log::Log`] trait so that standard `log::info!()`,
 //! `log::warn!()` etc. macros work everywhere without importing a concrete
@@ -27,7 +28,7 @@ use log::{Level, LevelFilter, Log, Metadata, Record};
 
 use crate::{config::LoggingConfig, AppError, Result};
 
-// ─── Structured access log (M-16) ────────────────────────────────────────────
+// ─── Structured access log ────────────────────────────────────────────────────
 
 /// An HTTP access log record in Combined Log Format (CLF).
 ///
@@ -43,7 +44,7 @@ pub struct AccessRecord<'a> {
     pub path: &'a str,
     pub protocol: &'a str,
     pub status: u16,
-    pub bytes_sent: u64,
+    pub bytes_sent: Option<u64>,
     pub user_agent: Option<&'a str>,
     pub referer: Option<&'a str>,
 }
@@ -60,6 +61,7 @@ impl std::fmt::Display for AccessRecord<'_> {
         let referer = self
             .referer
             .map_or_else(|| "-".to_owned(), escape_clf_field);
+        let bytes_sent = self.bytes_sent.map_or_else(|| "-".to_owned(), |n| n.to_string());
         write!(
             f,
             "{} - - [{now}] \"{} {} {}\" {} {} \"{}\" \"{}\"",
@@ -68,7 +70,7 @@ impl std::fmt::Display for AccessRecord<'_> {
             path,
             protocol,
             self.status,
-            self.bytes_sent,
+            bytes_sent,
             referer,
             ua,
         )
@@ -90,9 +92,26 @@ static ACCESS_LOG: OnceLock<Mutex<LogFile>> = OnceLock::new();
 /// # Errors
 ///
 /// Returns [`AppError::Io`] if the log directory cannot be created or the
-/// file cannot be opened.
+/// file cannot be opened. Returns [`AppError::LogInit`] if an access log has
+/// already been initialized for a different path.
 pub fn init_access_log(data_dir: &Path) -> Result<()> {
     let log_path = data_dir.join("logs/access.log");
+    if let Some(existing) = ACCESS_LOG.get() {
+        let existing_path = existing
+            .lock()
+            .map_err(|_| AppError::LogInit("access log mutex is poisoned".into()))?
+            .path
+            .clone();
+        if existing_path == log_path {
+            return Ok(());
+        }
+        return Err(AppError::LogInit(format!(
+            "access log already initialized at {}; cannot reinitialize with {}",
+            existing_path.display(),
+            log_path.display()
+        )));
+    }
+
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
         #[cfg(unix)]
@@ -129,12 +148,14 @@ pub fn init_access_log(data_dir: &Path) -> Result<()> {
             ))
         })?;
 
-    let _ = ACCESS_LOG.set(Mutex::new(LogFile {
+    ACCESS_LOG
+        .set(Mutex::new(LogFile {
         file: f,
         path: log_path,
         writes_since_check: 0,
         cached_size: 0,
-    }));
+        }))
+        .map_err(|_| AppError::LogInit("access log already initialized".into()))?;
     Ok(())
 }
 
@@ -298,8 +319,6 @@ impl Log for RustHostLogger {
         if metadata.level() > self.max_level {
             return false;
         }
-        // 4.3 — Target-based dependency filtering.
-        //
         // When `filter_dependencies` is true, only pass through records that:
         //   a) come from the `rusthost` crate (target starts with "rusthost"), OR
         //   b) are at Warn level or above (always surfaced regardless of origin).
@@ -437,7 +456,6 @@ pub fn flush() {
 pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
     LOG_BUFFER.get_or_init(|| Mutex::new(VecDeque::with_capacity(1_000)));
 
-    // 4.2 — LogLevel is now a typed enum; convert directly to LevelFilter.
     let max_level: LevelFilter = config.level.into();
 
     let file = if config.enabled {
@@ -453,7 +471,7 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
-            // Task 1.3: Replace the `whoami` subprocess with env-var lookup.
+            // Use env-var lookup rather than spawning `whoami`.
             //
             // Rationale: `whoami` depends on PATH availability (not guaranteed on
             // locked-down enterprise systems) and its stdout is user-controlled text
@@ -590,7 +608,6 @@ fn escape_clf_field(s: &str) -> String {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
-    // Task 1.3 — validate_windows_name unit tests.
     // These run on all platforms (cfg(test) is not gated on windows) so CI
     // catches regressions even on Linux/macOS build runners.
     use crate::logging::AccessRecord;
@@ -685,7 +702,7 @@ mod tests {
             path: "/a\"b\\c\nd",
             protocol: "HTTP/1.1",
             status: 200,
-            bytes_sent: 12,
+            bytes_sent: Some(12),
             user_agent: Some("agent\"name\\"),
             referer: Some("ref\r\nline"),
         };
@@ -694,5 +711,21 @@ mod tests {
         assert!(rendered.contains("\\\\"));
         assert!(!rendered.contains('\n'));
         assert!(!rendered.contains('\r'));
+    }
+
+    #[test]
+    fn access_record_renders_unknown_bytes_as_dash() {
+        let record = AccessRecord {
+            remote_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            method: "GET",
+            path: "/",
+            protocol: "HTTP/1.1",
+            status: 304,
+            bytes_sent: None,
+            user_agent: None,
+            referer: None,
+        };
+        let rendered = record.to_string();
+        assert!(rendered.contains(" 304 - "));
     }
 }

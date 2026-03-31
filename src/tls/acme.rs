@@ -1,7 +1,10 @@
-//! src/tls/acme.rs
+//! # ACME TLS Support
+//!
+//! **File:** `acme.rs`
+//! **Location:** `src/tls/acme.rs`
 use crate::Result;
 use crate::{config::AcmeConfig, error::AppError};
-use futures::StreamExt as _; // [Issue I] moved to module level from inside fn body
+use futures::StreamExt as _;
 use rustls::ServerConfig;
 use rustls_acme::AcmeAcceptor;
 use std::{
@@ -15,14 +18,13 @@ use std::{
 use tokio::{runtime::Handle, task::JoinHandle};
 
 #[cfg(unix)]
-use std::os::unix::fs::DirBuilderExt; // [Issue 4] DirBuilderExt for atomic mode on create
+use std::os::unix::fs::DirBuilderExt;
 
 // ---------------------------------------------------------------------------
 // Singleton guard — prevents multiple ACME loops racing over the same DirCache
 // ---------------------------------------------------------------------------
-// [Issue C] Two concurrent AcmeState instances sharing the same DirCache race
-// on account-key and certificate files, causing corruption and potentially
-// triggering Let's Encrypt rate limits through spurious re-issuance.
+// Two concurrent AcmeState instances sharing the same DirCache can race on
+// account-key and certificate files, causing corruption and redundant issuance.
 static ACME_INITIALIZED: OnceLock<()> = OnceLock::new();
 
 // ---------------------------------------------------------------------------
@@ -56,17 +58,12 @@ static ACME_INITIALIZED: OnceLock<()> = OnceLock::new();
 /// - there is no active Tokio runtime,
 /// - [`validate_acme_config`] rejects the provided [`AcmeConfig`], or
 /// - the ACME cache directory cannot be created or secured on disk.
-// [Issue F] #[must_use] ensures callers don't discard the acceptor/config
-// after the event loop has already been spawned and the cache dir created.
 #[must_use = "the AcmeAcceptor and ServerConfig must be used to serve TLS; \
               the JoinHandle must be retained to monitor the ACME event loop"]
 pub fn build_acme_acceptor(
     cfg: &AcmeConfig,
     data_dir: &Path,
-    // [Issue 5] Return the JoinHandle so callers can await it during shutdown
-    // and observe panics, instead of silently dropping it.
 ) -> Result<(Arc<AcmeAcceptor>, Arc<ServerConfig>, JoinHandle<()>)> {
-    // [Issue B] Respect the `enabled` flag — the original code never checked it.
     if !cfg.enabled {
         return Err(AppError::Tls(
             "build_acme_acceptor called with cfg.enabled = false; \
@@ -75,8 +72,8 @@ pub fn build_acme_acceptor(
         ));
     }
 
-    // Task 1.4: The OnceLock guard is checked here but NOT set yet.
-    // Setting it before validate_acme_config (as the original code did) meant
+    // The OnceLock guard is checked here but not set yet. Setting it before
+    // validate_acme_config would mean
     // that if validation — or any subsequent fallible step — failed, the lock
     // was already permanently set. All future retry attempts would be silently
     // blocked, and the process had to be restarted to recover from a transient
@@ -100,8 +97,8 @@ pub fn build_acme_acceptor(
 
     let cache_dir: PathBuf = data_dir.join(&cfg.cache_dir);
 
-    // [Issue 3] Check the *resolved* path length, not just the segment.
-    // The joined path can silently exceed OS limits (Linux: 4096, Win: 260)
+    // Check the resolved path length, not just the segment. The joined path
+    // can silently exceed OS limits (Linux: 4096, Win: 260)
     // even when the cfg.cache_dir segment passes its own length check.
     if cache_dir.as_os_str().len() > 4096 {
         return Err(AppError::Tls(format!(
@@ -110,8 +107,8 @@ pub fn build_acme_acceptor(
         )));
     }
 
-    // [Issue 4] Create the cache directory with restrictive permissions
-    // atomically on Unix using DirBuilder::mode(), eliminating the TOCTOU
+    // Create the cache directory with restrictive permissions atomically on
+    // Unix using DirBuilder::mode(), eliminating the TOCTOU
     // race between create_dir_all and a subsequent set_permissions call.
     // On non-Unix platforms create_dir_all is sufficient; there is no
     // equivalent of Unix file-mode bits.
@@ -138,7 +135,6 @@ pub fn build_acme_acceptor(
         })?;
     }
 
-    // [Issue 13] Removed the embedded `\n` that broke structured log formatters.
     if cfg.staging {
         log::warn!(
             "TLS/ACME: staging=true — certificates will NOT be trusted by browsers. \
@@ -187,22 +183,21 @@ pub fn build_acme_acceptor(
     #[allow(deprecated)]
     let acme_acceptor = Arc::new(state.acceptor());
 
-    // [Issue 7] Changed from &'static str to Arc<str> so the type honestly
-    // reflects that the value is derived at runtime, not a compile-time literal.
+    // The environment label is runtime-derived, so Arc<str> matches its
+    // lifetime more honestly than &'static str.
     let env_label: Arc<str> = if cfg.staging { "staging" } else { "production" }.into();
 
-    // [Issue A] Use try_current() instead of current() to convert the
-    // unconditional panic into a recoverable AppError.
+    // Use try_current() to convert a missing-runtime panic into a recoverable
+    // AppError.
     let rt_handle = Handle::try_current().map_err(|_| {
         AppError::Tls(
             "build_acme_acceptor must be called from within an active Tokio runtime".into(),
         )
     })?;
 
-    // [Issue 5] Retain the JoinHandle and return it to the caller.
     let task_handle = rt_handle.spawn(run_acme_event_loop(state, env_label));
 
-    // Task 1.4: Mark initialization as complete only after every fallible step
+    // Mark initialization as complete only after every fallible step
     // has succeeded. If any earlier step returned Err (validation, cache dir
     // creation, runtime handle, etc.) the lock was never set, so the caller
     // can retry without restarting the process.
@@ -237,7 +232,6 @@ pub fn build_acme_acceptor(
 /// only happens during a clean process shutdown.
 async fn run_acme_event_loop<EC, EA>(
     mut state: rustls_acme::AcmeState<EC, EA>,
-    // [Issue 7] Arc<str> instead of &'static str — value is runtime-derived.
     env_label: Arc<str>,
 ) where
     EC: Debug + Send + 'static,
@@ -253,8 +247,8 @@ async fn run_acme_event_loop<EC, EA>(
                 log::info!("TLS/ACME [{env_label}]: {event:?}");
             }
             Some(Err(err)) => {
-                // [Issue G] Back off on consecutive errors instead of
-                // immediately looping, which would busy-spin and flood logs
+                // Back off on consecutive errors instead of immediately
+                // looping, which would busy-spin and flood logs
                 // during persistent failures (bad DNS, rate limits, etc.).
                 // The rustls-acme state machine handles retries internally;
                 // the sleep here prevents us from hammering it faster than
@@ -292,8 +286,8 @@ async fn run_acme_event_loop<EC, EA>(
 /// - `email`: if provided, non-empty and structurally plausible
 ///   (`local@domain`).
 ///
-/// [Issue 9] All `AcmeConfig` field validation is consolidated here so callers
-/// (config-check CLIs, tests) get a complete picture from a single call site.
+/// All `AcmeConfig` field validation is consolidated here so callers get a
+/// complete picture from a single call site.
 fn validate_acme_config(cfg: &AcmeConfig) -> Result<()> {
     // --- domains -------------------------------------------------------
 
@@ -303,8 +297,8 @@ fn validate_acme_config(cfg: &AcmeConfig) -> Result<()> {
         ));
     }
 
-    // [Issue E] Detect duplicates — sending the same domain twice to the
-    // ACME server triggers redundant challenge attempts and can exhaust
+    // Sending the same domain twice triggers redundant challenge attempts and
+    // can exhaust
     // Let's Encrypt's per-domain rate limits.
     let mut seen: HashSet<&str> = HashSet::new();
 
@@ -321,7 +315,7 @@ fn validate_acme_config(cfg: &AcmeConfig) -> Result<()> {
                 "[tls.acme] domain {domain:?} contains leading/trailing whitespace"
             )));
         }
-        // [Issue D] Non-ASCII (IDN) domains must be punycode-encoded before
+        // Non-ASCII (IDN) domains must be punycode-encoded before
         // submission. rustls-acme does not perform IDN normalisation, so
         // passing "münchen.de" would produce an obscure runtime failure.
         if !trimmed.is_ascii() {
@@ -330,7 +324,7 @@ fn validate_acme_config(cfg: &AcmeConfig) -> Result<()> {
                  encode internationalized domains in punycode (e.g. xn--...)"
             )));
         }
-        // [Issue H] RFC 8555 §7.1.4 requires canonical lowercase identifiers.
+        // RFC 8555 §7.1.4 requires canonical lowercase identifiers.
         // Mixed-case domains may also fail SNI matching at the TLS layer.
         if trimmed.chars().any(|c| c.is_ascii_uppercase()) {
             return Err(AppError::Tls(format!(
@@ -338,14 +332,14 @@ fn validate_acme_config(cfg: &AcmeConfig) -> Result<()> {
                  (RFC 8555 §7.1.4 canonical form)"
             )));
         }
-        // [Issue 6] Reject malformed dot placement.
+        // Reject malformed dot placement.
         if trimmed.starts_with('.') || trimmed.ends_with('.') || trimmed.contains("..") {
             return Err(AppError::Tls(format!(
                 "[tls.acme] domain {domain:?} has invalid dot placement \
                  (leading dot, trailing dot, or consecutive dots)"
             )));
         }
-        // [Issue 6] Wildcards are incompatible with TLS-ALPN-01, which is
+        // Wildcards are incompatible with TLS-ALPN-01, which is
         // what rustls-acme uses. DNS-01 is required for wildcard issuance.
         if trimmed.starts_with("*.") {
             return Err(AppError::Tls(format!(
@@ -360,7 +354,7 @@ fn validate_acme_config(cfg: &AcmeConfig) -> Result<()> {
                  domain name, not a bare hostname or IP address"
             )));
         }
-        // [Issue E] Duplicate check (after all per-entry normalisation above).
+        // Duplicate check after normalization.
         if !seen.insert(trimmed) {
             return Err(AppError::Tls(format!(
                 "[tls.acme] duplicate domain {domain:?} in domains list"
@@ -369,16 +363,16 @@ fn validate_acme_config(cfg: &AcmeConfig) -> Result<()> {
     }
 
     // --- cache_dir -----------------------------------------------------
-    // [Issue 9] Moved from build_acme_acceptor so validate_acme_config is
-    // the single authoritative validation entry point for AcmeConfig.
+    // Keep cache-dir validation here so this function is the single
+    // authoritative validation entry point for AcmeConfig.
 
     if Path::new(&cfg.cache_dir).is_absolute() {
         return Err(AppError::Tls(
             "[tls.acme.cache_dir] must be a relative path".into(),
         ));
     }
-    // [Issue 2] Use Path::components() instead of str::contains("..") to
-    // perform a correct component-aware check. The string ".." can appear in
+    // Use Path::components() instead of str::contains("..") to perform a
+    // correct component-aware check. The string ".." can appear in
     // non-traversal contexts (e.g. "a/..b") while a ParentDir component is
     // unambiguously a directory traversal.
     if Path::new(&cfg.cache_dir)
@@ -408,7 +402,7 @@ fn validate_acme_config(cfg: &AcmeConfig) -> Result<()> {
                     .into(),
             ));
         }
-        // [Issue 11] Basic structural check: non-empty local part + '@' +
+        // Basic structural check: non-empty local part + '@' +
         // non-empty domain part. Full RFC 5321 validation is out of scope,
         // but this catches the most common typos before Let's Encrypt rejects
         // the account registration with a cryptic error.
@@ -483,7 +477,6 @@ mod tests {
 
     #[test]
     fn rejects_non_ascii_domain() {
-        // [Issue D] IDN domains must be punycode-encoded.
         let mut cfg = valid_cfg();
         cfg.domains = vec!["münchen.de".into()];
         assert!(validate_acme_config(&cfg).is_err());
@@ -491,7 +484,6 @@ mod tests {
 
     #[test]
     fn rejects_uppercase_domain() {
-        // [Issue H] RFC 8555 requires lowercase identifiers.
         let mut cfg = valid_cfg();
         cfg.domains = vec!["Example.COM".into()];
         assert!(validate_acme_config(&cfg).is_err());
@@ -527,7 +519,6 @@ mod tests {
 
     #[test]
     fn rejects_wildcard_domain() {
-        // [Issue 6] Wildcards are incompatible with TLS-ALPN-01.
         let mut cfg = valid_cfg();
         cfg.domains = vec!["*.example.com".into()];
         assert!(validate_acme_config(&cfg).is_err());
@@ -556,7 +547,6 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_domains() {
-        // [Issue E] Duplicates can trigger ACME rate limits.
         let mut cfg = valid_cfg();
         cfg.domains = vec!["example.com".into(), "example.com".into()];
         assert!(validate_acme_config(&cfg).is_err());
@@ -592,7 +582,6 @@ mod tests {
 
     #[test]
     fn rejects_email_without_at_sign() {
-        // [Issue 11] Basic format validation.
         let mut cfg = valid_cfg();
         cfg.email = Some("notanemail".into());
         assert!(validate_acme_config(&cfg).is_err());
@@ -626,7 +615,6 @@ mod tests {
     }
 
     // --- cache_dir validation ---
-    // [Issue 10] These were entirely absent from the original test suite.
 
     #[test]
     fn rejects_absolute_cache_dir() {
@@ -637,7 +625,6 @@ mod tests {
 
     #[test]
     fn rejects_dotdot_cache_dir_prefix() {
-        // [Issue 2] Catches the traversal the original string check also caught.
         let mut cfg = valid_cfg();
         cfg.cache_dir = "../outside".into();
         assert!(validate_acme_config(&cfg).is_err());
@@ -645,8 +632,8 @@ mod tests {
 
     #[test]
     fn rejects_dotdot_cache_dir_in_middle() {
-        // [Issue 2] The old str::contains("..") would flag "a/..b" (false
-        // positive) but miss this when the component boundary falls elsewhere.
+        // The old str::contains("..") would flag "a/..b" (false positive)
+        // but miss this when the component boundary falls elsewhere.
         // Component::ParentDir is unambiguous.
         let mut cfg = valid_cfg();
         cfg.cache_dir = "tls/../../../etc/passwd".into();

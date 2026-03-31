@@ -1,6 +1,7 @@
 //! # Console Input
 //!
-//! **Directory:** `src/console/`
+//! **File:** `input.rs`
+//! **Location:** `src/console/input.rs`
 
 use std::time::Duration;
 

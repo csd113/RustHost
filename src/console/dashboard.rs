@@ -1,6 +1,7 @@
 //! # Dashboard Renderer
 //!
-//! **Directory:** `src/console/`
+//! **File:** `dashboard.rs`
+//! **Location:** `src/console/dashboard.rs`
 use crate::{
     config::Config,
     logging,
@@ -23,6 +24,53 @@ fn dim(s: &str) -> String {
 fn bold(s: &str) -> String {
     format!("\x1b[1m{s}\x1b[0m")
 }
+
+fn local_http_url(bind_addr: std::net::IpAddr, port: u16) -> String {
+    match bind_addr {
+        std::net::IpAddr::V4(addr) if addr.is_unspecified() => {
+            format!("http://127.0.0.1:{port}")
+        }
+        std::net::IpAddr::V6(addr) if addr.is_unspecified() => {
+            format!("http://[::1]:{port}")
+        }
+        std::net::IpAddr::V6(addr) => format!("http://[{addr}]:{port}"),
+        std::net::IpAddr::V4(addr) => format!("http://{addr}:{port}"),
+    }
+}
+
+fn local_https_url(bind_addr: std::net::IpAddr, port: u16) -> String {
+    match bind_addr {
+        std::net::IpAddr::V4(addr) if addr.is_unspecified() => {
+            if port == 443 {
+                "https://127.0.0.1".to_owned()
+            } else {
+                format!("https://127.0.0.1:{port}")
+            }
+        }
+        std::net::IpAddr::V6(addr) if addr.is_unspecified() => {
+            if port == 443 {
+                "https://[::1]".to_owned()
+            } else {
+                format!("https://[::1]:{port}")
+            }
+        }
+        std::net::IpAddr::V6(addr) => {
+            if port == 443 {
+                format!("https://[{addr}]")
+            } else {
+                format!("https://[{addr}]:{port}")
+            }
+        }
+        std::net::IpAddr::V4(addr) => {
+            if port == 443 {
+                format!("https://{addr}")
+            } else {
+                format!("https://{addr}:{port}")
+            }
+        }
+    }
+}
+
 const RULE: &str = "────────────────────────────────";
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 #[must_use]
@@ -78,15 +126,12 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
     out.push_str("\r\n");
     // ── Endpoints ────────────────────────────────────────────────────────────
     let _ = writeln!(out, "{}\r", bold("Endpoints"));
-    let _ = writeln!(out, " Local : http://localhost:{}\r", state.actual_port);
+    let local_url = local_http_url(config.server.bind, state.actual_port);
+    let _ = writeln!(out, " Local : {local_url}\r");
     // HTTPS endpoint — only shown when the TLS server is up.
     if state.tls_running {
         if let Some(tls_port) = state.tls_port {
-            let https_url = if tls_port == 443 {
-                "https://localhost".to_owned()
-            } else {
-                format!("https://localhost:{tls_port}")
-            };
+            let https_url = local_https_url(config.server.bind, tls_port);
             let _ = writeln!(out, " HTTPS : {}\r", green(&https_url));
         }
     }
