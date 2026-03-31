@@ -274,6 +274,7 @@ struct RouteConfig {
     trusted_proxies: Arc<Vec<std::net::IpAddr>>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn route(
     req: Request<Incoming>,
     cfg: &RouteConfig,
@@ -1100,16 +1101,14 @@ async fn onion_location_header_value(
         .headers()
         .get(header::HOST)
         .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .unwrap_or("");
+        .map_or("", str::trim);
     if host.eq_ignore_ascii_case("") {
         return None;
     }
-    if host
-        .split(':')
-        .next()
-        .is_some_and(|value| value.ends_with(".onion"))
-    {
+    if host.split(':').next().is_some_and(|value| {
+        value.len() >= ".onion".len()
+            && value[value.len() - ".onion".len()..].eq_ignore_ascii_case(".onion")
+    }) {
         return None;
     }
 

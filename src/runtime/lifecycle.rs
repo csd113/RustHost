@@ -269,6 +269,7 @@ fn schedule_initial_site_scan(config: &Arc<Config>, state: &SharedState, data_di
 /// Core server startup given an already-built `Config`.
 ///
 /// Shared by the standard settings.toml path and the `--serve` one-shot mode.
+#[allow(clippy::too_many_lines)]
 async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Result<()> {
     // 2. Initialise logging.
     logging::init(&config.logging, &data_dir)?;

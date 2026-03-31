@@ -89,10 +89,7 @@ type AcmeBuildResult = Result<(
 /// - the ACME cache directory cannot be created or secured on disk.
 #[must_use = "the AcmeAcceptor and ServerConfig must be used to serve TLS; \
               the JoinHandle must be retained to monitor the ACME event loop"]
-pub fn build_acme_acceptor(
-    cfg: &AcmeConfig,
-    data_dir: &Path,
-) -> AcmeBuildResult {
+pub fn build_acme_acceptor(cfg: &AcmeConfig, data_dir: &Path) -> AcmeBuildResult {
     if !cfg.enabled {
         return Err(AppError::Tls(
             "build_acme_acceptor called with cfg.enabled = false; \
@@ -245,10 +242,8 @@ fn acquire_acme_init_guard() -> Result<AcmeInitGuard> {
 ///
 /// The loop exits only when the underlying stream closes, which normally
 /// only happens during a clean process shutdown.
-async fn run_acme_event_loop<EC, EA>(
-    mut state: rustls_acme::AcmeState<EC, EA>,
-    env_label: Arc<str>,
-) where
+async fn run_acme_event_loop<EC, EA>(mut state: rustls_acme::AcmeState<EC, EA>, env_label: Arc<str>)
+where
     EC: Debug + Send + 'static,
     EA: Debug + Send + 'static,
 {

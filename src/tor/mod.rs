@@ -61,7 +61,7 @@ const RECONNECT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 const RETRY_BASE_SECS: u64 = 30;
 const RETRY_MAX_SECS: u64 = 300;
 const MAX_RETRIES: u32 = 5;
-const TOR_RELAY_BUFFER_BYTES: usize = 64 * 1024;
+const TOR_RELAY_BUFFER_BYTES: usize = 32 * 1024;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -487,7 +487,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut transferred = 0u64;
-    let mut buffer = [0u8; TOR_RELAY_BUFFER_BYTES];
+    let mut buffer = vec![0u8; TOR_RELAY_BUFFER_BYTES].into_boxed_slice();
 
     loop {
         let read = tokio::time::timeout(

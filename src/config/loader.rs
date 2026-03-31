@@ -36,9 +36,7 @@ fn reject_parent_dir(value: &str, label: &str, errors: &mut Vec<String>) {
         .components()
         .any(|c| c == std::path::Component::ParentDir)
     {
-        errors.push(format!(
-            "[site] {label} must not contain '..' components"
-        ));
+        errors.push(format!("[site] {label} must not contain '..' components"));
     }
 }
 
@@ -52,7 +50,9 @@ fn validate_redirects(cfg: &Config, errors: &mut Vec<String>) {
                 errors.push(format!("{prefix}: from must start with '/'"));
             }
             if rule.from.chars().any(char::is_control) {
-                errors.push(format!("{prefix}: from must not contain control characters"));
+                errors.push(format!(
+                    "{prefix}: from must not contain control characters"
+                ));
             }
         }
 

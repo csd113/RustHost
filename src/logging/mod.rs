@@ -66,18 +66,13 @@ impl std::fmt::Display for AccessRecord<'_> {
         let referer = self
             .referer
             .map_or_else(|| "-".to_owned(), escape_clf_field);
-        let bytes_sent = self.bytes_sent.map_or_else(|| "-".to_owned(), |n| n.to_string());
+        let bytes_sent = self
+            .bytes_sent
+            .map_or_else(|| "-".to_owned(), |n| n.to_string());
         write!(
             f,
             "{} - - [{now}] \"{} {} {}\" {} {} \"{}\" \"{}\"",
-            self.remote_addr,
-            method,
-            path,
-            protocol,
-            self.status,
-            bytes_sent,
-            referer,
-            ua,
+            self.remote_addr, method, path, protocol, self.status, bytes_sent, referer, ua,
         )
     }
 }
@@ -164,7 +159,10 @@ pub fn init_access_log(data_dir: &Path) -> Result<()> {
         let mut guard = existing
             .lock()
             .map_err(|_| AppError::LogInit("access log mutex is poisoned".into()))?;
-        if guard.as_ref().is_some_and(|current| current.path == log_path) {
+        if guard
+            .as_ref()
+            .is_some_and(|current| current.path == log_path)
+        {
             drop(guard);
             return Ok(());
         }
@@ -190,7 +188,10 @@ pub fn log_access(record: &AccessRecord<'_>) {
     if let Some(log) = ACCESS_LOG.get() {
         if let Ok(guard) = log.lock() {
             if let Some(state) = guard.as_ref() {
-                match state.tx.try_send(AccessLogCommand::Line(record.to_string())) {
+                match state
+                    .tx
+                    .try_send(AccessLogCommand::Line(record.to_string()))
+                {
                     Ok(()) => {}
                     Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                         let _ = ACCESS_LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -690,9 +691,9 @@ fn escape_clf_field(s: &str) -> String {
 mod tests {
     // These run on all platforms (cfg(test) is not gated on windows) so CI
     // catches regressions even on Linux/macOS build runners.
-    use crate::logging::AccessRecord;
     #[cfg(windows)]
     use super::validate_windows_name;
+    use crate::logging::AccessRecord;
 
     // Provide a shim for non-Windows test runs so the test bodies compile.
     #[cfg(not(windows))]

@@ -110,6 +110,7 @@ fn try_acquire_per_ip(
 /// Extracting these into a struct keeps [`run`] under the 100-line limit
 /// imposed by `clippy::nursery::too_many_lines` while grouping the values
 /// that every spawned handler task needs.
+#[allow(clippy::struct_excessive_bools)]
 struct ServerContext {
     canonical_root: Arc<Path>,
     index_file: Arc<str>,
@@ -778,7 +779,7 @@ fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpLis
 }
 
 #[must_use]
-pub fn tor_loopback_addr(addr: IpAddr) -> IpAddr {
+pub const fn tor_loopback_addr(addr: IpAddr) -> IpAddr {
     match addr {
         IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),

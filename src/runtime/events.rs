@@ -44,17 +44,18 @@ pub async fn reload_site(
 ) -> Result<()> {
     let site_root = data_dir.join(&config.site.directory);
     let scan_root = site_root.clone();
-    let (count, bytes) = match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            log::warn!("Site rescan failed: {e}");
-            return Ok(());
-        }
-        Err(e) => {
-            log::warn!("Site rescan task panicked: {e}");
-            return Ok(());
-        }
-    };
+    let (count, bytes) =
+        match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                log::warn!("Site rescan failed: {e}");
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!("Site rescan task panicked: {e}");
+                return Ok(());
+            }
+        };
     {
         let mut s = state.write().await;
         s.site_file_count = count;
