@@ -160,7 +160,7 @@ fn spawn_windows(exe: &std::path::Path, cli_args: &[String]) -> Result<(), BoxEr
         .env(SPAWNED_VAR, "1")
         .creation_flags(CREATE_NEW_CONSOLE)
         .spawn()
-        .map_err(|e| format!("failed to spawn new console window: {e}").into())?;
+        .map_err(|e| -> BoxError { format!("failed to spawn new console window: {e}").into() })?;
 
     Ok(())
 }
