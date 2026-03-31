@@ -328,6 +328,18 @@ pub struct ServerConfig {
     /// Defaults to `"off"` — no CSP header, maximum browser compatibility.
     #[serde(default)]
     pub csp_level: CspLevel,
+
+    /// IPs trusted to set the `X-Forwarded-For` header. When `None` or empty,
+    /// the header is ignored and the TCP peer address is always used for
+    /// rate-limiting and logging. This is the safe default for direct-edge
+    /// deployments; set it only when running behind a known reverse proxy.
+    ///
+    /// Example `settings.toml` entry:
+    /// ```toml
+    /// trusted_proxies = ["127.0.0.1", "::1"]
+    /// ```
+    #[serde(default)]
+    pub trusted_proxies: Option<Vec<IpAddr>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -432,6 +444,7 @@ impl Default for Config {
                 max_connections: default_max_connections(),
                 max_connections_per_ip: default_max_connections_per_ip(),
                 csp_level: CspLevel::Off,
+                trusted_proxies: None,
             },
             site: SiteConfig {
                 directory: default_site_directory(),

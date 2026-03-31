@@ -131,6 +131,7 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
             max_connections: 256,
             max_connections_per_ip: 16,
             csp_level: CspLevel::Off,
+            trusted_proxies: None,
         },
         site: SiteConfig {
             directory: dir_str,

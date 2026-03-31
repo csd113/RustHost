@@ -122,6 +122,9 @@ struct ServerContext {
     per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
     max_conns: usize,
     max_per_ip: u32,
+    /// Task 1.2: IPs whose X-Forwarded-For header is trusted.
+    /// Defaults to empty (XFF ignored) for direct-edge deployments.
+    trusted_proxies: Arc<Vec<IpAddr>>,
 }
 impl ServerContext {
     /// Variant used when the HTTP and HTTPS listeners must share the same
@@ -165,6 +168,9 @@ impl ServerContext {
             per_ip_map,
             max_conns,
             max_per_ip: config.server.max_connections_per_ip,
+            // Task 1.2: Read trusted proxy IPs from config (defaults to empty).
+            // When empty, X-Forwarded-For is ignored on every connection.
+            trusted_proxies: Arc::new(config.server.trusted_proxies.clone().unwrap_or_default()),
         })
     }
     /// Attempt to spawn a handler task for one accepted connection.
@@ -208,11 +214,23 @@ impl ServerContext {
         };
         let e404 = self.error_404_path.clone();
         let redirects = Arc::clone(&self.redirects);
+        let trusted_proxies = Arc::clone(&self.trusted_proxies);
         join_set.spawn(async move {
             let _permit = permit;
             let _ip_guard = ip_guard;
-            if let Err(e) =
-                handler::handle(stream, site, idx, flags, met, csp, e404, redirects).await
+            if let Err(e) = handler::handle(
+                stream,
+                peer,
+                site,
+                idx,
+                flags,
+                met,
+                csp,
+                e404,
+                redirects,
+                trusted_proxies,
+            )
+            .await
             {
                 log::debug!("Handler error: {e}");
             }
@@ -432,6 +450,7 @@ pub async fn run_https(
                         };
                         let e404 = ctx.error_404_path.clone();
                         let redirects = Arc::clone(&ctx.redirects);
+                        let trusted_proxies = Arc::clone(&ctx.trusted_proxies);
                         join_set.spawn(async move {
                             // Items must appear before any statements (clippy::items_after_statements).
                             use tokio_util::compat::{
@@ -496,6 +515,7 @@ pub async fn run_https(
                             };
                             if let Err(e) = handler::handle(
                                 tls_stream,
+                                peer,
                                 site,
                                 idx,
                                 flags,
@@ -503,6 +523,7 @@ pub async fn run_https(
                                 csp,
                                 e404,
                                 redirects,
+                                trusted_proxies,
                             )
                             .await
                             {

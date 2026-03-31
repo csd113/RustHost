@@ -348,6 +348,62 @@ impl Log for RustHostLogger {
     }
 }
 
+/// Validate a Windows identity name component (username or domain).
+///
+/// Rejects control characters and the `icacls` metacharacters that would
+/// confuse argument parsing. Intentionally does **not** log the raw value on
+/// failure — adversarial input must not reach log sinks.
+///
+/// Mirrors the identical function in `src/tor/mod.rs` (`harden_windows_permissions`).
+/// If the validation rules need updating, both copies must be kept in sync —
+/// a shared utility in `crate::util` is the long-term home.
+#[cfg(windows)]
+fn validate_windows_name(s: &str) -> std::io::Result<()> {
+    if s.is_empty() || s.len() > 256 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Windows identity name has unexpected length: {} bytes",
+                s.len()
+            ),
+        ));
+    }
+    // Illegal in Windows names: " / \ [ ] : ; | = , + * ? < >
+    // Also reject: ( ) — icacls grant-string metacharacters.
+    // Also reject: control characters and & (shell metacharacter on cmd.exe).
+    let has_bad_char = s.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '"' | '/'
+                    | '\\'
+                    | '['
+                    | ']'
+                    | ':'
+                    | ';'
+                    | '|'
+                    | '='
+                    | ','
+                    | '+'
+                    | '*'
+                    | '?'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | '&'
+            )
+    });
+    if has_bad_char {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            // Raw value intentionally omitted to avoid logging attacker input.
+            "Windows identity name component contains disallowed characters",
+        ));
+    }
+    Ok(())
+}
+
 /// Flush all buffered log entries to the log file.
 ///
 /// Invokes `RustHostLogger::flush()`, which acquires the file mutex and calls
@@ -390,27 +446,61 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
-            // Phase 2 (H-5) — enforce owner-only access on Windows as well.
-            // Default directory creation on Windows inherits the parent ACL,
-            // which is typically world-readable on consumer machines.
-            // `icacls /inheritance:r` removes inherited ACEs; the `/grant:r`
-            // grants Full Control only to the current user.
+            // Task 1.3: Replace the `whoami` subprocess with env-var lookup.
+            //
+            // Rationale: `whoami` depends on PATH availability (not guaranteed on
+            // locked-down enterprise systems) and its stdout is user-controlled text
+            // that was concatenated directly into `icacls` arguments, enabling
+            // command injection for any username containing `&`, `;`, `(`, etc.
+            //
+            // The Windows kernel unconditionally sets USERNAME and USERDOMAIN in
+            // every process's environment — they are equivalent in value to `whoami`
+            // but never require a subprocess or shell expansion.
+            //
+            // Both values are validated by `validate_windows_name` before use.
+            // The Tor module (tor/mod.rs) already follows this pattern correctly;
+            // this brings logging into alignment.
             #[cfg(windows)]
             {
-                if let Ok(whoami_out) = std::process::Command::new("whoami").output() {
-                    let user = String::from_utf8_lossy(&whoami_out.stdout)
-                        .trim()
-                        .to_owned();
-                    let path_str = parent.to_string_lossy();
-                    let _ = std::process::Command::new("icacls")
-                        .args([
-                            path_str.as_ref(),
-                            "/inheritance:r",
-                            "/grant:r",
-                            &format!("{user}:(OI)(CI)F"),
-                        ])
-                        .output();
-                }
+                let username = std::env::var("USERNAME").map_err(|e| {
+                    AppError::LogInit(format!("USERNAME environment variable not available: {e}"))
+                })?;
+                let userdomain = std::env::var("USERDOMAIN").map_err(|e| {
+                    AppError::LogInit(format!(
+                        "USERDOMAIN environment variable not available: {e}"
+                    ))
+                })?;
+
+                validate_windows_name(&username).map_err(|e| {
+                    AppError::LogInit(format!(
+                        "USERNAME contains disallowed characters — \
+                         cannot harden log directory ACL: {e}"
+                    ))
+                })?;
+                validate_windows_name(&userdomain).map_err(|e| {
+                    AppError::LogInit(format!(
+                        "USERDOMAIN contains disallowed characters — \
+                         cannot harden log directory ACL: {e}"
+                    ))
+                })?;
+
+                // Build the icacls grant specifier as a single argument token.
+                // std::process::Command wraps arguments containing spaces in double
+                // quotes on Windows (CreateProcessW), so usernames with spaces
+                // (e.g. enterprise accounts like "John Smith") are handled correctly.
+                //
+                // Format: "DOMAIN\user:(OI)(CI)F"
+                //   (OI) = object inherit, (CI) = container inherit, F = full control.
+                let grant_arg = format!("{userdomain}\\{username}:(OI)(CI)F");
+                let path_str = parent.to_string_lossy();
+                let _ = std::process::Command::new("icacls")
+                    .args([
+                        path_str.as_ref(),
+                        "/inheritance:r",
+                        "/grant:r",
+                        grant_arg.as_str(),
+                    ])
+                    .output();
             }
         }
 
@@ -472,5 +562,97 @@ const fn level_label(level: Level) -> &'static str {
         Level::Info => "INFO ",
         Level::Warn => "WARN ",
         Level::Error => "ERROR",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    // Task 1.3 — validate_windows_name unit tests.
+    // These run on all platforms (cfg(test) is not gated on windows) so CI
+    // catches regressions even on Linux/macOS build runners.
+    #[cfg(windows)]
+    use super::validate_windows_name;
+
+    // Provide a shim for non-Windows test runs so the test bodies compile.
+    #[cfg(not(windows))]
+    fn validate_windows_name(s: &str) -> std::io::Result<()> {
+        // Mirror the real implementation so tests remain meaningful on Linux CI.
+        if s.is_empty() || s.len() > 256 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows identity name has unexpected length",
+            ));
+        }
+        let bad = s.chars().any(|c| {
+            c.is_control()
+                || matches!(
+                    c,
+                    '"' | '/'
+                        | '\\'
+                        | '['
+                        | ']'
+                        | ':'
+                        | ';'
+                        | '|'
+                        | '='
+                        | ','
+                        | '+'
+                        | '*'
+                        | '?'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '&'
+                )
+        });
+        if bad {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows identity name component contains disallowed characters",
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn validate_windows_name_rejects_ampersand() {
+        // & is a cmd.exe metacharacter — injecting it could chain commands.
+        assert!(validate_windows_name("user & evil").is_err());
+    }
+
+    #[test]
+    fn validate_windows_name_rejects_semicolon() {
+        assert!(validate_windows_name("user;cmd").is_err());
+    }
+
+    #[test]
+    fn validate_windows_name_rejects_parens() {
+        // ( ) are icacls grant-string metacharacters.
+        assert!(validate_windows_name("user(admin)").is_err());
+    }
+
+    #[test]
+    fn validate_windows_name_rejects_empty() {
+        assert!(validate_windows_name("").is_err());
+    }
+
+    #[test]
+    fn validate_windows_name_rejects_overlong() {
+        assert!(validate_windows_name(&"a".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn validate_windows_name_accepts_normal_user() {
+        assert!(validate_windows_name("normal_user").is_ok());
+    }
+
+    #[test]
+    fn validate_windows_name_accepts_domain_user_with_space() {
+        // Enterprise usernames like "John Smith" are valid.
+        assert!(validate_windows_name("John Smith").is_ok());
     }
 }

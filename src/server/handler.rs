@@ -72,6 +72,10 @@ pub struct FeatureFlags {
 /// Propagates I/O errors from hyper's connection driver.
 pub async fn handle<S>(
     stream: S,
+    // Task 1.2: Real socket address of the connecting client. This is used as
+    // the remote-IP in access logs unless the peer is in trusted_proxies, in
+    // which case X-Forwarded-For is consulted instead.
+    peer_addr: std::net::SocketAddr,
     canonical_root: Arc<Path>,
     index_file: Arc<str>,
     flags: FeatureFlags,
@@ -79,6 +83,9 @@ pub async fn handle<S>(
     csp: Arc<str>,
     error_404_path: Option<std::path::PathBuf>,
     redirects: Arc<Vec<crate::config::RedirectRule>>,
+    // Task 1.2: IPs/networks from which X-Forwarded-For may be trusted.
+    // An empty slice means XFF is ignored entirely (default / safest).
+    trusted_proxies: Arc<Vec<std::net::IpAddr>>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -90,6 +97,8 @@ where
         flags,
         error_404_path,
         redirects,
+        peer_addr,
+        trusted_proxies,
     });
 
     let io = TokioIo::new(stream);
@@ -124,6 +133,13 @@ struct RouteConfig {
     error_404_path: Option<std::path::PathBuf>,
     /// Operator redirect/rewrite rules (M-13), checked before filesystem resolution.
     redirects: Arc<Vec<crate::config::RedirectRule>>,
+    /// Task 1.2: Real socket address of the accepted TCP connection.
+    /// Used as the authoritative remote-IP in access logs unless the peer is in
+    /// `trusted_proxies`, in which case X-Forwarded-For is substituted.
+    peer_addr: std::net::SocketAddr,
+    /// Task 1.2: Set of IPs allowed to supply X-Forwarded-For headers.
+    /// An empty Vec means XFF is ignored on every connection (default).
+    trusted_proxies: Arc<Vec<std::net::IpAddr>>,
 }
 
 async fn route(
@@ -135,13 +151,25 @@ async fn route(
         &Method::OPTIONS => {
             metrics.add_request();
             let resp = options_response();
-            log_request(&req, resp.status().as_u16(), 0);
+            log_request(
+                &req,
+                resp.status().as_u16(),
+                0,
+                cfg.peer_addr,
+                &cfg.trusted_proxies,
+            );
             return Ok(inject_security_headers(resp, cfg.flags.is_https));
         }
         m if m != Method::GET && m != Method::HEAD => {
             metrics.add_error();
             let resp = method_not_allowed();
-            log_request(&req, resp.status().as_u16(), 0);
+            log_request(
+                &req,
+                resp.status().as_u16(),
+                0,
+                cfg.peer_addr,
+                &cfg.trusted_proxies,
+            );
             return Ok(inject_security_headers(resp, cfg.flags.is_https));
         }
         _ => {}
@@ -158,7 +186,13 @@ async fn route(
             let status = rule.status;
             metrics.add_request();
             let resp = external_redirect_response(&safe, status, &cfg.csp);
-            log_request(&req, resp.status().as_u16(), 0);
+            log_request(
+                &req,
+                resp.status().as_u16(),
+                0,
+                cfg.peer_addr,
+                &cfg.trusted_proxies,
+            );
             return Ok(inject_security_headers(resp, cfg.flags.is_https));
         }
     }
@@ -185,7 +219,13 @@ async fn route(
     .await?;
 
     // M-16 — write one Combined Log Format line per request.
-    log_request(&req, resp.status().as_u16(), 0);
+    log_request(
+        &req,
+        resp.status().as_u16(),
+        0,
+        cfg.peer_addr,
+        &cfg.trusted_proxies,
+    );
 
     // Inject HSTS and other security headers that depend on transport.
     let resp = inject_security_headers(resp, cfg.flags.is_https);
@@ -262,20 +302,42 @@ async fn dispatch_resolved(
     })
 }
 
-/// Emit one access-log line.  `bytes_sent` is 0 for HEAD / redirects where
-/// we don't track the body size; a future improvement could measure it.
-fn log_request<B>(req: &Request<B>, status: u16, bytes_sent: u64) {
-    // Only emit if the access logger has been initialised.
+/// Emit one access-log line.
+///
+/// Task 1.2 — The `peer_addr` parameter is the real socket address of the
+/// accepted TCP connection. It is used as the authoritative remote-IP **unless**
+/// `peer_addr.ip()` is in `trusted_proxies`, in which case the first entry of
+/// `X-Forwarded-For` is consulted instead.
+///
+/// This prevents any client from forging `X-Forwarded-For: 127.0.0.1` to
+/// appear as localhost in access logs on a direct-edge server where no
+/// trusted proxy exists (i.e. the default empty list).
+fn log_request<B>(
+    req: &Request<B>,
+    status: u16,
+    bytes_sent: u64,
+    peer_addr: std::net::SocketAddr,
+    trusted_proxies: &[std::net::IpAddr],
+) {
     use crate::logging::{log_access, AccessRecord};
-    // Extract the peer address from the forwarded headers if available,
-    // otherwise fall back to 127.0.0.1 (we don't have socket addr here).
-    let remote = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
-        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+
+    // Start with the real socket address as the authoritative source of truth.
+    let mut remote = peer_addr.ip();
+
+    // Only consult X-Forwarded-For when the connecting peer is explicitly
+    // listed as a trusted proxy. An empty trusted_proxies list (the default)
+    // means XFF is always ignored — safe for direct-edge deployments.
+    if trusted_proxies.contains(&remote) {
+        if let Some(forwarded_ip) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.trim().parse::<std::net::IpAddr>().ok())
+        {
+            remote = forwarded_ip;
+        }
+    }
 
     let ua = req
         .headers()

@@ -97,29 +97,79 @@ pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<A
 // ---------------------------------------------------------------------------
 
 fn load_manual_cert(cfg: &ManualCertConfig, data_dir: &Path) -> Result<Arc<TlsAcceptor>> {
+    use std::path::Component;
+
+    // Task 1.1 (belt): Reject ParentDir components before joining with data_dir.
+    // A pure string/lexical starts_with check on the joined path can be fooled by
+    // paths like "../outside.crt" — they pass the prefix test as a string but the
+    // OS resolves them to a location entirely outside data_dir.
+    // Mirror the pattern already used by validate_acme_config in acme.rs.
+    if Path::new(&cfg.cert_path)
+        .components()
+        .any(|c| c == Component::ParentDir)
+    {
+        return Err(AppError::Tls(
+            "cert_path must not contain parent directory components".into(),
+        ));
+    }
+    if Path::new(&cfg.key_path)
+        .components()
+        .any(|c| c == Component::ParentDir)
+    {
+        return Err(AppError::Tls(
+            "key_path must not contain parent directory components".into(),
+        ));
+    }
+
+    // Absolute paths are also unconditionally rejected — cert files must live
+    // inside the data directory, not be referenced by a rooted path.
+    if Path::new(&cfg.cert_path).is_absolute() {
+        return Err(AppError::Tls(
+            "cert_path must be a relative path (no leading '/')".into(),
+        ));
+    }
+    if Path::new(&cfg.key_path).is_absolute() {
+        return Err(AppError::Tls(
+            "key_path must be a relative path (no leading '/')".into(),
+        ));
+    }
+
     let cert_path = data_dir.join(&cfg.cert_path);
     let key_path = data_dir.join(&cfg.key_path);
 
-    if cert_path.is_absolute() || !cert_path.starts_with(data_dir) {
+    // Task 1.1 (suspenders): Canonicalize both the data_dir anchor and the
+    // resolved paths, then verify containment on the canonical forms.
+    // This catches any remaining escapes via symlinks that survive the component
+    // check above (e.g. a symlink inside data_dir pointing outside it).
+    let canonical_data_dir = std::fs::canonicalize(data_dir)
+        .map_err(|e| AppError::Tls(format!("cannot canonicalize data_dir: {e}")))?;
+    let canonical_cert = std::fs::canonicalize(&cert_path)
+        .map_err(|e| AppError::Tls(format!("cannot resolve cert_path '{}': {e}", cfg.cert_path)))?;
+    let canonical_key = std::fs::canonicalize(&key_path)
+        .map_err(|e| AppError::Tls(format!("cannot resolve key_path '{}': {e}", cfg.key_path)))?;
+
+    if !canonical_cert.starts_with(&canonical_data_dir) {
         return Err(AppError::Tls(format!(
-            "cert path escapes data_dir: {}",
+            "cert_path resolves outside data_dir after canonicalization: {}",
             cfg.cert_path
         )));
     }
-    if key_path.is_absolute() || !key_path.starts_with(data_dir) {
+    if !canonical_key.starts_with(&canonical_data_dir) {
         return Err(AppError::Tls(format!(
-            "key path escapes data_dir: {}",
+            "key_path resolves outside data_dir after canonicalization: {}",
             cfg.key_path
         )));
     }
 
     log::debug!(
         "TLS: loading cert from {} and key from {}",
-        cert_path.display(),
-        key_path.display()
+        canonical_cert.display(),
+        canonical_key.display()
     );
 
-    load_pem_as_acceptor(&cert_path, &key_path)
+    // Use the canonical paths for I/O to avoid any TOCTOU between the check
+    // above and the actual read in load_pem_as_acceptor.
+    load_pem_as_acceptor(&canonical_cert, &canonical_key)
 }
 
 // ---------------------------------------------------------------------------
@@ -167,4 +217,71 @@ pub(super) fn load_pem_as_acceptor(cert_path: &Path, key_path: &Path) -> Result<
         .map_err(|e| AppError::Tls(format!("invalid certificate/key pair: {e}")))?;
 
     Ok(Arc::new(TlsAcceptor::from(Arc::new(server_cfg))))
+}
+
+// ---------------------------------------------------------------------------
+// Tests — Task 1.1 path traversal regression
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ManualCertConfig;
+    use tempfile::TempDir;
+
+    fn traversal_cfg(cert: &str, key: &str) -> ManualCertConfig {
+        ManualCertConfig {
+            cert_path: cert.into(),
+            key_path: key.into(),
+        }
+    }
+
+    // Helper: call load_manual_cert and check that it returns an Err whose
+    // message contains `needle`.
+    fn assert_rejected(cfg: &ManualCertConfig, data_dir: &Path, needle: &str) {
+        match load_manual_cert(cfg, data_dir) {
+            Ok(_) => panic!("expected load_manual_cert to return Err"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(needle),
+                    "expected error to contain {needle:?}, got: {msg:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_parent_dir_in_cert_path() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = traversal_cfg("../outside.crt", "server.key");
+        assert_rejected(&cfg, tmp.path(), "parent directory");
+    }
+
+    #[test]
+    fn rejects_parent_dir_in_key_path() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = traversal_cfg("server.crt", "../outside.key");
+        assert_rejected(&cfg, tmp.path(), "parent directory");
+    }
+
+    #[test]
+    fn rejects_nested_traversal_in_cert_path() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = traversal_cfg("sub/../../escape.crt", "server.key");
+        assert_rejected(&cfg, tmp.path(), "parent directory");
+    }
+
+    #[test]
+    fn rejects_absolute_cert_path() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = traversal_cfg("/etc/ssl/cert.pem", "server.key");
+        assert_rejected(&cfg, tmp.path(), "relative path");
+    }
+
+    #[test]
+    fn rejects_absolute_key_path() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = traversal_cfg("server.crt", "/etc/ssl/private/key.pem");
+        assert_rejected(&cfg, tmp.path(), "relative path");
+    }
 }

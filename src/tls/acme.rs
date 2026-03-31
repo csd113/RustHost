@@ -75,15 +75,24 @@ pub fn build_acme_acceptor(
         ));
     }
 
-    // [Issue C] Enforce single initialization per process.
-    ACME_INITIALIZED.set(()).map_err(|()| {
-        AppError::Tls(
+    // Task 1.4: The OnceLock guard is checked here but NOT set yet.
+    // Setting it before validate_acme_config (as the original code did) meant
+    // that if validation — or any subsequent fallible step — failed, the lock
+    // was already permanently set. All future retry attempts would be silently
+    // blocked, and the process had to be restarted to recover from a transient
+    // failure (e.g. a momentarily non-writable cache directory).
+    //
+    // We set the lock only after every fallible step succeeds (see the bottom
+    // of this function). A guard is still checked here so that a *second call
+    // after a prior success* is rejected immediately, before doing any work.
+    if ACME_INITIALIZED.get().is_some() {
+        return Err(AppError::Tls(
             "build_acme_acceptor has already been called; \
              ACME may only be initialized once per process to prevent \
              concurrent state machines from racing over the shared DirCache"
                 .into(),
-        )
-    })?;
+        ));
+    }
 
     // All config validation — domains, email, and cache_dir — is now
     // consolidated in validate_acme_config (see Issue 9).
@@ -192,6 +201,21 @@ pub fn build_acme_acceptor(
 
     // [Issue 5] Retain the JoinHandle and return it to the caller.
     let task_handle = rt_handle.spawn(run_acme_event_loop(state, env_label));
+
+    // Task 1.4: Mark initialization as complete only after every fallible step
+    // has succeeded. If any earlier step returned Err (validation, cache dir
+    // creation, runtime handle, etc.) the lock was never set, so the caller
+    // can retry without restarting the process.
+    //
+    // set() returns Err(()) if another thread raced us here — treat that as
+    // a duplicate-initialization error (same message as the early-exit guard).
+    ACME_INITIALIZED.set(()).map_err(|()| {
+        AppError::Tls(
+            "build_acme_acceptor completed concurrently on another thread; \
+             ACME may only be initialized once per process"
+                .into(),
+        )
+    })?;
 
     Ok((acme_acceptor, server_cfg, task_handle))
 }
