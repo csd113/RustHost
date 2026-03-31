@@ -54,12 +54,11 @@ enable_directory_listing = false
 
 [tor]
 # Enable built-in Tor onion service (Arti client, no external binary needed).
-# Disabled by default so first-run installs do not publish an onion service
-# unless the operator explicitly opts in.
-enabled = false
+# Enabled by default so the local site also comes up on Tor immediately.
+enabled = true
 
 # Grace period for active Tor streams during shutdown.
-shutdown_grace_secs = 30
+shutdown_grace_secs = 5
 
 # ─── [logging] ────────────────────────────────────────────────────────────────
 

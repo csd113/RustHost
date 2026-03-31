@@ -218,10 +218,7 @@ pub(super) fn build_directory_listing(dir: &Path, url_path: &str, expose_dotfile
             truncated = true;
             let should_replace = names.last().is_some_and(|largest| name < *largest);
             if should_replace {
-                let largest = names
-                    .last()
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_default();
+                let largest = names.last().map(ToOwned::to_owned).unwrap_or_default();
                 names.remove(&largest);
                 names.insert(name);
             }

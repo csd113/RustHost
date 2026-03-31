@@ -20,6 +20,7 @@ use super::SharedConnectionBudget;
 pub(super) struct BackgroundTasks {
     pub(super) https: Option<tokio::task::JoinHandle<()>>,
     pub(super) redirect: Option<tokio::task::JoinHandle<()>>,
+    pub(super) tor_ingress: Option<tokio::task::JoinHandle<()>>,
     pub(super) acme: Option<tokio::task::JoinHandle<()>>,
     pub(super) acme_guard: Option<tls::acme::AcmeInitGuard>,
 }
@@ -32,15 +33,15 @@ pub(super) async fn wait_for_bind_port(
         Ok(Ok(port)) => Ok(port),
         Ok(Err(_)) => {
             log::error!("{label} port channel closed before sending — startup failed");
-            Err(AppError::ServerStartup(
-                format!("{label} task exited before signalling its bound port"),
-            ))
+            Err(AppError::ServerStartup(format!(
+                "{label} task exited before signalling its bound port"
+            )))
         }
         Err(_) => {
             log::error!("Timed out waiting for {label} to bind");
-            Err(AppError::ServerStartup(
-                format!("Timed out waiting for {label} to bind (10 s)"),
-            ))
+            Err(AppError::ServerStartup(format!(
+                "Timed out waiting for {label} to bind (10 s)"
+            )))
         }
     }
 }
@@ -129,8 +130,7 @@ pub(super) async fn setup_tls(
                 let redir_sem = std::sync::Arc::clone(&budget.semaphore);
                 let redir_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
                 let redir_max_per_ip = config.server.max_connections_per_ip;
-                let redir_drain_timeout =
-                    Duration::from_secs(config.server.shutdown_grace_secs);
+                let redir_drain_timeout = Duration::from_secs(config.server.shutdown_grace_secs);
                 let (redir_port_tx, redir_port_rx) = oneshot::channel::<u16>();
                 tasks.redirect = Some(tokio::spawn(async move {
                     server::redirect::run_redirect_server(
@@ -199,10 +199,7 @@ pub(super) async fn graceful_shutdown(
 
     if let Some(handle) = tor_handle {
         let tor_budget = Duration::from_secs(config.tor.shutdown_grace_secs);
-        if tokio::time::timeout(tor_budget, handle)
-            .await
-            .is_err()
-        {
+        if tokio::time::timeout(tor_budget, handle).await.is_err() {
             log::warn!(
                 "Tor circuit teardown did not complete within {} s; \
                  active Tor streams will be forcibly closed",
@@ -215,6 +212,12 @@ pub(super) async fn graceful_shutdown(
         background_tasks.redirect,
         Duration::from_secs(config.server.shutdown_grace_secs.saturating_add(2)),
         "HTTP redirect server",
+    )
+    .await;
+    wait_for_background_task(
+        background_tasks.tor_ingress,
+        Duration::from_secs(config.server.shutdown_grace_secs.saturating_add(2)),
+        "Tor ingress server",
     )
     .await;
     wait_for_background_task(
@@ -252,7 +255,10 @@ pub(super) async fn wait_for_background_task(
             log::warn!("{label} task ended with a join error during shutdown: {e}");
         }
         Err(_) => {
-            log::warn!("{label} did not stop within {} s; aborting task", timeout.as_secs());
+            log::warn!(
+                "{label} did not stop within {} s; aborting task",
+                timeout.as_secs()
+            );
             handle.abort();
         }
     }

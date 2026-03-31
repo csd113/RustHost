@@ -316,7 +316,7 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     );
 
     // Wait for the server to signal its bound port via the oneshot channel.
-    let bind_port = match wait_for_bind_port(port_rx, "HTTP server").await {
+    match wait_for_bind_port(port_rx, "HTTP server").await {
         Ok(port) => port,
         Err(err) => {
             let _ = shutdown_tx.send(true);
@@ -344,17 +344,54 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     .inspect_err(|_| {
         let _ = shutdown_tx.send(true);
     })?;
+    let mut background_tasks = background_tasks;
 
     // 7. Start Tor (if enabled).
     //    tor::init() spawns a Tokio task and returns its JoinHandle.
     //    Pass shutdown_rx so Tor's stream loop exits on clean shutdown.
     let tor_handle = if config.tor.enabled {
+        let tor_bind_addr = server::tor_loopback_addr(config.server.bind);
+        let (tor_ingress_port_tx, tor_ingress_port_rx) = oneshot::channel::<u16>();
+        let tor_ingress_config = Arc::clone(&config);
+        let tor_ingress_state = Arc::clone(&state);
+        let tor_ingress_metrics = Arc::clone(&metrics);
+        let tor_ingress_shutdown = shutdown_rx.clone();
+        let tor_ingress_data_dir = data_dir.clone();
+        let tor_ingress_sem = std::sync::Arc::clone(&budget.semaphore);
+        let tor_ingress_root_rx = root_tx.subscribe();
+        background_tasks.tor_ingress = Some(tokio::spawn(async move {
+            server::run_tor_ingress(
+                tor_ingress_config,
+                tor_ingress_state,
+                tor_ingress_metrics,
+                tor_ingress_data_dir,
+                tor_ingress_shutdown,
+                tor_ingress_port_tx,
+                tor_ingress_sem,
+                tor_ingress_root_rx,
+            )
+            .await;
+        }));
+        let tor_ingress_port =
+            match wait_for_bind_port(tor_ingress_port_rx, "Tor ingress server").await {
+                Ok(port) => port,
+                Err(err) => {
+                    let _ = shutdown_tx.send(true);
+                    wait_for_background_task(
+                        background_tasks.tor_ingress.take(),
+                        Duration::from_secs(5),
+                        "Tor ingress server startup task",
+                    )
+                    .await;
+                    return Err(err);
+                }
+            };
         #[allow(clippy::cast_possible_truncation)]
         let max_tor = config.server.max_connections as usize;
         Some(tor::init(
             data_dir.clone(),
-            bind_port,
-            config.server.bind,
+            tor_ingress_port,
+            tor_bind_addr,
             max_tor,
             Arc::clone(&state),
             shutdown_rx.clone(),
@@ -375,7 +412,14 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     event_loop(key_rx, &config, &state, &metrics, data_dir, root_tx).await?;
 
     // 11. Graceful shutdown.
-    graceful_shutdown(&config, shutdown_tx, server_handle, tor_handle, background_tasks).await;
+    graceful_shutdown(
+        &config,
+        shutdown_tx,
+        server_handle,
+        tor_handle,
+        background_tasks,
+    )
+    .await;
     Ok(())
 }
 
@@ -445,16 +489,26 @@ async fn start_console(
     } else {
         let snapshot = state.read().await.clone();
         println!("RustHost running");
-        println!(" HTTP : http://{}:{}", config.server.bind, snapshot.actual_port);
+        println!(
+            " HTTP : http://{}:{}",
+            config.server.bind, snapshot.actual_port
+        );
         if snapshot.tls_running {
             if let Some(tls_port) = snapshot.tls_port {
                 println!(" HTTPS: https://{}:{tls_port}", config.server.bind);
             }
         }
-        println!(" Site : {}", data_dir.join(&config.site.directory).display());
+        println!(
+            " Site : {}",
+            data_dir.join(&config.site.directory).display()
+        );
         println!(
             " Tor  : {}",
-            if config.tor.enabled { "enabled" } else { "disabled" }
+            if config.tor.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
         Ok(None)
     }

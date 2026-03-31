@@ -115,6 +115,7 @@ struct ServerContext {
     index_file: Arc<str>,
     csp_header: Arc<str>,
     state: SharedState,
+    keep_alive: bool,
     dir_list: bool,
     expose_dots: bool,
     spa_routing: bool,
@@ -124,7 +125,7 @@ struct ServerContext {
     semaphore: Arc<Semaphore>,
     per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
     max_conns: usize,
-    max_per_ip: u32,
+    max_per_ip: Option<u32>,
     /// IPs whose X-Forwarded-For header is trusted.
     /// Defaults to empty (XFF ignored) for direct-edge deployments.
     trusted_proxies: Arc<Vec<IpAddr>>,
@@ -141,6 +142,8 @@ impl ServerContext {
         data_dir: &Path,
         semaphore: Arc<Semaphore>,
         per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
+        max_per_ip: Option<u32>,
+        keep_alive: bool,
     ) -> Option<Self> {
         let site_root = data_dir.join(&config.site.directory);
         let canonical_root: Arc<Path> = match site_root.canonicalize() {
@@ -178,6 +181,7 @@ impl ServerContext {
             index_file: Arc::from(config.site.index_file.as_str()),
             csp_header: Arc::from(config.server.csp_level.as_header_value()),
             state,
+            keep_alive,
             dir_list: config.site.enable_directory_listing,
             expose_dots: config.site.expose_dotfiles,
             spa_routing: config.site.spa_routing,
@@ -187,7 +191,7 @@ impl ServerContext {
             semaphore,
             per_ip_map,
             max_conns,
-            max_per_ip: config.server.max_connections_per_ip,
+            max_per_ip,
             // When empty, X-Forwarded-For is ignored on every connection.
             trusted_proxies: Arc::new(config.server.trusted_proxies.clone().unwrap_or_default()),
         })
@@ -204,13 +208,15 @@ impl ServerContext {
         join_set: &mut JoinSet<()>,
     ) -> bool {
         let peer_ip = peer.ip();
-        let Ok(ip_guard) = try_acquire_per_ip(&self.per_ip_map, peer_ip, self.max_per_ip) else {
-            log::warn!(
-                "Per-IP limit ({}) reached for {peer_ip}; dropping connection",
-                self.max_per_ip
-            );
-            drop(stream);
-            return true;
+        let ip_guard = if let Some(limit) = self.max_per_ip {
+            let Ok(ip_guard) = try_acquire_per_ip(&self.per_ip_map, peer_ip, limit) else {
+                log::warn!("Per-IP limit ({limit}) reached for {peer_ip}; dropping connection");
+                drop(stream);
+                return true;
+            };
+            Some(ip_guard)
+        } else {
+            None
         };
         let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
             log::warn!(
@@ -230,6 +236,7 @@ impl ServerContext {
             expose_dotfiles: self.expose_dots,
             spa_routing: self.spa_routing,
             is_https: false,
+            keep_alive: self.keep_alive,
         };
         let e404 = self.error_404_page.clone();
         let e503 = self.error_503_page.clone();
@@ -307,6 +314,8 @@ pub async fn run(
         &data_dir,
         shared_semaphore,
         shared_per_ip_map,
+        Some(config.server.max_connections_per_ip),
+        true,
     ) else {
         return;
     };
@@ -435,6 +444,8 @@ pub async fn run_https(
         &data_dir,
         shared_semaphore,
         shared_per_ip_map,
+        Some(config.server.max_connections_per_ip),
+        true,
     ) else {
         return;
     };
@@ -469,13 +480,17 @@ pub async fn run_https(
                             }
                         };
                         let peer_ip = peer.ip();
-                        let Ok(ip_guard) = try_acquire_per_ip(&ctx.per_ip_map, peer_ip, ctx.max_per_ip) else {
-                            log::warn!(
-                                "Per-IP limit ({}) reached for {peer_ip}; dropping TLS connection",
-                                ctx.max_per_ip
-                            );
-                            drop(tcp_stream);
-                            continue;
+                        let ip_guard = if let Some(limit) = ctx.max_per_ip {
+                            let Ok(ip_guard) = try_acquire_per_ip(&ctx.per_ip_map, peer_ip, limit) else {
+                                log::warn!(
+                                    "Per-IP limit ({limit}) reached for {peer_ip}; dropping TLS connection"
+                                );
+                                drop(tcp_stream);
+                                continue;
+                            };
+                            Some(ip_guard)
+                        } else {
+                            None
                         };
                         let Ok(permit) = Arc::clone(&ctx.semaphore).try_acquire_owned() else {
                             log::warn!(
@@ -495,6 +510,7 @@ pub async fn run_https(
                             expose_dotfiles: ctx.expose_dots,
                             spa_routing: ctx.spa_routing,
                             is_https: true,
+                            keep_alive: ctx.keep_alive,
                         };
                         let e404 = ctx.error_404_page.clone();
                         let e503 = ctx.error_503_page.clone();
@@ -615,6 +631,105 @@ pub async fn run_https(
     .await;
     log::info!("HTTPS server drained.");
 }
+
+/// Start a loopback-only HTTP listener used exclusively by the Tor proxy.
+///
+/// This listener serves the same site tree as the main HTTP server but bypasses
+/// per-IP admission control because every Tor stream originates from loopback
+/// once Arti proxies it into the local process. It still shares the global
+/// connection semaphore so Tor traffic participates in the overall capacity
+/// budget instead of becoming an unbounded side channel.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tor_ingress(
+    config: Arc<Config>,
+    state: SharedState,
+    metrics: SharedMetrics,
+    data_dir: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+    port_tx: oneshot::Sender<u16>,
+    shared_semaphore: Arc<Semaphore>,
+    root_watch: watch::Receiver<Arc<Path>>,
+) {
+    let bind_addr = tor_loopback_addr(config.server.bind);
+    let listener = match TcpListener::bind(std::net::SocketAddr::new(bind_addr, 0)).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            log::error!("Tor ingress server failed to bind {bind_addr}:0: {e}");
+            return;
+        }
+    };
+    let bound_port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => {
+            log::error!("Tor ingress server could not read bound port: {e}");
+            return;
+        }
+    };
+    let Some(mut ctx) = ServerContext::with_shared(
+        &config,
+        state,
+        &data_dir,
+        shared_semaphore,
+        Arc::new(DashMap::new()),
+        None,
+        false,
+    ) else {
+        return;
+    };
+    let _ = port_tx.send(bound_port);
+    log::info!("Tor ingress server listening on {bind_addr}:{bound_port}");
+    let mut join_set: JoinSet<()> = JoinSet::new();
+    let mut root_watch = root_watch;
+    let mut backoff_ms: u64 = 1;
+    loop {
+        if root_watch.has_changed().unwrap_or(false) {
+            let new_root = Arc::clone(&root_watch.borrow_and_update());
+            log::info!("Tor ingress: site root refreshed: {}", new_root.display());
+            ctx.canonical_root = new_root;
+        }
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, peer)) => {
+                        backoff_ms = 1;
+                        log::debug!("Tor ingress connection from {peer}");
+                        if !ctx.spawn_connection(stream, peer, &metrics, &mut join_set) {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        if is_fd_exhaustion(&e) {
+                            log::error!(
+                                "Tor ingress accept error — file-descriptor limit reached \
+                                 (EMFILE/ENFILE): {e}. Reduce max_connections or raise the OS ulimit."
+                            );
+                        } else {
+                            log::debug!("Tor ingress accept error (transient): {e}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = backoff_ms.saturating_mul(2).min(1_000);
+                    }
+                }
+            }
+            Some(result) = join_set.join_next(), if !join_set.is_empty() => {
+                if let Err(e) = result {
+                    log::debug!("Tor ingress connection task join error: {e}");
+                }
+            }
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() { break; }
+            }
+        }
+    }
+    log::info!("Tor ingress server stopped accepting; draining in-flight connections…");
+    let drain = async { while join_set.join_next().await.is_some() {} };
+    let _ = tokio::time::timeout(
+        Duration::from_secs(config.server.shutdown_grace_secs),
+        drain,
+    )
+    .await;
+    log::info!("Tor ingress server drained.");
+}
 // ─── Port binding ─────────────────────────────────────────────────────────────
 /// Try to bind to `addr:port`. When `fallback` is true, increments the port
 /// up to 10 times before giving up.
@@ -651,6 +766,14 @@ fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpLis
             ),
         ),
     })
+}
+
+#[must_use]
+pub fn tor_loopback_addr(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+    }
 }
 /// Return `true` when `e` represents file-descriptor exhaustion.
 ///

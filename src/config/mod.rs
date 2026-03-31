@@ -81,11 +81,14 @@ const fn default_max_connections_per_ip() -> u32 {
 const fn default_shutdown_grace_secs() -> u64 {
     30
 }
+const fn default_tor_shutdown_grace_secs() -> u64 {
+    5
+}
 const fn default_true() -> bool {
     true
 }
-const fn default_false() -> bool {
-    false
+const fn default_tor_enabled() -> bool {
+    true
 }
 
 /// Server defaults
@@ -397,12 +400,12 @@ pub struct SiteConfig {
 pub struct TorConfig {
     /// Master on/off switch. When `false`, Tor is never started and the
     /// onion address section of the dashboard is hidden.
-    #[serde(default = "default_false")]
+    #[serde(default = "default_tor_enabled")]
     pub enabled: bool,
 
     /// Maximum time to allow active onion-service streams to drain during
     /// graceful shutdown before remaining tasks are aborted.
-    #[serde(default = "default_shutdown_grace_secs")]
+    #[serde(default = "default_tor_shutdown_grace_secs")]
     pub shutdown_grace_secs: u64,
 }
 
@@ -473,8 +476,8 @@ impl Default for Config {
                 error_503: None,
             },
             tor: TorConfig {
-                enabled: false,
-                shutdown_grace_secs: default_shutdown_grace_secs(),
+                enabled: default_tor_enabled(),
+                shutdown_grace_secs: default_tor_shutdown_grace_secs(),
             },
             logging: LoggingConfig {
                 enabled: default_logging_enabled(),

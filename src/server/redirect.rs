@@ -307,9 +307,9 @@ fn sanitize_host_header(raw: &str) -> Option<String> {
         let remainder = &host[end.saturating_add(1)..];
         if !(remainder.is_empty()
             || remainder.starts_with(':')
-                && remainder
-                    .get(1..)
-                    .is_some_and(|port| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())))
+                && remainder.get(1..).is_some_and(|port| {
+                    !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+                }))
         {
             return None;
         }

@@ -94,6 +94,7 @@ pub struct FeatureFlags {
     pub expose_dotfiles: bool,
     pub spa_routing: bool,
     pub is_https: bool,
+    pub keep_alive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,7 +233,7 @@ where
     let io = TokioIo::new(stream);
 
     hyper::server::conn::http1::Builder::new()
-        .keep_alive(true)
+        .keep_alive(flags.keep_alive)
         .max_buf_size(MAX_REQUEST_BUFFER_BYTES)
         .serve_connection(
             io,
