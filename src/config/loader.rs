@@ -25,24 +25,58 @@ pub fn load(path: &Path) -> Result<Config> {
     Ok(config)
 }
 
-fn validate(cfg: &Config) -> Result<()> {
-    let mut errors: Vec<String> = Vec::new();
+fn reject_parent_dir(value: &str, label: &str, errors: &mut Vec<String>) {
+    let path = std::path::Path::new(value);
+    if path.has_root() {
+        errors.push(format!("[site] {label} must not be an absolute path"));
+        return;
+    }
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        errors.push(format!(
+            "[site] {label} must not contain '..' components"
+        ));
+    }
+}
 
-    fn reject_parent_dir(value: &str, label: &str, errors: &mut Vec<String>) {
-        let path = std::path::Path::new(value);
-        if path.has_root() {
-            errors.push(format!("[site] {label} must not be an absolute path"));
-            return;
+fn validate_redirects(cfg: &Config, errors: &mut Vec<String>) {
+    for (idx, rule) in cfg.redirects.iter().enumerate() {
+        let prefix = format!("[[redirects]] entry {}", idx.saturating_add(1));
+        if rule.from.is_empty() {
+            errors.push(format!("{prefix}: from must not be empty"));
+        } else {
+            if !rule.from.starts_with('/') {
+                errors.push(format!("{prefix}: from must start with '/'"));
+            }
+            if rule.from.chars().any(char::is_control) {
+                errors.push(format!("{prefix}: from must not contain control characters"));
+            }
         }
-        if path
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-        {
+
+        if rule.to.is_empty() {
+            errors.push(format!("{prefix}: to must not be empty"));
+        } else if rule.to.chars().any(char::is_control) {
+            errors.push(format!("{prefix}: to must not contain control characters"));
+        } else if !rule.to.is_ascii() {
             errors.push(format!(
-                "[site] {label} must not contain '..' components"
+                "{prefix}: to must be ASCII so it can be emitted safely as an HTTP Location header"
+            ));
+        }
+
+        if !matches!(rule.status, 301 | 302) {
+            errors.push(format!(
+                "{prefix}: status must be either 301 or 302, got {}",
+                rule.status
             ));
         }
     }
+}
+
+#[allow(clippy::too_many_lines)] // Centralizes config validation in one place.
+fn validate(cfg: &Config) -> Result<()> {
+    let mut errors: Vec<String> = Vec::new();
 
     // [server]
     // max_connections = 0 deadlocks the semaphore (never grants permits).
@@ -155,6 +189,8 @@ fn validate(cfg: &Config) -> Result<()> {
     if cfg.identity.instance_name.chars().any(char::is_control) {
         errors.push("[identity] instance_name must not contain control characters".into());
     }
+
+    validate_redirects(cfg, &mut errors);
 
     if errors.is_empty() {
         Ok(())

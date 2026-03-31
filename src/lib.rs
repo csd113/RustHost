@@ -6,6 +6,16 @@
 //! Internal modules are `pub(crate)` by default; only items that form part of
 //! the documented operator/integration-test API are re-exported here.
 
+#![deny(warnings)]
+#![deny(clippy::all, clippy::pedantic)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented
+)]
+
 // Public modules — part of the documented external API.
 pub mod config;
 pub mod error;

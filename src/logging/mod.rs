@@ -56,12 +56,10 @@ impl std::fmt::Display for AccessRecord<'_> {
         let protocol = escape_clf_field(self.protocol);
         let ua = self
             .user_agent
-            .map(escape_clf_field)
-            .unwrap_or_else(|| "-".to_owned());
+            .map_or_else(|| "-".to_owned(), escape_clf_field);
         let referer = self
             .referer
-            .map(escape_clf_field)
-            .unwrap_or_else(|| "-".to_owned());
+            .map_or_else(|| "-".to_owned(), escape_clf_field);
         write!(
             f,
             "{} - - [{now}] \"{} {} {}\" {} {} \"{}\" \"{}\"",
@@ -682,7 +680,7 @@ mod tests {
     #[test]
     fn access_record_escapes_quotes_and_backslashes() {
         let record = AccessRecord {
-            remote_addr: "127.0.0.1".parse().expect("valid ip"),
+            remote_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             method: "GET",
             path: "/a\"b\\c\nd",
             protocol: "HTTP/1.1",

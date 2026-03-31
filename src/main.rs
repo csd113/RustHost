@@ -16,7 +16,15 @@
 //! -h, --help          Print usage and exit
 //! ```
 
+#![deny(warnings)]
 #![deny(clippy::all, clippy::pedantic)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented
+)]
 #![warn(clippy::nursery)]
 
 use std::io::Write as _;

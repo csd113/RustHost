@@ -23,10 +23,12 @@
 use std::{fmt::Write as _, path::Path, sync::Arc};
 
 use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full};
+use futures::TryStreamExt as _;
+use http_body_util::{BodyExt as _, Full, StreamBody};
 use hyper::{body::Incoming, header, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
+use tokio_util::io::ReaderStream;
 
 use super::{fallback, mime};
 use crate::{runtime::state::SharedMetrics, Result};
@@ -35,12 +37,21 @@ use crate::{runtime::state::SharedMetrics, Result};
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 
+const MAX_REQUEST_BUFFER_BYTES: usize = 16 * 1024;
+
 fn full_body(data: impl Into<Bytes>) -> BoxBody {
     Full::new(data.into()).map_err(|e| match e {}).boxed()
 }
 
 fn empty_body() -> BoxBody {
     full_body(Bytes::new())
+}
+
+fn reader_body<R>(reader: R) -> BoxBody
+where
+    R: tokio::io::AsyncRead + Send + Sync + 'static,
+{
+    StreamBody::new(ReaderStream::new(reader).map_ok(hyper::body::Frame::data)).boxed()
 }
 
 // ─── Feature flags ───────────────────────────────────────────────────────────
@@ -105,6 +116,7 @@ where
 
     hyper::server::conn::http1::Builder::new()
         .keep_alive(true)
+        .max_buf_size(MAX_REQUEST_BUFFER_BYTES)
         .serve_connection(
             io,
             hyper::service::service_fn(move |req| {
@@ -176,8 +188,7 @@ async fn route(
     }
 
     let is_head = req.method() == Method::HEAD;
-    let raw_path = req.uri().path();
-    let decoded = percent_decode(raw_path.split('?').next().unwrap_or("/"));
+    let decoded = percent_decode(req.uri().path());
 
     // M-13 — check operator redirect rules before any filesystem access.
     for rule in cfg.redirects.iter() {
@@ -185,7 +196,7 @@ async fn route(
             let safe = sanitize_header_value(&rule.to);
             let status = rule.status;
             metrics.add_request();
-            let resp = external_redirect_response(&safe, status, &cfg.csp);
+            let resp = external_redirect_response(&safe, status, &cfg.csp)?;
             log_request(
                 &req,
                 resp.status().as_u16(),
@@ -365,7 +376,11 @@ fn log_request<B>(
 /// Build a redirect response for operator-configured rules (M-13).
 ///
 /// Uses the `status` from the rule (301 or 302) rather than always 301.
-fn external_redirect_response(location: &str, status: u16, csp: &str) -> Response<BoxBody> {
+fn external_redirect_response(
+    location: &str,
+    status: u16,
+    csp: &str,
+) -> std::result::Result<Response<BoxBody>, std::io::Error> {
     let body = format!("Redirecting to {location}");
     let data: Bytes = Bytes::copy_from_slice(body.as_bytes());
     let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::MOVED_PERMANENTLY);
@@ -376,7 +391,7 @@ fn external_redirect_response(location: &str, status: u16, csp: &str) -> Respons
         .header(header::CONTENT_LENGTH, data.len())
         .header("Cache-Control", "no-cache");
     builder = security_headers(builder, csp, "text/plain");
-    builder.body(full_body(data)).unwrap_or_default()
+    finalize_response(builder, full_body(data), "operator redirect response")
 }
 
 // ─── File serving ─────────────────────────────────────────────────────────────
@@ -437,11 +452,15 @@ async fn serve_file(
             // every arithmetic operation to be explicitly overflow-safe.
             let send_len = range.end.saturating_sub(range.start).saturating_add(1);
 
-            let encoding = best_encoding(req);
+            // HTTP byte ranges are defined over the selected representation.
+            // Serving a compressed slice while advertising Content-Range over
+            // the original file bytes is protocol-incorrect and breaks resume/
+            // seeking in real clients, so 206 responses are always identity.
+            let encoding = Encoding::Identity;
             let (body, content_encoding) = if is_head {
                 (empty_body(), None)
             } else {
-                compress_body(file, send_len, encoding).await?
+                compress_body(file, send_len, encoding)
             };
 
             let mut builder = Response::builder()
@@ -463,14 +482,16 @@ async fn serve_file(
                 builder = builder.header(header::CONTENT_LENGTH, send_len);
             }
             metrics.add_request();
-            Ok(builder.body(body).unwrap_or_default())
+            finalize_response(builder, body, "range response")
         } else {
             metrics.add_error();
-            Ok(Response::builder()
-                .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                .header("Content-Range", format!("bytes */{file_len}"))
-                .body(empty_body())
-                .unwrap_or_default())
+            Ok(finalize_response(
+                Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header("Content-Range", format!("bytes */{file_len}")),
+                empty_body(),
+                "range not satisfiable response",
+            )?)
         };
     }
 
@@ -479,7 +500,7 @@ async fn serve_file(
     let (body, content_encoding) = if is_head {
         (empty_body(), None)
     } else {
-        compress_body(file, file_len, encoding).await?
+        compress_body(file, file_len, encoding)
     };
 
     let mut builder = Response::builder()
@@ -498,7 +519,7 @@ async fn serve_file(
     }
 
     metrics.add_request();
-    Ok(builder.body(body).unwrap_or_default())
+    finalize_response(builder, body, "file response")
 }
 
 // ─── Compression (H-8) ───────────────────────────────────────────────────────
@@ -547,38 +568,36 @@ pub fn best_encoding<B>(req: &Request<B>) -> Encoding {
 /// `(body, None)` for identity encoding.
 ///
 /// The `len` cap respects Range requests — only the requested slice is read.
-async fn compress_body(
-    mut file: tokio::fs::File,
+fn compress_body(
+    file: tokio::fs::File,
     len: u64,
     encoding: Encoding,
-) -> std::io::Result<(BoxBody, Option<&'static str>)> {
-    use tokio::io::AsyncReadExt as _;
-
-    let mut handle = (&mut file).take(len);
+) -> (BoxBody, Option<&'static str>) {
+    let handle = file.take(len);
 
     match encoding {
         Encoding::Brotli => {
             use async_compression::tokio::bufread::BrotliEncoder;
             use tokio::io::BufReader;
-            let mut enc = BrotliEncoder::new(BufReader::new(handle));
-            let mut buf = Vec::new();
-            enc.read_to_end(&mut buf).await?;
-            Ok((full_body(buf), Some("br")))
+            (reader_body(BrotliEncoder::new(BufReader::new(handle))), Some("br"))
         }
         Encoding::Gzip => {
             use async_compression::tokio::bufread::GzipEncoder;
             use tokio::io::BufReader;
-            let mut enc = GzipEncoder::new(BufReader::new(handle));
-            let mut buf = Vec::new();
-            enc.read_to_end(&mut buf).await?;
-            Ok((full_body(buf), Some("gzip")))
+            (reader_body(GzipEncoder::new(BufReader::new(handle))), Some("gzip"))
         }
-        Encoding::Identity => {
-            let mut buf = Vec::new();
-            handle.read_to_end(&mut buf).await?;
-            Ok((full_body(buf), None))
-        }
+        Encoding::Identity => (reader_body(handle), None),
     }
+}
+
+fn finalize_response(
+    builder: hyper::http::response::Builder,
+    body: BoxBody,
+    context: &str,
+) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    builder
+        .body(body)
+        .map_err(|e| std::io::Error::other(format!("failed to build {context}: {e}")))
 }
 
 // ─── ETag helpers (H-9) ──────────────────────────────────────────────────────

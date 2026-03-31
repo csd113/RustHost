@@ -43,7 +43,7 @@ time           = "0.3"      # OffsetDateTime for rcgen cert params
 
 # Phase 6 — TLS / HTTPS support
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
-tokio-util   = { version = "0.7",  features = ["compat"] }  # futures-io ↔ tokio-io compatibility bridge
+tokio-util   = { version = "0.7",  features = ["compat", "io"] }  # futures-io ↔ tokio-io compatibility bridge
 rustls       = { version = "0.23", features = ["ring"] }    # rustls TLS implementation
 rustls-acme  = { version = "0.12", default-features = false, features = ["tokio", "ring"] } # ACME / Let's Encrypt automation
 rcgen        = "0.13"                                        # self-signed dev cert generation

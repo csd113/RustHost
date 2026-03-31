@@ -442,8 +442,8 @@ pub async fn run_https(
                         // Clone the acceptor handle cheaply — both variants are Arc-backed.
                         let acceptor = match &tls_acceptor {
                             Acceptor::Static(a) => Acceptor::Static(Arc::clone(a)),
-                            Acceptor::Acme(a, cfg, h) => {
-                                Acceptor::Acme(Arc::clone(a), Arc::clone(cfg), Arc::clone(h))
+                            Acceptor::Acme(a, cfg) => {
+                                Acceptor::Acme(Arc::clone(a), Arc::clone(cfg))
                             }
                         };
                         let peer_ip = peer.ip();
@@ -503,7 +503,7 @@ pub async fn run_https(
                                         }
                                     }
                                 }
-                                Acceptor::Acme(a, server_cfg, _handle) => {
+                                Acceptor::Acme(a, server_cfg) => {
                                     // AcmeAcceptor::accept needs futures-io AsyncRead/AsyncWrite,
                                     // so adapt the tokio TcpStream before passing it in.
                                     let compat_stream = tcp_stream.compat();
@@ -698,39 +698,33 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
             }
         };
         for entry in entries.flatten() {
-            // Use symlink_metadata (does not follow symlinks) to detect symlinked
-            // directories before following them into potential cycles.
-            let Ok(meta) = entry.metadata() else { continue };
-            if meta.is_file() {
+            let path = entry.path();
+            // Inspect the link itself first so directory symlinks cannot walk
+            // outside the site root during a background metrics scan.
+            let Ok(link_meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if link_meta.file_type().is_symlink() {
+                log::warn!("Skipping symlink during site scan: {}", path.display());
+                continue;
+            }
+            if link_meta.is_file() {
                 count = count.saturating_add(1);
-                bytes = bytes.saturating_add(meta.len());
-            } else if meta.is_dir() {
+                bytes = bytes.saturating_add(link_meta.len());
+            } else if link_meta.is_dir() {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::MetadataExt;
-                    let ino = meta.ino();
+                    let ino = link_meta.ino();
                     if !visited_inodes.insert(ino) {
                         log::warn!(
-                            "Symlink cycle detected at {} (inode {ino}), skipping",
-                            entry.path().display()
+                            "Directory cycle detected at {} (inode {ino}), skipping",
+                            path.display()
                         );
                         continue;
                     }
                 }
-                #[cfg(not(unix))]
-                {
-                    // On non-Unix, skip symlinked directories to avoid cycles.
-                    if let Ok(sym_meta) = entry.path().symlink_metadata() {
-                        if sym_meta.file_type().is_symlink() {
-                            log::warn!(
-                                "Skipping symlinked directory {} (no inode tracking on this platform)",
-                                entry.path().display()
-                            );
-                            continue;
-                        }
-                    }
-                }
-                queue.push_back((entry.path(), depth.saturating_add(1)));
+                queue.push_back((path, depth.saturating_add(1)));
             }
         }
     }

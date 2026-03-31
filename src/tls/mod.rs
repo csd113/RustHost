@@ -28,18 +28,14 @@ pub enum Acceptor {
     /// Static certificate — manual PEM files or a self-signed dev cert.
     Static(Arc<TlsAcceptor>),
     /// Let's Encrypt certificate managed by `rustls-acme`.
-    ///
-    /// The [`tokio::task::JoinHandle`] is wrapped in [`Arc`] so the
-    /// `Acceptor` can be cheaply cloned for each accepted connection without
-    /// transferring ownership of the handle. The handle drives the ACME event
-    /// loop (challenge responses, renewals) and **must** be retained and
-    /// awaited during graceful shutdown; all clones share the same underlying
-    /// task — awaiting any one of them is sufficient.
-    Acme(
-        Arc<rustls_acme::AcmeAcceptor>,
-        Arc<ServerConfig>,
-        Arc<tokio::task::JoinHandle<()>>,
-    ),
+    Acme(Arc<rustls_acme::AcmeAcceptor>, Arc<ServerConfig>),
+}
+
+/// TLS startup result, including any background task that must be monitored
+/// during shutdown.
+pub struct TlsSetup {
+    pub acceptor: Acceptor,
+    pub acme_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Construct an [`Acceptor`] from the provided [`TlsConfig`], or return
@@ -58,14 +54,17 @@ pub enum Acceptor {
 /// - The ACME config is invalid (empty domain list, IP address as domain, etc.).
 /// - The ACME cache directory cannot be created.
 /// - The self-signed certificate cannot be generated or written to disk.
-pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<Acceptor>> {
+pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<TlsSetup>> {
     if !cfg.enabled {
         return Ok(None);
     }
 
     if let Some(manual) = &cfg.manual_cert {
         log::info!("TLS: loading manual certificate");
-        return Ok(Some(Acceptor::Static(load_manual_cert(manual, data_dir)?)));
+        return Ok(Some(TlsSetup {
+            acceptor: Acceptor::Static(load_manual_cert(manual, data_dir)?),
+            acme_task: None,
+        }));
     }
 
     if cfg.acme.enabled {
@@ -77,11 +76,10 @@ pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<A
         // inside acme::build_acme_acceptor — a second call returns an error.
         let (acme_acceptor, server_cfg, event_loop) =
             acme::build_acme_acceptor(&cfg.acme, data_dir)?;
-        return Ok(Some(Acceptor::Acme(
-            acme_acceptor,
-            server_cfg,
-            Arc::new(event_loop),
-        )));
+        return Ok(Some(TlsSetup {
+            acceptor: Acceptor::Acme(acme_acceptor, server_cfg),
+            acme_task: Some(event_loop),
+        }));
     }
 
     log::info!("TLS: no cert configured — generating/loading self-signed dev certificate");
@@ -89,7 +87,10 @@ pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<A
     log::warn!(
         "TLS: using self-signed localhost dev cert (INSECURE FOR PROD — configure manual_cert or acme)"
     );
-    Ok(Some(Acceptor::Static(acceptor)))
+    Ok(Some(TlsSetup {
+        acceptor: Acceptor::Static(acceptor),
+        acme_task: None,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +225,8 @@ pub(super) fn load_pem_as_acceptor(cert_path: &Path, key_path: &Path) -> Result<
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
     use super::*;
     use crate::config::ManualCertConfig;
     use tempfile::TempDir;

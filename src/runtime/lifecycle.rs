@@ -66,6 +66,13 @@ struct SharedConnectionBudget {
     >,
 }
 
+#[derive(Default)]
+struct BackgroundTasks {
+    https: Option<tokio::task::JoinHandle<()>>,
+    redirect: Option<tokio::task::JoinHandle<()>>,
+    acme: Option<tokio::task::JoinHandle<()>>,
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 /// Entry point for the `rusthost-cli` binary.
@@ -279,9 +286,11 @@ async fn setup_tls(
     data_dir: &Path,
     budget: &SharedConnectionBudget,
     root_tx: &watch::Sender<Arc<std::path::Path>>,
-) {
+) -> BackgroundTasks {
+    let mut tasks = BackgroundTasks::default();
+
     if !config.tls.enabled {
-        return;
+        return tasks;
     }
 
     // build_acceptor is async and manages its own spawn_blocking internally
@@ -294,7 +303,13 @@ async fn setup_tls(
             log::error!("TLS init failed: {e}. Continuing in HTTP-only mode.");
         }
         Ok(None) => { /* enabled=false handled inside build_acceptor */ }
-        Ok(Some(acceptor)) => {
+        Ok(Some(tls_setup)) => {
+            let crate::tls::TlsSetup {
+                acceptor,
+                acme_task,
+            } = tls_setup;
+            tasks.acme = acme_task;
+
             // Record cert type in shared state for the dashboard.
             {
                 let mut s = state.write().await;
@@ -322,7 +337,7 @@ async fn setup_tls(
                 let tls_sem = std::sync::Arc::clone(&budget.semaphore);
                 let tls_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
                 let tls_root_rx = root_tx.subscribe();
-                tokio::spawn(async move {
+                tasks.https = Some(tokio::spawn(async move {
                     server::run_https(
                         tls_config,
                         tls_state,
@@ -335,7 +350,7 @@ async fn setup_tls(
                         tls_root_rx,
                     )
                     .await;
-                });
+                }));
             }
 
             // Optionally spawn the HTTP→HTTPS redirect server.
@@ -344,18 +359,26 @@ async fn setup_tls(
                 let redir_plain_port = config.tls.http_port.get();
                 let redir_tls_port = config.tls.port.get();
                 let redir_shutdown = shutdown_rx.clone();
-                tokio::spawn(async move {
+                let redir_sem = std::sync::Arc::clone(&budget.semaphore);
+                let redir_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
+                let redir_max_per_ip = config.server.max_connections_per_ip;
+                tasks.redirect = Some(tokio::spawn(async move {
                     server::redirect::run_redirect_server(
                         bind_addr,
                         redir_plain_port,
                         redir_tls_port,
                         redir_shutdown,
+                        redir_sem,
+                        redir_ip_map,
+                        redir_max_per_ip,
                     )
                     .await;
-                });
+                }));
             }
         }
     }
+
+    tasks
 }
 
 /// Open the user's browser if `open_browser_on_start` is set.
@@ -436,7 +459,7 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     let bind_port = wait_for_bind_port(port_rx).await?;
 
     // 7b. TLS / HTTPS — optional, non-fatal.
-    setup_tls(
+    let background_tasks = setup_tls(
         &config,
         &state,
         &metrics,
@@ -475,7 +498,7 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     event_loop(key_rx, &config, &state, &metrics, data_dir, root_tx).await?;
 
     // 12. Graceful shutdown.
-    graceful_shutdown(shutdown_tx, server_handle, tor_handle).await;
+    graceful_shutdown(shutdown_tx, server_handle, tor_handle, background_tasks).await;
     Ok(())
 }
 
@@ -514,6 +537,7 @@ async fn graceful_shutdown(
     shutdown_tx: watch::Sender<bool>,
     server_handle: tokio::task::JoinHandle<()>,
     tor_handle: Option<tokio::task::JoinHandle<()>>,
+    background_tasks: BackgroundTasks,
 ) {
     log::info!("Shutting down…");
     let _ = shutdown_tx.send(true);
@@ -550,9 +574,49 @@ async fn graceful_shutdown(
         }
     }
 
+    wait_for_background_task(
+        background_tasks.redirect,
+        Duration::from_secs(5),
+        "HTTP redirect server",
+    )
+    .await;
+    wait_for_background_task(
+        background_tasks.https,
+        Duration::from_secs(5),
+        "HTTPS server",
+    )
+    .await;
+    wait_for_background_task(
+        background_tasks.acme,
+        Duration::from_secs(5),
+        "ACME event loop",
+    )
+    .await;
+
     log::info!("RustHost shut down cleanly.");
     logging::flush();
     console::cleanup();
+}
+
+async fn wait_for_background_task(
+    task: Option<tokio::task::JoinHandle<()>>,
+    timeout: Duration,
+    label: &str,
+) {
+    let Some(mut handle) = task else {
+        return;
+    };
+
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            log::warn!("{label} task ended with a join error during shutdown: {e}");
+        }
+        Err(_) => {
+            log::warn!("{label} did not stop within {} s; aborting task", timeout.as_secs());
+            handle.abort();
+        }
+    }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
