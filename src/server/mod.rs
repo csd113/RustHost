@@ -114,6 +114,7 @@ struct ServerContext {
     canonical_root: Arc<Path>,
     index_file: Arc<str>,
     csp_header: Arc<str>,
+    state: SharedState,
     dir_list: bool,
     expose_dots: bool,
     spa_routing: bool,
@@ -136,6 +137,7 @@ impl ServerContext {
     /// opening connections on both ports simultaneously.
     fn with_shared(
         config: &Config,
+        state: SharedState,
         data_dir: &Path,
         semaphore: Arc<Semaphore>,
         per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
@@ -175,6 +177,7 @@ impl ServerContext {
             canonical_root,
             index_file: Arc::from(config.site.index_file.as_str()),
             csp_header: Arc::from(config.server.csp_level.as_header_value()),
+            state,
             dir_list: config.site.enable_directory_listing,
             expose_dots: config.site.expose_dotfiles,
             spa_routing: config.site.spa_routing,
@@ -220,6 +223,7 @@ impl ServerContext {
         let site = Arc::clone(&self.canonical_root);
         let idx = Arc::clone(&self.index_file);
         let met = Arc::clone(metrics);
+        let state = Arc::clone(&self.state);
         let csp = Arc::clone(&self.csp_header);
         let flags = handler::FeatureFlags {
             dir_listing: self.dir_list,
@@ -241,6 +245,7 @@ impl ServerContext {
                 idx,
                 flags,
                 met,
+                state,
                 csp,
                 e404,
                 e503,
@@ -296,9 +301,13 @@ pub async fn run(
     if bound_port != base_port {
         log::warn!("Configured port {base_port} was in use; bound to {bound_port} instead.");
     }
-    let Some(mut ctx) =
-        ServerContext::with_shared(&config, &data_dir, shared_semaphore, shared_per_ip_map)
-    else {
+    let Some(mut ctx) = ServerContext::with_shared(
+        &config,
+        Arc::clone(&state),
+        &data_dir,
+        shared_semaphore,
+        shared_per_ip_map,
+    ) else {
         return;
     };
     {
@@ -420,9 +429,13 @@ pub async fn run_https(
             return;
         }
     };
-    let Some(mut ctx) =
-        ServerContext::with_shared(&config, &data_dir, shared_semaphore, shared_per_ip_map)
-    else {
+    let Some(mut ctx) = ServerContext::with_shared(
+        &config,
+        Arc::clone(&state),
+        &data_dir,
+        shared_semaphore,
+        shared_per_ip_map,
+    ) else {
         return;
     };
     {
@@ -475,6 +488,7 @@ pub async fn run_https(
                         let site = Arc::clone(&ctx.canonical_root);
                         let idx = Arc::clone(&ctx.index_file);
                         let met = Arc::clone(&metrics);
+                        let state = Arc::clone(&ctx.state);
                         let csp = Arc::clone(&ctx.csp_header);
                         let flags = handler::FeatureFlags {
                             dir_listing: ctx.dir_list,
@@ -555,6 +569,7 @@ pub async fn run_https(
                                 idx,
                                 flags,
                                 met,
+                                state,
                                 csp,
                                 e404,
                                 e503,

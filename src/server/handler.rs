@@ -36,14 +36,17 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 use tokio_util::io::ReaderStream;
 
 use super::{fallback, mime};
-use crate::{runtime::state::SharedMetrics, Result};
+use crate::{
+    runtime::state::{SharedMetrics, SharedState},
+    Result,
+};
+pub use encoding::Encoding;
 use encoding::{best_encoding, should_compress};
+pub use pathing::percent_decode;
 use pathing::{
     build_directory_listing, cache_control_for, resolve_path, sanitize_header_value,
     ResolveOptions, Resolved,
 };
-pub use encoding::Encoding;
-pub use pathing::percent_decode;
 
 // ─── Body type alias ─────────────────────────────────────────────────────────
 
@@ -105,7 +108,10 @@ impl CustomErrorPage {
             .status(self.status)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .header(header::CONTENT_LENGTH, self.body.len())
-            .header("Cache-Control", cache_control_for("text/html; charset=utf-8", url_path));
+            .header(
+                "Cache-Control",
+                cache_control_for("text/html; charset=utf-8", url_path),
+            );
         builder = security_headers(builder, csp, "text/html; charset=utf-8");
         let body = if is_head {
             empty_body()
@@ -198,6 +204,7 @@ pub(crate) async fn handle<S>(
     index_file: Arc<str>,
     flags: FeatureFlags,
     metrics: SharedMetrics,
+    state: SharedState,
     csp: Arc<str>,
     error_404_page: Option<Arc<CustomErrorPage>>,
     error_503_page: Option<Arc<CustomErrorPage>>,
@@ -214,6 +221,7 @@ where
         index_file,
         csp,
         flags,
+        state,
         error_404_page,
         error_503_page,
         redirects,
@@ -251,6 +259,7 @@ struct RouteConfig {
     index_file: Arc<str>,
     csp: Arc<str>,
     flags: FeatureFlags,
+    state: SharedState,
     error_404_page: Option<Arc<CustomErrorPage>>,
     error_503_page: Option<Arc<CustomErrorPage>>,
     /// Operator redirect or rewrite rules checked before filesystem resolution.
@@ -280,7 +289,14 @@ async fn route(
                 cfg.peer_addr,
                 &cfg.trusted_proxies,
             );
-            return Ok(inject_security_headers(resp, cfg.flags.is_https, &cfg.csp));
+            return Ok(inject_security_headers(
+                resp,
+                &req,
+                cfg.flags.is_https,
+                &cfg.csp,
+                &cfg.state,
+            )
+            .await);
         }
         m if m != Method::GET && m != Method::HEAD => {
             metrics.add_error();
@@ -292,7 +308,14 @@ async fn route(
                 cfg.peer_addr,
                 &cfg.trusted_proxies,
             );
-            return Ok(inject_security_headers(resp, cfg.flags.is_https, &cfg.csp));
+            return Ok(inject_security_headers(
+                resp,
+                &req,
+                cfg.flags.is_https,
+                &cfg.csp,
+                &cfg.state,
+            )
+            .await);
         }
         _ => {}
     }
@@ -314,7 +337,14 @@ async fn route(
                 cfg.peer_addr,
                 &cfg.trusted_proxies,
             );
-            return Ok(inject_security_headers(resp, cfg.flags.is_https, &cfg.csp));
+            return Ok(inject_security_headers(
+                resp,
+                &req,
+                cfg.flags.is_https,
+                &cfg.csp,
+                &cfg.state,
+            )
+            .await);
         }
     }
 
@@ -338,8 +368,8 @@ async fn route(
         };
         resolve_path(&opts)
     })
-        .await
-        .map_err(|e| std::io::Error::other(format!("path resolution task panicked: {e}")))?;
+    .await
+    .map_err(|e| std::io::Error::other(format!("path resolution task panicked: {e}")))?;
 
     let resp = dispatch_resolved(
         resolved,
@@ -363,7 +393,7 @@ async fn route(
     );
 
     // Inject HSTS and other security headers that depend on transport.
-    let resp = inject_security_headers(resp, cfg.flags.is_https, &cfg.csp);
+    let resp = inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await;
     Ok(resp)
 }
 
@@ -663,7 +693,10 @@ async fn open_precompressed_variant(
     for (suffix, content_encoding) in candidates {
         let variant_path = abs_path.with_extension(format!(
             "{}.{suffix}",
-            abs_path.extension().and_then(|ext| ext.to_str()).unwrap_or("")
+            abs_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("")
         ));
         let file = match tokio::fs::File::open(&variant_path).await {
             Ok(file) => file,
@@ -818,12 +851,18 @@ fn stream_body(
         Encoding::Brotli => {
             use async_compression::tokio::bufread::BrotliEncoder;
             use tokio::io::BufReader;
-            (reader_body(BrotliEncoder::new(BufReader::new(handle))), Some("br"))
+            (
+                reader_body(BrotliEncoder::new(BufReader::new(handle))),
+                Some("br"),
+            )
         }
         Encoding::Gzip => {
             use async_compression::tokio::bufread::GzipEncoder;
             use tokio::io::BufReader;
-            (reader_body(GzipEncoder::new(BufReader::new(handle))), Some("gzip"))
+            (
+                reader_body(GzipEncoder::new(BufReader::new(handle))),
+                Some("gzip"),
+            )
         }
         Encoding::Identity => (identity_reader_body(handle), None),
     }
@@ -1009,7 +1048,13 @@ pub fn parse_range<B>(
 /// [`security_headers`] builder helper for most response paths, making them
 /// doubly-inserted on those paths.  `insert` overwrites duplicates, so the net
 /// result is always exactly one copy of each header.
-fn inject_security_headers(mut resp: Response<BoxBody>, is_https: bool, csp: &str) -> Response<BoxBody> {
+async fn inject_security_headers(
+    mut resp: Response<BoxBody>,
+    req: &Request<Incoming>,
+    is_https: bool,
+    csp: &str,
+    state: &SharedState,
+) -> Response<BoxBody> {
     let is_html = is_html_response(&resp);
     let h = resp.headers_mut();
     if is_https {
@@ -1017,6 +1062,9 @@ fn inject_security_headers(mut resp: Response<BoxBody>, is_https: bool, csp: &st
             header::STRICT_TRANSPORT_SECURITY,
             header::HeaderValue::from_static("max-age=63072000; includeSubDomains"),
         );
+        if let Some(value) = onion_location_header_value(req, state).await {
+            h.insert(header::HeaderName::from_static("onion-location"), value);
+        }
     }
     h.insert(
         header::HeaderName::from_static("x-content-type-options"),
@@ -1041,6 +1089,37 @@ fn inject_security_headers(mut resp: Response<BoxBody>, is_https: bool, csp: &st
         }
     }
     resp
+}
+
+async fn onion_location_header_value(
+    req: &Request<Incoming>,
+    state: &SharedState,
+) -> Option<header::HeaderValue> {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or("");
+    if host.eq_ignore_ascii_case("") {
+        return None;
+    }
+    if host
+        .split(':')
+        .next()
+        .is_some_and(|value| value.ends_with(".onion"))
+    {
+        return None;
+    }
+
+    let onion_address = state.read().await.onion_address.clone()?;
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map_or("/", hyper::http::uri::PathAndQuery::as_str);
+    let location = format!("https://{onion_address}{path_and_query}");
+    let safe_location = sanitize_header_value(&location);
+    header::HeaderValue::from_str(safe_location.as_ref()).ok()
 }
 
 fn is_html_response(resp: &Response<BoxBody>) -> bool {

@@ -78,12 +78,8 @@ impl TestServer {
         site_root: &Path,
         configure: impl FnOnce(&mut Config),
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::start_with_bind_and_config(
-            site_root,
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            configure,
-        )
-        .await
+        Self::start_with_bind_and_config(site_root, IpAddr::V4(Ipv4Addr::LOCALHOST), configure)
+            .await
     }
 
     async fn start_with_bind_and_config(
@@ -223,14 +219,12 @@ async fn start_server_with_bind_or_skip(
     match TestServer::start_with_bind_and_config(site_root, bind_addr, configure).await {
         Ok(server) => Ok(Some(server)),
         Err(err)
-            if err
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| {
-                    matches!(
-                        io.kind(),
-                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrNotAvailable
-                    )
-                }) =>
+            if err.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrNotAvailable
+                )
+            }) =>
         {
             eprintln!(
                 "[http_integration] skipping test: loopback sockets are blocked or unavailable in this environment"
@@ -247,14 +241,12 @@ async fn start_https_server_or_skip(
     match HttpsTestServer::start(site_root).await {
         Ok(server) => Ok(Some(server)),
         Err(err)
-            if err
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| {
-                    matches!(
-                        io.kind(),
-                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrNotAvailable
-                    )
-                }) =>
+            if err.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrNotAvailable
+                )
+            }) =>
         {
             eprintln!(
                 "[http_integration] skipping test: loopback sockets are blocked or unavailable in this environment"
@@ -300,6 +292,13 @@ struct HttpsTestServer {
 
 impl HttpsTestServer {
     async fn start(site_root: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::start_with_state(site_root, |_| {}).await
+    }
+
+    async fn start_with_state(
+        site_root: &Path,
+        configure_state: impl FnOnce(&mut AppState),
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         ensure_crypto_provider();
 
         let port = reserve_port()?;
@@ -308,7 +307,9 @@ impl HttpsTestServer {
         config.tls.port = std::num::NonZeroU16::new(port).ok_or("reserved HTTPS port was 0")?;
         config.tls.redirect_http = false;
 
-        let state = Arc::new(RwLock::new(AppState::new()));
+        let mut initial_state = AppState::new();
+        configure_state(&mut initial_state);
+        let state = Arc::new(RwLock::new(initial_state));
         let metrics = Arc::new(Metrics::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -364,8 +365,8 @@ impl HttpsTestServer {
     async fn send(&self, request: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let cert_pem = std::fs::read(&self.cert_path)?;
         let mut cert_reader = std::io::BufReader::new(cert_pem.as_slice());
-        let certs = rustls_pemfile::certs(&mut cert_reader)
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let certs =
+            rustls_pemfile::certs(&mut cert_reader).collect::<std::result::Result<Vec<_>, _>>()?;
 
         let mut roots = rustls::RootCertStore::empty();
         for cert in certs {
@@ -734,7 +735,9 @@ async fn get_index_html_returns_200() -> Result<(), Box<dyn std::error::Error>> 
 #[tokio::test(flavor = "current_thread")]
 async fn get_index_html_returns_200_over_ipv6() -> Result<(), Box<dyn std::error::Error>> {
     let (tmp, site) = make_site(&[("index.html", b"<h1>hello ipv6</h1>")])?;
-    let Some(server) = start_server_with_bind_or_skip(&site, IpAddr::V6(Ipv6Addr::LOCALHOST), |_| {}).await? else {
+    let Some(server) =
+        start_server_with_bind_or_skip(&site, IpAddr::V6(Ipv6Addr::LOCALHOST), |_| {}).await?
+    else {
         return Ok(());
     };
 
@@ -768,6 +771,46 @@ async fn https_self_signed_server_returns_200() -> Result<(), Box<dyn std::error
         Some("max-age=31536000; includeSubDomains")
     );
     assert!(response_to_str(&response)?.contains("secure hello"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn https_response_includes_onion_location_when_onion_is_ready(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"<h1>secure hello</h1>")])?;
+    let server = match HttpsTestServer::start_with_state(&site, |state| {
+        state.onion_address =
+            Some("exampleexampleexampleexampleexampleexampleexampleexample.onion".into());
+    })
+    .await
+    {
+        Ok(server) => server,
+        Err(err)
+            if err.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrNotAvailable
+                )
+            }) =>
+        {
+            eprintln!(
+                "[http_integration] skipping test: loopback sockets are blocked or unavailable in this environment"
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
+
+    let response = server
+        .send(b"GET /docs/app.js?q=1 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(
+        header_value(&response, "onion-location")?.as_deref(),
+        Some("https://exampleexampleexampleexampleexampleexampleexampleexample.onion/docs/app.js?q=1")
+    );
     Ok(())
 }
 
@@ -926,9 +969,7 @@ async fn serves_precompressed_sidecar_when_client_accepts_brotli(
     };
 
     let response = server
-        .send(
-            b"GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br, gzip\r\n\r\n",
-        )
+        .send(b"GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br, gzip\r\n\r\n")
         .await?;
 
     server.stop().await;
@@ -1070,6 +1111,23 @@ async fn csp_absent_and_base_headers_present_on_non_html_response(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn http_response_does_not_include_onion_location() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"<h1>ok</h1>")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(header_value(&response, "onion-location")?, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn custom_503_page_is_served_for_missing_index_root() -> Result<(), Box<dyn std::error::Error>>
 {
     let (tmp, site) = make_site(&[("error503.html", b"<h1>offline</h1>")])?;
@@ -1082,7 +1140,9 @@ async fn custom_503_page_is_served_for_missing_index_root() -> Result<(), Box<dy
         return Ok(());
     };
 
-    let response = server.send(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await?;
+    let response = server
+        .send(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
     server.stop().await;
     let _ = tmp;
 
@@ -1146,7 +1206,10 @@ async fn connection_limit_rejects_second_socket() -> Result<(), Box<dyn std::err
     server.stop().await;
     let _ = tmp;
 
-    assert!(rejected, "expected second socket to be rejected at capacity");
+    assert!(
+        rejected,
+        "expected second socket to be rejected at capacity"
+    );
     Ok(())
 }
 
@@ -1198,7 +1261,11 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
 
-    assert_eq!(status_code(&response)?, 301, "redirect server must return 301");
+    assert_eq!(
+        status_code(&response)?,
+        301,
+        "redirect server must return 301"
+    );
     assert_eq!(
         header_value(&response, "location")?.as_deref(),
         Some("https://example.com:8443/docs?q=1")

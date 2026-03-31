@@ -26,6 +26,7 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Moved per-request filesystem path resolution onto Tokio's blocking pool to avoid starving the async runtime under slow-disk or hostile request load.
 - Tightened connection admission so HTTP, HTTPS, and redirect listeners reject overflow immediately instead of holding accepted sockets open while waiting for permits.
 - Completed the shared response hardening path so redirects, `OPTIONS`, `405`, `304`, and other non-file responses now receive the full security-header set consistently.
+- Added automatic `Onion-Location` headers on clearnet HTTPS responses when the built-in Tor onion service is ready, so supporting browsers can surface the `.onion` version of the current page.
 - Wired `site.error_503` into runtime serving and preload custom error pages at startup with size limits, removing per-request reloads and dead config.
 - Improved access-log accuracy by recording real `Content-Length` values when known and `-` when a streamed/compressed size is not known ahead of time.
 - Made compression more production-friendly by honoring `Accept-Encoding` quality values and skipping obviously poor candidates such as tiny or already-compressed assets.
