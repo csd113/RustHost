@@ -21,6 +21,7 @@ pub(super) struct BackgroundTasks {
     pub(super) https: Option<tokio::task::JoinHandle<()>>,
     pub(super) redirect: Option<tokio::task::JoinHandle<()>>,
     pub(super) acme: Option<tokio::task::JoinHandle<()>>,
+    pub(super) acme_guard: Option<tls::acme::AcmeInitGuard>,
 }
 
 pub(super) async fn wait_for_bind_port(port_rx: oneshot::Receiver<u16>) -> Result<u16> {
@@ -67,8 +68,10 @@ pub(super) async fn setup_tls(
             let crate::tls::TlsSetup {
                 acceptor,
                 acme_task,
+                acme_guard,
             } = tls_setup;
             tasks.acme = acme_task;
+            tasks.acme_guard = acme_guard;
 
             {
                 let mut s = state.write().await;
@@ -164,7 +167,7 @@ pub(super) async fn graceful_shutdown(
     shutdown_tx: watch::Sender<bool>,
     server_handle: tokio::task::JoinHandle<()>,
     tor_handle: Option<tokio::task::JoinHandle<()>>,
-    background_tasks: BackgroundTasks,
+    mut background_tasks: BackgroundTasks,
 ) {
     log::info!("Shutting down…");
     let _ = shutdown_tx.send(true);
@@ -216,6 +219,8 @@ pub(super) async fn graceful_shutdown(
         "ACME event loop",
     )
     .await;
+    background_tasks.acme_guard.take();
+    logging::shutdown_access_log();
 
     log::info!("RustHost shut down cleanly.");
     logging::flush();

@@ -16,39 +16,15 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Wired `site.error_503` into runtime serving and preload custom error pages at startup with size limits, removing per-request reloads and dead config.
 - Improved access-log accuracy by recording real `Content-Length` values when known and `-` when a streamed/compressed size is not known ahead of time.
 - Made compression more production-friendly by honoring `Accept-Encoding` quality values and skipping obviously poor candidates such as tiny or already-compressed assets.
-- Hardened private filesystem creation on Unix by creating Tor state directories and self-signed key files with restrictive permissions at creation time instead of relaxing them afterward.
-- Cleaned up startup and shutdown reliability by draining failed startup tasks, rejecting conflicting access-log reinitialization, and routing internal file-serving failures through one shared fallback path.
-- Split large server, runtime, and Tor helper sections into focused submodules and expanded test coverage for proxy IP resolution, custom `503` pages, redirect handling, and connection-limit rejection.
-- Bounded directory listings, clarified `scan_site` behavior, documented the lack of built-in auth/session features, and made the integration tests tolerate sandboxed environments that block loopback sockets.
-
-## `tor/mod.rs`
-
-- **Fixed:** Rewrote `wait_for_shutdown_signal` to use `wait_for(|&v| v)` instead of `changed()` — prevents missed signals and silent sender-drop
-- **Fixed:** Patched `JoinSet` memory leak by reaping finished tasks inline in `process_streams`
-- **Fixed:** Explicitly drop `StreamRequest` on local connect failure so a `RELAY_END` cell is sent instead of silently hanging up
-- **Fixed:** Corrected deadline fallback — overflow no longer sets deadline to "right now"
-- **Fixed:** `log_onion_banner` no longer double-prints `.onion` suffix on short hostnames
-- **Fixed:** Grouped all three index writes under one `#[allow(clippy::indexing_slicing)]` block with bounds proof
-- **Fixed:** Replaced dead `checked_shl(...).unwrap_or(u64::MAX)` with plain `<<` (shift is always < 64)
-- **Fixed (Windows):** Replaced `whoami` subprocess with `USERNAME`/`USERDOMAIN` env-var lookup; added input validation
-- **Improved:** Strengthened `ensure_private_dir` doc comment to call out Tor key material risk
-- **Removed:** Redundant `set_starting_and_clear_onion` call in `reconnect_after_stream_end` — `run()` already handles it
-- **Refactored:** Replaced all `Box<dyn Error>` returns with `anyhow::Result`; errors now use `.context()` and `{e:#}`
-- **Fixed:** Moved `semaphore.close()` before task drain to prevent permit acquisition during shutdown
-- **Fixed (tests):** Replaced `unwrap_or` with `unwrap` — silent fallback was masking potential test failures
-
-## `acme.rs`
-
-- **Fixed:** Removed unnecessary `Vec` allocation — pass iterator directly to `AcmeConfig::new`
-- **Fixed:** Domain validation now rejects leading/trailing whitespace
-- **Fixed:** Cleaned up multi-line log literal formatting
-- **Deprecated:** Flagged use of deprecated `AcmeState::acceptor()` for migration
-- **Fixed:** Removed unnecessary `.to_owned()` on static `&str` for `env_label`
-- **Improved:** Documented `tokio::spawn` runtime requirement to prevent panic on misconfiguration
-- **Fixed:** Minor allocation cleanup in email `contact_push`
-- **Improved:** Added test coverage for whitespace domains and `build_acme_acceptor`
-- **Fixed:** Added validation for `cache_dir` — rejects absolute paths, traversal, and oversized strings
-- **Fixed:** Addressed miscellaneous Clippy pedantic/nursery warnings
+- Hardened private filesystem creation further by validating directory chains, rejecting symlink hops, and keeping restrictive permissions in place for Tor and TLS state.
+- Cleaned up startup and shutdown reliability by draining failed startup tasks, allowing structured access-log reinitialization after shutdown, and holding ACME lifecycle ownership in runtime state instead of a permanent one-shot global.
+- Fixed IPv6 listener binding and local URL rendering so HTTP, HTTPS, redirect, dashboard, and localhost flows all handle bracketed IPv6 addresses correctly.
+- Corrected the Arti relay timeout behavior so active long-lived transfers are limited by idle time instead of a mistaken full-session wall clock.
+- Bounded directory listings during traversal instead of collecting and sorting an entire hostile directory before truncation.
+- Expanded test coverage with HTTPS handshake tests, IPv6 HTTP tests, ACME restart lifecycle coverage, redirect handling, proxy IP resolution, custom `503` pages, and connection-limit rejection.
+- Added top-of-file file/location reference headers across the codebase, removed stale issue-fix annotations, and continued splitting logic into smaller focused modules.
+- Rewrote the README and setup guide to better document production scope, cross-platform behavior, HTTPS/Tor setup, headless operation, and static-hosting-only expectations.
+- Removed duplicate setup filename variants so the repository stays clean on case-insensitive macOS and Windows filesystems.
 
 ---
 

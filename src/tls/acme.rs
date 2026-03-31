@@ -12,7 +12,7 @@ use std::{
     fmt::Debug,
     net::IpAddr,
     path::{Component, Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 use tokio::{runtime::Handle, task::JoinHandle};
@@ -20,12 +20,41 @@ use tokio::{runtime::Handle, task::JoinHandle};
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 
+/// Lifecycle guard that keeps the per-process ACME state reserved until the
+/// HTTPS runtime has fully shut down.
+///
+/// Dropping the guard releases the reservation so a later in-process restart
+/// can initialize ACME again.
+pub struct AcmeInitGuard {
+    active: bool,
+}
+
+impl Drop for AcmeInitGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(lock) = ACME_INITIALIZED.get() {
+            if let Ok(mut initialized) = lock.lock() {
+                *initialized = false;
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Singleton guard — prevents multiple ACME loops racing over the same DirCache
 // ---------------------------------------------------------------------------
 // Two concurrent AcmeState instances sharing the same DirCache can race on
 // account-key and certificate files, causing corruption and redundant issuance.
-static ACME_INITIALIZED: OnceLock<()> = OnceLock::new();
+static ACME_INITIALIZED: OnceLock<Mutex<bool>> = OnceLock::new();
+
+type AcmeBuildResult = Result<(
+    Arc<AcmeAcceptor>,
+    Arc<ServerConfig>,
+    JoinHandle<()>,
+    AcmeInitGuard,
+)>;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -63,7 +92,7 @@ static ACME_INITIALIZED: OnceLock<()> = OnceLock::new();
 pub fn build_acme_acceptor(
     cfg: &AcmeConfig,
     data_dir: &Path,
-) -> Result<(Arc<AcmeAcceptor>, Arc<ServerConfig>, JoinHandle<()>)> {
+) -> AcmeBuildResult {
     if !cfg.enabled {
         return Err(AppError::Tls(
             "build_acme_acceptor called with cfg.enabled = false; \
@@ -72,24 +101,7 @@ pub fn build_acme_acceptor(
         ));
     }
 
-    // The OnceLock guard is checked here but not set yet. Setting it before
-    // validate_acme_config would mean
-    // that if validation — or any subsequent fallible step — failed, the lock
-    // was already permanently set. All future retry attempts would be silently
-    // blocked, and the process had to be restarted to recover from a transient
-    // failure (e.g. a momentarily non-writable cache directory).
-    //
-    // We set the lock only after every fallible step succeeds (see the bottom
-    // of this function). A guard is still checked here so that a *second call
-    // after a prior success* is rejected immediately, before doing any work.
-    if ACME_INITIALIZED.get().is_some() {
-        return Err(AppError::Tls(
-            "build_acme_acceptor has already been called; \
-             ACME may only be initialized once per process to prevent \
-             concurrent state machines from racing over the shared DirCache"
-                .into(),
-        ));
-    }
+    let acme_guard = acquire_acme_init_guard()?;
 
     // All config validation — domains, email, and cache_dir — is now
     // consolidated in validate_acme_config (see Issue 9).
@@ -197,22 +209,25 @@ pub fn build_acme_acceptor(
 
     let task_handle = rt_handle.spawn(run_acme_event_loop(state, env_label));
 
-    // Mark initialization as complete only after every fallible step
-    // has succeeded. If any earlier step returned Err (validation, cache dir
-    // creation, runtime handle, etc.) the lock was never set, so the caller
-    // can retry without restarting the process.
-    //
-    // set() returns Err(()) if another thread raced us here — treat that as
-    // a duplicate-initialization error (same message as the early-exit guard).
-    ACME_INITIALIZED.set(()).map_err(|()| {
-        AppError::Tls(
-            "build_acme_acceptor completed concurrently on another thread; \
-             ACME may only be initialized once per process"
-                .into(),
-        )
-    })?;
+    Ok((acme_acceptor, server_cfg, task_handle, acme_guard))
+}
 
-    Ok((acme_acceptor, server_cfg, task_handle))
+fn acquire_acme_init_guard() -> Result<AcmeInitGuard> {
+    let lock = ACME_INITIALIZED.get_or_init(|| Mutex::new(false));
+    let mut initialized = lock
+        .lock()
+        .map_err(|_| AppError::Tls("ACME initialization mutex is poisoned".into()))?;
+    if *initialized {
+        return Err(AppError::Tls(
+            "build_acme_acceptor has already been called; \
+             ACME may only be initialized once at a time per process to prevent \
+             concurrent state machines from racing over the shared DirCache"
+                .into(),
+        ));
+    }
+    *initialized = true;
+    drop(initialized);
+    Ok(AcmeInitGuard { active: true })
 }
 
 // ---------------------------------------------------------------------------
@@ -669,5 +684,21 @@ mod tests {
         let mut cfg = valid_cfg();
         cfg.cache_dir = "data/tls/acme/cache".into();
         assert!(validate_acme_config(&cfg).is_ok());
+    }
+
+    #[tokio::test]
+    async fn build_acme_acceptor_can_be_reinitialized_after_guard_drop() -> Result<()> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let tmp = tempfile::tempdir()?;
+        let cfg = valid_cfg();
+
+        let (_acceptor, _server_cfg, task, guard) = build_acme_acceptor(&cfg, tmp.path())?;
+        task.abort();
+        drop(guard);
+
+        let (_acceptor, _server_cfg, task, _guard) = build_acme_acceptor(&cfg, tmp.path())?;
+        task.abort();
+        Ok(())
     }
 }

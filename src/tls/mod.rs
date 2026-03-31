@@ -39,6 +39,7 @@ pub enum Acceptor {
 pub struct TlsSetup {
     pub acceptor: Acceptor,
     pub acme_task: Option<tokio::task::JoinHandle<()>>,
+    pub acme_guard: Option<acme::AcmeInitGuard>,
 }
 
 /// Construct an [`Acceptor`] from the provided [`TlsConfig`], or return
@@ -67,6 +68,7 @@ pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<T
         return Ok(Some(TlsSetup {
             acceptor: Acceptor::Static(load_manual_cert(manual, data_dir)?),
             acme_task: None,
+            acme_guard: None,
         }));
     }
 
@@ -77,11 +79,12 @@ pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<T
         );
         // Duplicate-initialization is now enforced by the OnceLock guard
         // inside acme::build_acme_acceptor — a second call returns an error.
-        let (acme_acceptor, server_cfg, event_loop) =
+        let (acme_acceptor, server_cfg, event_loop, acme_guard) =
             acme::build_acme_acceptor(&cfg.acme, data_dir)?;
         return Ok(Some(TlsSetup {
             acceptor: Acceptor::Acme(acme_acceptor, server_cfg),
             acme_task: Some(event_loop),
+            acme_guard: Some(acme_guard),
         }));
     }
 
@@ -93,6 +96,7 @@ pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<T
     Ok(Some(TlsSetup {
         acceptor: Acceptor::Static(acceptor),
         acme_task: None,
+        acme_guard: None,
     }))
 }
 

@@ -5,6 +5,7 @@
 
 use std::{
     borrow::Cow,
+    collections::BTreeSet,
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
@@ -200,27 +201,36 @@ pub(super) fn build_directory_listing(dir: &Path, url_path: &str, expose_dotfile
     let mut truncated = false;
 
     if let Ok(entries) = std::fs::read_dir(dir) {
-        let mut names: Vec<String> = entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().into_string().ok()?;
-                if expose_dotfiles || !name.starts_with('.') {
-                    Some(name)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        names.sort();
-        if names.len() > MAX_DIRECTORY_LISTING_ENTRIES {
-            names.truncate(MAX_DIRECTORY_LISTING_ENTRIES);
+        let mut names = BTreeSet::new();
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().into_string().ok() else {
+                continue;
+            };
+            if !expose_dotfiles && name.starts_with('.') {
+                continue;
+            }
+
+            if names.len() < MAX_DIRECTORY_LISTING_ENTRIES {
+                names.insert(name);
+                continue;
+            }
+
             truncated = true;
+            let should_replace = names.last().is_some_and(|largest| name < *largest);
+            if should_replace {
+                let largest = names
+                    .last()
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_default();
+                names.remove(&largest);
+                names.insert(name);
+            }
         }
 
         let base = html_escape(url_path.trim_end_matches('/'));
-        for name in &names {
-            let encoded_name = percent_encode_path(name);
-            let escaped_name = html_escape(name);
+        for name in names {
+            let encoded_name = percent_encode_path(&name);
+            let escaped_name = html_escape(&name);
             let _ = writeln!(
                 items,
                 "  <li><a href=\"{base}/{encoded_name}\">{escaped_name}</a></li>"

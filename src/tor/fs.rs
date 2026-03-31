@@ -29,26 +29,7 @@
 /// eliminates the subprocess entirely and removes all injection surface.
 pub(super) fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        let ft = meta.file_type();
-        if ft.is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "refusing to use symlink as private directory: {}",
-                    path.display()
-                ),
-            ));
-        }
-        if !ft.is_dir() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("path exists but is not a directory: {}", path.display()),
-            ));
-        }
+        ensure_directory_chain(parent)?;
     }
 
     #[cfg(unix)]
@@ -63,6 +44,62 @@ pub(super) fn ensure_private_dir(path: &std::path::Path) -> std::io::Result<()> 
     harden_windows_permissions(path)?;
 
     Ok(())
+}
+
+fn ensure_directory_chain(path: &std::path::Path) -> std::io::Result<()> {
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if current.as_os_str().is_empty() {
+            continue;
+        }
+        ensure_real_directory(&current)?;
+    }
+    Ok(())
+}
+
+fn ensure_real_directory(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("refusing to use symlink in private directory path: {}", path.display()),
+                ));
+            }
+            if !file_type.is_dir() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("path exists but is not a directory: {}", path.display()),
+                ));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => create_single_directory(path),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(unix)]
+fn create_single_directory(path: &std::path::Path) -> std::io::Result<()> {
+    use std::fs::DirBuilder;
+    use std::os::unix::fs::DirBuilderExt;
+
+    match DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => ensure_real_directory(path),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_single_directory(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => ensure_real_directory(path),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(unix)]

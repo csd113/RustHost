@@ -78,7 +78,7 @@ impl std::fmt::Display for AccessRecord<'_> {
 }
 
 /// Global access log writer.  Initialised by [`init_access_log`]; no-op until then.
-static ACCESS_LOG: OnceLock<Mutex<LogFile>> = OnceLock::new();
+static ACCESS_LOG: OnceLock<Mutex<Option<LogFile>>> = OnceLock::new();
 
 /// Initialise the access log file.
 ///
@@ -96,21 +96,6 @@ static ACCESS_LOG: OnceLock<Mutex<LogFile>> = OnceLock::new();
 /// already been initialized for a different path.
 pub fn init_access_log(data_dir: &Path) -> Result<()> {
     let log_path = data_dir.join("logs/access.log");
-    if let Some(existing) = ACCESS_LOG.get() {
-        let existing_path = existing
-            .lock()
-            .map_err(|_| AppError::LogInit("access log mutex is poisoned".into()))?
-            .path
-            .clone();
-        if existing_path == log_path {
-            return Ok(());
-        }
-        return Err(AppError::LogInit(format!(
-            "access log already initialized at {}; cannot reinitialize with {}",
-            existing_path.display(),
-            log_path.display()
-        )));
-    }
 
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -148,13 +133,28 @@ pub fn init_access_log(data_dir: &Path) -> Result<()> {
             ))
         })?;
 
-    ACCESS_LOG
-        .set(Mutex::new(LogFile {
+    let new_log = LogFile {
         file: f,
-        path: log_path,
+        path: log_path.clone(),
         writes_since_check: 0,
         cached_size: 0,
-        }))
+    };
+
+    if let Some(existing) = ACCESS_LOG.get() {
+        let mut guard = existing
+            .lock()
+            .map_err(|_| AppError::LogInit("access log mutex is poisoned".into()))?;
+        if guard.as_ref().is_some_and(|current| current.path == log_path) {
+            drop(guard);
+            return Ok(());
+        }
+        *guard = Some(new_log);
+        drop(guard);
+        return Ok(());
+    }
+
+    ACCESS_LOG
+        .set(Mutex::new(Some(new_log)))
         .map_err(|_| AppError::LogInit("access log already initialized".into()))?;
     Ok(())
 }
@@ -166,7 +166,24 @@ pub fn init_access_log(data_dir: &Path) -> Result<()> {
 pub fn log_access(record: &AccessRecord<'_>) {
     if let Some(log) = ACCESS_LOG.get() {
         if let Ok(mut lf) = log.lock() {
-            lf.write_line(&record.to_string());
+            if let Some(file) = lf.as_mut() {
+                file.write_line(&record.to_string());
+            }
+        }
+    }
+}
+
+/// Flush and close the structured access log writer, if initialized.
+///
+/// This lets long-running test processes or embedded runtimes reinitialize the
+/// access log against a new data directory after shutdown.
+pub fn shutdown_access_log() {
+    if let Some(log) = ACCESS_LOG.get() {
+        if let Ok(mut guard) = log.lock() {
+            if let Some(file) = guard.as_mut() {
+                let _ = file.file.flush();
+            }
+            *guard = None;
         }
     }
 }

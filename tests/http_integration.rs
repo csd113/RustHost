@@ -23,7 +23,7 @@
 //! of microseconds and is acceptable in practice.
 
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::{atomic::AtomicU32, Arc},
     time::Duration,
@@ -31,7 +31,7 @@ use std::{
 
 use dashmap::DashMap;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{watch, RwLock, Semaphore},
 };
@@ -49,10 +49,14 @@ use rusthost::{
 /// The test never connects until `port_rx` fires (see [`TestServer::start`]),
 /// so the gap between this drop and the server's bind is not observable by the
 /// test logic.
-fn reserve_port() -> Result<u16, std::io::Error> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+fn reserve_port_for(bind_addr: IpAddr) -> Result<u16, std::io::Error> {
+    let listener = std::net::TcpListener::bind(SocketAddr::new(bind_addr, 0))?;
     Ok(listener.local_addr()?.port())
     // listener dropped here — port released back to the OS
+}
+
+fn reserve_port() -> Result<u16, std::io::Error> {
+    reserve_port_for(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
 // ─── Test harness ─────────────────────────────────────────────────────────────
@@ -70,20 +74,26 @@ struct TestServer {
 }
 
 impl TestServer {
-    /// Spin up a server and wait until it confirms its bound port.
-    ///
-    /// `site_root` must already contain the files the test expects to serve.
-    async fn start(site_root: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::start_with_config(site_root, |_| {}).await
-    }
-
     async fn start_with_config(
         site_root: &Path,
         configure: impl FnOnce(&mut Config),
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let port = reserve_port()?;
+        Self::start_with_bind_and_config(
+            site_root,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            configure,
+        )
+        .await
+    }
 
-        let mut config = build_test_config(site_root, port)?;
+    async fn start_with_bind_and_config(
+        site_root: &Path,
+        bind_addr: IpAddr,
+        configure: impl FnOnce(&mut Config),
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let port = reserve_port_for(bind_addr)?;
+
+        let mut config = build_test_config(site_root, bind_addr, port)?;
         configure(&mut config);
         let config = Arc::new(config);
         let state = Arc::new(RwLock::new(AppState::new()));
@@ -142,7 +152,7 @@ impl TestServer {
             .map_err(|_| "timed out waiting for server to report its bound port")?
             .map_err(|_| "server port channel closed before sending")?;
 
-        let addr: SocketAddr = format!("127.0.0.1:{bound_port}").parse()?;
+        let addr = SocketAddr::new(bind_addr, bound_port);
 
         Ok(Self {
             addr,
@@ -202,17 +212,199 @@ impl TestServer {
 async fn start_server_or_skip(
     site_root: &Path,
 ) -> Result<Option<TestServer>, Box<dyn std::error::Error>> {
-    match TestServer::start(site_root).await {
+    start_server_with_bind_or_skip(site_root, IpAddr::V4(Ipv4Addr::LOCALHOST), |_| {}).await
+}
+
+async fn start_server_with_bind_or_skip(
+    site_root: &Path,
+    bind_addr: IpAddr,
+    configure: impl FnOnce(&mut Config),
+) -> Result<Option<TestServer>, Box<dyn std::error::Error>> {
+    match TestServer::start_with_bind_and_config(site_root, bind_addr, configure).await {
         Ok(server) => Ok(Some(server)),
         Err(err)
             if err
                 .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied) =>
+                .is_some_and(|io| {
+                    matches!(
+                        io.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrNotAvailable
+                    )
+                }) =>
         {
-            eprintln!("[http_integration] skipping test: loopback sockets are blocked in this environment");
+            eprintln!(
+                "[http_integration] skipping test: loopback sockets are blocked or unavailable in this environment"
+            );
             Ok(None)
         }
         Err(err) => Err(err),
+    }
+}
+
+async fn start_https_server_or_skip(
+    site_root: &Path,
+) -> Result<Option<HttpsTestServer>, Box<dyn std::error::Error>> {
+    match HttpsTestServer::start(site_root).await {
+        Ok(server) => Ok(Some(server)),
+        Err(err)
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| {
+                    matches!(
+                        io.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AddrNotAvailable
+                    )
+                }) =>
+        {
+            eprintln!(
+                "[http_integration] skipping test: loopback sockets are blocked or unavailable in this environment"
+            );
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn wait_for_listener(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+                ) && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(err) => return Err(Box::new(err)),
+        }
+    }
+}
+
+fn ensure_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+struct HttpsTestServer {
+    addr: SocketAddr,
+    cert_path: std::path::PathBuf,
+    shutdown_tx: watch::Sender<bool>,
+    _root_tx: watch::Sender<Arc<Path>>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl HttpsTestServer {
+    async fn start(site_root: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        ensure_crypto_provider();
+
+        let port = reserve_port()?;
+        let mut config = build_test_config(site_root, IpAddr::V4(Ipv4Addr::LOCALHOST), port)?;
+        config.tls.enabled = true;
+        config.tls.port = std::num::NonZeroU16::new(port).ok_or("reserved HTTPS port was 0")?;
+        config.tls.redirect_http = false;
+
+        let state = Arc::new(RwLock::new(AppState::new()));
+        let metrics = Arc::new(Metrics::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let data_dir = site_root.parent().unwrap_or(site_root).to_path_buf();
+        let joined = data_dir.join(&config.site.directory);
+        let site_root_arc: Arc<Path> = Arc::from(joined.as_path());
+        let (root_tx, root_rx) = watch::channel(site_root_arc);
+
+        let conn_semaphore: Arc<Semaphore> =
+            Arc::new(Semaphore::new(config.server.max_connections as usize));
+        let ip_connections: Arc<DashMap<IpAddr, Arc<AtomicU32>>> = Arc::new(DashMap::new());
+
+        let tls_setup = rusthost::tls::build_acceptor(&config.tls, &data_dir)
+            .await?
+            .ok_or("expected TLS setup when tls.enabled = true")?;
+        let rusthost::tls::TlsSetup {
+            acceptor,
+            acme_task: _acme_task,
+            acme_guard: _acme_guard,
+        } = tls_setup;
+
+        let config = Arc::new(config);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let cert_path = data_dir.join("tls/dev/self-signed.crt");
+        let handle = tokio::spawn(async move {
+            rusthost::server::run_https(
+                config,
+                state,
+                metrics,
+                data_dir,
+                shutdown_rx,
+                acceptor,
+                conn_semaphore,
+                ip_connections,
+                root_rx,
+            )
+            .await;
+        });
+
+        wait_for_listener(addr).await?;
+
+        Ok(Self {
+            addr,
+            cert_path,
+            shutdown_tx,
+            _root_tx: root_tx,
+            handle: Some(handle),
+        })
+    }
+
+    async fn send(&self, request: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let cert_pem = std::fs::read(&self.cert_path)?;
+        let mut cert_reader = std::io::BufReader::new(cert_pem.as_slice());
+        let certs = rustls_pemfile::certs(&mut cert_reader)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in certs {
+            roots.add(cert)?;
+        }
+
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let stream = TcpStream::connect(self.addr).await?;
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+            .map_err(|_| "invalid localhost server name")?
+            .to_owned();
+        let mut tls_stream = connector.connect(server_name, stream).await?;
+        tls_stream.write_all(request).await?;
+
+        tokio::time::timeout(Duration::from_secs(5), read_one_response(&mut tls_stream))
+            .await
+            .map_err(|_| "HTTPS read_one_response timed out after 5 s")?
+    }
+
+    async fn stop(mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(handle) = self.handle.take() {
+            match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("[HttpsTestServer] server task panicked: {e}"),
+                Err(_) => eprintln!("[HttpsTestServer] server shutdown timed out after 5 s"),
+            }
+        }
+    }
+}
+
+impl Drop for HttpsTestServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -251,7 +443,11 @@ impl Drop for TestServer {
 ///
 /// Returns an error rather than silently falling back to a bad default if
 /// `site_root` does not have a valid UTF-8 directory name.
-fn build_test_config(site_root: &Path, port: u16) -> Result<Config, Box<dyn std::error::Error>> {
+fn build_test_config(
+    site_root: &Path,
+    bind_addr: IpAddr,
+    port: u16,
+) -> Result<Config, Box<dyn std::error::Error>> {
     use std::num::NonZeroU16;
 
     let dir_name = site_root
@@ -268,6 +464,7 @@ fn build_test_config(site_root: &Path, port: u16) -> Result<Config, Box<dyn std:
     // rather than an unwrap/expect that clippy would flag.
     config.server.port =
         NonZeroU16::new(port).ok_or("reserve_port() returned port 0, which is invalid")?;
+    config.server.bind = bind_addr;
 
     // auto_port_fallback = false: the server must bind exactly `port`.
     config.server.auto_port_fallback = false;
@@ -387,7 +584,10 @@ fn find_header_end(buf: &[u8], search_from: usize) -> Option<usize> {
 ///
 /// Use for HEAD requests where the server sends `Content-Length` but no body
 /// bytes.
-async fn read_headers_only(stream: &mut TcpStream) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+async fn read_headers_only<S>(stream: &mut S) -> Result<Vec<u8>, Box<dyn std::error::Error>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut buf = Vec::with_capacity(4096);
     let mut staging = [0u8; 4096];
 
@@ -418,7 +618,10 @@ async fn read_headers_only(stream: &mut TcpStream) -> Result<Vec<u8>, Box<dyn st
 /// Accumulates bytes using a 4 KiB staging buffer until `\r\n\r\n` is found,
 /// then reads exactly `Content-Length` additional bytes (defaulting to 0).
 /// Avoids blocking on a keep-alive connection that never sends EOF.
-async fn read_one_response(stream: &mut TcpStream) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+async fn read_one_response<S>(stream: &mut S) -> Result<Vec<u8>, Box<dyn std::error::Error>>
+where
+    S: AsyncRead + Unpin,
+{
     // ── 1. Read headers ───────────────────────────────────────────────────────
     let mut buf = Vec::with_capacity(4096);
     let mut staging = [0u8; 4096];
@@ -523,6 +726,46 @@ async fn get_index_html_returns_200() -> Result<(), Box<dyn std::error::Error>> 
         "GET /index.html must return 200:\n{}",
         response_to_str(&response)?
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_index_html_returns_200_over_ipv6() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"<h1>hello ipv6</h1>")])?;
+    let Some(server) = start_server_with_bind_or_skip(&site, IpAddr::V6(Ipv6Addr::LOCALHOST), |_| {}).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /index.html HTTP/1.1\r\nHost: [::1]\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert!(response_to_str(&response)?.contains("hello ipv6"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn https_self_signed_server_returns_200() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"<h1>secure hello</h1>")])?;
+    let Some(server) = start_https_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert_eq!(
+        header_value(&response, "strict-transport-security")?.as_deref(),
+        Some("max-age=31536000; includeSubDomains")
+    );
+    assert!(response_to_str(&response)?.contains("secure hello"));
     Ok(())
 }
 
