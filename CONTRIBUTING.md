@@ -21,13 +21,8 @@ workflow, code standards, and review expectations so your time is spent well.
 
 | Tool | Minimum version | Notes |
 |------|-----------------|-------|
-| Rust (nightly) | see `rust-toolchain.toml` | pinned channel; installed automatically by `rustup` |
-| `cargo-audit` | latest | `cargo install cargo-audit` |
+| Rust (stable) | 1.90+ | matches the crate's `rust-version` in `Cargo.toml` |
 | `cargo-deny` | latest | `cargo install cargo-deny` |
-
-The pinned nightly toolchain is defined in `rust-toolchain.toml` at the
-repository root. Running any `cargo` command will invoke `rustup` to install it
-automatically on first use.
 
 ---
 
@@ -38,7 +33,7 @@ git clone https://github.com/your-org/rusthost
 cd rusthost
 
 # Build and run tests
-cargo test --all
+cargo test --all-targets --all-features
 
 # Run clippy (same flags as CI)
 cargo clippy --all-targets --all-features -- -D warnings
@@ -97,16 +92,13 @@ match on `AppError` variants at call sites that need to handle specific cases.
 cargo test --lib
 
 # All tests (unit + integration)
-cargo test --all
+cargo test --all-targets --all-features
 
 # A specific test by name
 cargo test percent_decode
 
-# Security audit
-cargo audit
-
 # Dependency policy check
-cargo deny check
+cargo deny check advisories bans licenses sources
 ```
 
 Integration tests live in `tests/`. They import items re-exported from
@@ -124,7 +116,7 @@ Integration tests live in `tests/`. They import items re-exported from
    to review and revert.
 4. **Changelog**: add a line under `[Unreleased]` in `CHANGELOG.md` before
    opening the PR.
-5. **CI must be green**: all three CI jobs (`test`, `audit`, `deny`) must pass.
+5. **CI must be green**: all three CI jobs (`test`, `lint`, `deny`) must pass.
    The `test` job runs on Ubuntu, macOS, and Windows.
 
 ---
