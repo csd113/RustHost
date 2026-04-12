@@ -29,7 +29,7 @@ use crate::{
     config::{self, Config},
     console, logging,
     runtime::{
-        events,
+        events, runtime_root,
         state::{AppState, Metrics, SharedMetrics, SharedState, TorStatus},
     },
     server, tor, Result,
@@ -198,9 +198,8 @@ fn default_data_dir() -> PathBuf {
 // ─── First Run ───────────────────────────────────────────────────────────────
 
 fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
-    for sub in &["site", "logs"] {
-        std::fs::create_dir_all(data_dir.join(sub))?;
-    }
+    std::fs::create_dir_all(data_dir.join("site"))?;
+    std::fs::create_dir_all(runtime_root(data_dir))?;
 
     config::defaults::write_default_config(settings_path)?;
 
@@ -214,6 +213,7 @@ fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
     println!("  ─────────────────────────────────────────");
     println!("  Data directories and a default config have been created.");
     println!("  You can drop your site files into:  ./rusthost-data/site/");
+    println!("  Runtime-managed files live under:    ./rusthost-data/runtime/");
     println!();
     println!("  Tor onion service is built-in — no external install required.");
     println!("  On first run, Arti will download ~2 MB of directory data (~30 s).");

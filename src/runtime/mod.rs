@@ -14,6 +14,8 @@ pub mod events;
 pub mod lifecycle;
 pub mod state;
 
+use std::path::{Path, PathBuf};
+
 /// Open `url` in the system default browser.
 ///
 /// Single canonical definition extracted from `lifecycle.rs` and `events.rs`
@@ -51,4 +53,13 @@ pub fn open_browser(url: &str) {
     if let Err(e) = result {
         log::warn!("Could not open browser at {url}: {e}");
     }
+}
+
+/// Return the runtime-owned directory root inside a data directory.
+///
+/// The generated on-disk layout keeps user content at `site/` and all
+/// RustHost-managed state under `runtime/`.
+#[must_use]
+pub fn runtime_root(data_dir: &Path) -> PathBuf {
+    data_dir.join("runtime")
 }
