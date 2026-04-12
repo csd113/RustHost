@@ -70,7 +70,7 @@ const fn default_http_port() -> NonZeroU16 {
     }
 }
 fn default_acme_dir() -> String {
-    String::from("tls/acme")
+    String::from("runtime/tls/acme")
 }
 const fn default_redirect_status() -> u16 {
     301
@@ -121,7 +121,7 @@ const fn default_logging_level() -> LogLevel {
     LogLevel::Info
 }
 fn default_logging_file() -> String {
-    String::from("logs/rusthost.log")
+    String::from("runtime/logs/rusthost.log")
 }
 
 /// Console defaults

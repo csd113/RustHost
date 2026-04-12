@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            build_tool: cargo
+            asset_name: rusthost-cli-x86_64-apple-darwin
+
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            build_tool: cargo
+            asset_name: rusthost-cli-aarch64-apple-darwin
+
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            build_tool: cargo
+            asset_name: rusthost-cli-x86_64-unknown-linux-gnu
+
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            build_tool: cross
+            asset_name: rusthost-cli-aarch64-unknown-linux-gnu
+
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            build_tool: cargo
+            asset_name: rusthost-cli-x86_64-pc-windows-msvc.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Install cross
+        if: matrix.build_tool == 'cross'
+        run: cargo install cross --locked --force
+
+      - name: Build release binary
+        run: ${{ matrix.build_tool }} build --locked --release --target ${{ matrix.target }} --bin rusthost-cli
+
+      - name: Stage artifact on Unix
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/rusthost-cli dist/${{ matrix.asset_name }}
+
+      - name: Stage artifact on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\rusthost-cli.exe" "dist\${{ matrix.asset_name }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: release-artifacts/rusthost-cli-*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

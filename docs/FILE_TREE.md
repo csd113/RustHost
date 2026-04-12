@@ -93,14 +93,17 @@ Created automatically — never commit these to version control.
     site/
         index.html                 ← placeholder; replace with your content
         ...                        ← your HTML / CSS / JS / assets
-    tor/
-        torrc                      ← overwritten on every run (do not edit)
-        data/                      ← Tor's internal state; do not delete
-        hidden_service/
-            hostname               ← your .onion address (written by Tor)
-            private_key            ← keep safe; losing it changes the address
-    logs/
-        rusthost.log               ← append-only; survives restarts
+    runtime/
+        logs/
+            rusthost.log           ← append-only; survives restarts
+        tls/
+            dev/
+                self-signed.crt    ← local dev cert (if TLS enabled)
+                self-signed.key    ← local dev key (if TLS enabled)
+            acme/                  ← ACME cache/state (if ACME enabled)
+        tor/
+            arti_state/            ← Tor identity + persistent state
+            arti_cache/            ← Tor consensus cache
 ```
 
 ---

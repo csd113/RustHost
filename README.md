@@ -81,7 +81,7 @@ On first run RustHost creates:
 
 - `rusthost-data/settings.toml`
 - `rusthost-data/site/`
-- `rusthost-data/logs/`
+- `rusthost-data/runtime/`
 
 Drop your static files into `rusthost-data/site/` and restart.
 
@@ -127,8 +127,8 @@ enabled = true
 port = 443
 
 [tls.manual_cert]
-cert_path = "tls/manual/fullchain.pem"
-key_path = "tls/manual/privkey.pem"
+cert_path = "runtime/tls/manual/fullchain.pem"
+key_path = "runtime/tls/manual/privkey.pem"
 ```
 
 Manual cert paths must stay inside the configured data directory.
@@ -147,7 +147,7 @@ enabled = true
 domains = ["example.com", "www.example.com"]
 email = "ops@example.com"
 staging = true
-cache_dir = "tls/acme"
+cache_dir = "runtime/tls/acme"
 ```
 
 Recommended rollout:
@@ -165,7 +165,7 @@ RustHost can expose the same static site over a Tor onion service using Arti in-
 Operational notes:
 
 - the first startup needs outbound network access so Arti can bootstrap
-- Tor private state is stored under the data directory
+- Tor private state is stored under `runtime/tor/`
 - if you want to preserve the same onion address, back up the Tor state directory
 - for sensitive deployments, run the process under a dedicated OS account
 

@@ -68,7 +68,7 @@ enabled = true
 level = "info"
 
 # Log file relative to ./rusthost-data/
-file = "logs/rusthost.log"
+file = "runtime/logs/rusthost.log"
 
 # Hide noisy third-party logs (Arti, Tokio, etc.) by default.
 filter_dependencies = true
@@ -121,13 +121,13 @@ email = ""
 # true = staging (recommended for testing), false = production.
 staging = true
 # Cache directory relative to data dir.
-cache_dir = "tls/acme"
+cache_dir = "runtime/tls/acme"
 
 # ── Manual certificate (uncomment to use your own cert) ───────────────────────
 
 # [tls.manual_cert]
-# cert_path = "tls/cert.pem"
-# key_path = "tls/key.pem"
+# cert_path = "runtime/tls/manual/fullchain.pem"
+# key_path = "runtime/tls/manual/privkey.pem"
 "#;
 
 /// Write the default `settings.toml` **only if it does not already exist**.

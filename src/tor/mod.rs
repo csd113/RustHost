@@ -167,14 +167,14 @@ async fn bootstrap_and_launch(
     data_dir: &std::path::Path,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<Option<TorSession>> {
-    ensure_private_dir(&data_dir.join("arti_state"))
+    ensure_private_dir(&data_dir.join("runtime/tor/arti_state"))
         .context("cannot create secure Tor state directory")?;
-    ensure_private_dir(&data_dir.join("arti_cache"))
+    ensure_private_dir(&data_dir.join("runtime/tor/arti_cache"))
         .context("cannot create secure Tor cache directory")?;
 
     let config = TorClientConfigBuilder::from_directories(
-        data_dir.join("arti_state"),
-        data_dir.join("arti_cache"),
+        data_dir.join("runtime/tor/arti_state"),
+        data_dir.join("runtime/tor/arti_cache"),
     )
     .build()
     .context("failed to build Tor client configuration")?;

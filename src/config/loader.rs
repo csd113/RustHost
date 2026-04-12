@@ -7,6 +7,15 @@ use super::Config;
 use crate::{AppError, Result};
 use std::path::Path;
 
+fn is_rooted_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::Prefix(_) | std::path::Component::RootDir
+        )
+    })
+}
+
 /// Load and validate the configuration from `path`.
 ///
 /// # Errors
@@ -28,7 +37,7 @@ pub fn load(path: &Path) -> Result<Config> {
 
 fn reject_parent_dir(value: &str, label: &str, errors: &mut Vec<String>) {
     let path = std::path::Path::new(value);
-    if path.has_root() {
+    if is_rooted_path(path) {
         errors.push(format!("[site] {label} must not be an absolute path"));
         return;
     }
@@ -126,7 +135,7 @@ fn validate(cfg: &Config) -> Result<()> {
 
     {
         let dir_path = std::path::Path::new(&cfg.site.directory);
-        if dir_path.has_root() {
+        if is_rooted_path(dir_path) {
             errors.push("[site] directory must not be an absolute path".into());
         }
         if dir_path
@@ -160,7 +169,7 @@ fn validate(cfg: &Config) -> Result<()> {
 
     {
         let log_path = std::path::Path::new(&cfg.logging.file);
-        if log_path.has_root() {
+        if is_rooted_path(log_path) {
             errors.push("[logging] file must not be an absolute path".into());
         }
         if log_path
@@ -500,7 +509,7 @@ enabled = false
 [logging]
 enabled = true
 level = "info"
-file = "logs/rusthost.log"
+file = "runtime/logs/rusthost.log"
 filter_dependencies = true
 
 [console]
