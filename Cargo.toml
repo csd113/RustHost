@@ -45,7 +45,8 @@ time           = "0.3"      # OffsetDateTime for rcgen cert params
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-util   = { version = "0.7",  features = ["compat", "io"] }  # futures-io ↔ tokio-io compatibility bridge
 rustls       = { version = "0.23", features = ["ring"] }    # rustls TLS implementation
-rustls-acme  = { version = "0.12", default-features = false, features = ["tokio", "ring"] } # ACME / Let's Encrypt automation
+rustls-acme  = { version = "0.15", default-features = false, features = ["tokio", "ring"] } # ACME / Let's Encrypt automation
+webpki-roots = "0.26"                                        # Mozilla root store for ACME client TLS
 rcgen        = "0.13"                                        # self-signed dev cert generation
 
 tokio = { version = "1", features = [

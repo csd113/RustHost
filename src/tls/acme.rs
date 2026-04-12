@@ -5,7 +5,7 @@
 use crate::Result;
 use crate::{config::AcmeConfig, error::AppError};
 use futures::StreamExt as _;
-use rustls::ServerConfig;
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_acme::AcmeAcceptor;
 use std::{
     collections::HashSet,
@@ -166,9 +166,20 @@ pub fn build_acme_acceptor(cfg: &AcmeConfig, data_dir: &Path) -> AcmeBuildResult
 
     // Modern builder API (rustls-acme ≥ 0.15+).
     // Note: `directory_lets_encrypt` takes a *production* bool (true = prod).
-    let mut acme_cfg = rustls_acme::AcmeConfig::new(cfg.domains.iter().map(String::as_str))
-        .cache(cache)
-        .directory_lets_encrypt(!cfg.staging);
+    let root_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let client_config = Arc::new(
+        ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    );
+    let mut acme_cfg = rustls_acme::AcmeConfig::new_with_client_config(
+        cfg.domains.iter().map(String::as_str),
+        client_config,
+    )
+    .cache(cache)
+    .directory_lets_encrypt(!cfg.staging);
 
     // Contact email — Let's Encrypt uses this for expiry notices.
     if let Some(email) = &cfg.email {

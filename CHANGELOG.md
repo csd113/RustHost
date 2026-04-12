@@ -7,7 +7,7 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [v1.3.1]
+## [v0.1.3.1]
 
 ### Changed
 
