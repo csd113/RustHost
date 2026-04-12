@@ -333,7 +333,7 @@ impl HttpsTestServer {
 
         let config = Arc::new(config);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let cert_path = data_dir.join("tls/dev/self-signed.crt");
+        let cert_path = data_dir.join("runtime/tls/dev/self-signed.crt");
         let (tls_port_tx, _tls_port_rx) = tokio::sync::oneshot::channel::<u16>();
         let handle = tokio::spawn(async move {
             rusthost::server::run_https(

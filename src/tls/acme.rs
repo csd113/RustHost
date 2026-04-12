@@ -444,7 +444,7 @@ mod tests {
             domains: vec!["example.com".into()],
             email: Some("test@example.com".into()),
             staging: true,
-            cache_dir: "tls/acme".into(),
+            cache_dir: "runtime/tls/acme".into(),
         }
     }
 
@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn accepts_nested_relative_cache_dir() {
         let mut cfg = valid_cfg();
-        cfg.cache_dir = "data/tls/acme/cache".into();
+        cfg.cache_dir = "runtime/tls/acme/cache".into();
         assert!(validate_acme_config(&cfg).is_ok());
     }
 

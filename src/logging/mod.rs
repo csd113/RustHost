@@ -97,7 +97,7 @@ struct AccessLogState {
 /// Initialise the access log file.
 ///
 /// Call once after [`init`], passing the same `data_dir`.  The access log is
-/// written to `<data_dir>/logs/access.log`.  Rotation follows the same
+/// written to `<data_dir>/runtime/logs/access.log`.  Rotation follows the same
 /// `MAX_LOG_BYTES` limit as the application log.
 ///
 /// Safe to call even when `logging.enabled = false`; the access log is
@@ -109,7 +109,7 @@ struct AccessLogState {
 /// file cannot be opened. Returns [`AppError::LogInit`] if an access log has
 /// already been initialized for a different path.
 pub fn init_access_log(data_dir: &Path) -> Result<()> {
-    let log_path = data_dir.join("logs/access.log");
+    let log_path = data_dir.join("runtime/logs/access.log");
 
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;

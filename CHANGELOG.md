@@ -7,6 +7,14 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.3.1]
+
+### Changed
+
+- Simplified the generated data directory so fresh installs now create `site/`, `settings.toml`, and a single `runtime/` tree for logs, TLS state, and Tor state instead of scattering runtime-owned folders at the top level.
+
+---
+
 ## [v0.1.3]
 
 ### Simplified updates

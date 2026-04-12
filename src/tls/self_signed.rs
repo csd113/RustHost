@@ -22,7 +22,7 @@ const CERT_SANS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 // ---------------------------------------------------------------------------
 /// Return a [`TlsAcceptor`] backed by a self-signed `localhost` certificate.
 ///
-/// If a valid, non-expiring cert already exists in `<data_dir>/tls/dev/` it
+/// If a valid, non-expiring cert already exists in `<data_dir>/runtime/tls/dev/` it
 /// is reused; otherwise a fresh one is generated with `rcgen` and written to
 /// disk (mode `0600` on Unix).
 ///
@@ -51,7 +51,7 @@ pub async fn generate_or_load(data_dir: &Path) -> Result<Arc<TlsAcceptor>> {
 }
 
 fn generate_or_load_blocking(data_dir: &Path) -> Result<Arc<TlsAcceptor>> {
-    let dir = data_dir.join("tls/dev");
+    let dir = data_dir.join("runtime/tls/dev");
     let cert_path = dir.join("self-signed.crt");
     let key_path = dir.join("self-signed.key");
     std::fs::create_dir_all(&dir).map_err(|e| {
@@ -309,8 +309,8 @@ mod tests {
     async fn generates_cert_on_first_call() {
         ensure_crypto_provider();
         let tmp = TempDir::new().unwrap();
-        let cert = tmp.path().join("tls/dev/self-signed.crt");
-        let key = tmp.path().join("tls/dev/self-signed.key");
+        let cert = tmp.path().join("runtime/tls/dev/self-signed.crt");
+        let key = tmp.path().join("runtime/tls/dev/self-signed.key");
         assert!(!cert.exists());
         generate_or_load(tmp.path())
             .await
@@ -324,7 +324,7 @@ mod tests {
         ensure_crypto_provider();
         let tmp = TempDir::new().unwrap();
         generate_or_load(tmp.path()).await.unwrap();
-        let cert_path = tmp.path().join("tls/dev/self-signed.crt");
+        let cert_path = tmp.path().join("runtime/tls/dev/self-signed.crt");
         let mtime_1 = std::fs::metadata(&cert_path).unwrap().modified().unwrap();
         // Small sleep to ensure mtime would differ if the file were rewritten.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

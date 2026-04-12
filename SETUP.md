@@ -90,7 +90,7 @@ On first run RustHost creates:
 
 - `rusthost-data/settings.toml`
 - `rusthost-data/site/`
-- `rusthost-data/logs/`
+- `rusthost-data/runtime/`
 
 Place your static files in `rusthost-data/site/` and restart.
 
@@ -140,8 +140,8 @@ enabled = true
 port = 443
 
 [tls.manual_cert]
-cert_path = "tls/manual/fullchain.pem"
-key_path = "tls/manual/privkey.pem"
+cert_path = "runtime/tls/manual/fullchain.pem"
+key_path = "runtime/tls/manual/privkey.pem"
 ```
 
 Notes:
@@ -164,7 +164,7 @@ enabled = true
 domains = ["example.com", "www.example.com"]
 email = "ops@example.com"
 staging = true
-cache_dir = "tls/acme"
+cache_dir = "runtime/tls/acme"
 ```
 
 Deployment checklist for ACME:
@@ -326,11 +326,12 @@ Typical managed layout:
 
 ```text
 rusthost-data/
-├── logs/
 ├── site/
 ├── settings.toml
-├── tls/
-└── arti_state/   (or other Tor state paths created by runtime components)
+└── runtime/
+    ├── logs/
+    ├── tls/
+    └── tor/
 ```
 
 The exact TLS and Tor subdirectories depend on the features you enable.

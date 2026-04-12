@@ -500,7 +500,7 @@ enabled = false
 [logging]
 enabled = true
 level = "info"
-file = "logs/rusthost.log"
+file = "runtime/logs/rusthost.log"
 filter_dependencies = true
 
 [console]
