@@ -20,6 +20,11 @@ use tokio::{runtime::Handle, task::JoinHandle};
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 
+fn is_rooted_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+}
+
 /// Lifecycle guard that keeps the per-process ACME state reserved until the
 /// HTTPS runtime has fully shut down.
 ///
@@ -376,7 +381,7 @@ fn validate_acme_config(cfg: &AcmeConfig) -> Result<()> {
     // Keep cache-dir validation here so this function is the single
     // authoritative validation entry point for AcmeConfig.
 
-    if Path::new(&cfg.cache_dir).is_absolute() {
+    if is_rooted_path(Path::new(&cfg.cache_dir)) {
         return Err(AppError::Tls(
             "[tls.acme.cache_dir] must be a relative path".into(),
         ));
