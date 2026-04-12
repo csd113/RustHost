@@ -20,6 +20,13 @@ use crate::{
     error::AppError,
 };
 
+fn is_rooted_path(path: &Path) -> bool {
+    use std::path::Component;
+
+    path.components()
+        .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
+}
+
 /// Converts a borrowed `PrivateKeyDer` to an owned `'static` version.
 fn private_key_der_to_static(key: &PrivateKeyDer<'_>) -> PrivateKeyDer<'static> {
     key.clone_key()
@@ -131,12 +138,12 @@ fn load_manual_cert(cfg: &ManualCertConfig, data_dir: &Path) -> Result<Arc<TlsAc
 
     // Absolute paths are also unconditionally rejected — cert files must live
     // inside the data directory, not be referenced by a rooted path.
-    if Path::new(&cfg.cert_path).is_absolute() {
+    if is_rooted_path(Path::new(&cfg.cert_path)) {
         return Err(AppError::Tls(
             "cert_path must be a relative path (no leading '/')".into(),
         ));
     }
-    if Path::new(&cfg.key_path).is_absolute() {
+    if is_rooted_path(Path::new(&cfg.key_path)) {
         return Err(AppError::Tls(
             "key_path must be a relative path (no leading '/')".into(),
         ));
