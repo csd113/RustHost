@@ -9,6 +9,8 @@
 #   audit   — cargo audit (known CVEs in dependencies)  [#16]
 #
 # cargo-audit is installed from crates.io on each run.
+# Use --force so the step stays idempotent if the runner image already
+# includes the binary in ~/.cargo/bin.
 # Cache the registry + build artifacts to keep runs fast.
 
 name: CI
@@ -99,7 +101,7 @@ jobs:
           key: ${{ runner.os }}-audit-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --locked --force
 
       - name: Run cargo audit
         # --deny unsound: also fail on soundness issues, not only CVEs
