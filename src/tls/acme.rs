@@ -92,6 +92,11 @@ type AcmeBuildResult = Result<(
 /// - there is no active Tokio runtime,
 /// - [`validate_acme_config`] rejects the provided [`AcmeConfig`], or
 /// - the ACME cache directory cannot be created or secured on disk.
+///
+/// # Panics
+///
+/// Panics if the process is shutting down while the returned background ACME
+/// task is still running and Tokio aborts the task during runtime teardown.
 #[must_use = "the AcmeAcceptor and ServerConfig must be used to serve TLS; \
               the JoinHandle must be retained to monitor the ACME event loop"]
 pub fn build_acme_acceptor(cfg: &AcmeConfig, data_dir: &Path) -> AcmeBuildResult {
@@ -166,11 +171,17 @@ pub fn build_acme_acceptor(cfg: &AcmeConfig, data_dir: &Path) -> AcmeBuildResult
 
     // Modern builder API (rustls-acme ≥ 0.15+).
     // Note: `directory_lets_encrypt` takes a *production* bool (true = prod).
-    let root_store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let client_config = Arc::new(
+    let root_store: RootCertStore = webpki_roots::TLS_SERVER_ROOTS.iter().cloned().collect();
+    let client_builder =
         ClientConfig::builder_with_provider(rustls::crypto::ring::default_provider().into())
             .with_safe_default_protocol_versions()
-            .unwrap()
+            .map_err(|err| {
+                AppError::Tls(format!(
+                    "failed to build ACME TLS client with safe protocol versions: {err}"
+                ))
+            })?;
+    let client_config = Arc::new(
+        client_builder
             .with_root_certificates(root_store)
             .with_no_client_auth(),
     );
