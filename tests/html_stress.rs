@@ -1,4 +1,4 @@
-//! HTML stress-test suite for RustHost.
+//! HTML stress-test suite for `RustHost`.
 //!
 //! This test serves the fixture tree under `tests/fixtures/html_stress` through
 //! the real HTTP server, then hammers it with a mixed workload:
@@ -8,6 +8,7 @@
 //! - a generated large HTML page with range requests
 
 use std::{
+    fmt::Write as _,
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -46,7 +47,7 @@ fn materialize_large_page(site_root: &Path) -> Result<(), Box<dyn std::error::Er
         "<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n  <title>Huge page</title>\n</head>\n<body>\n  <h1>Huge page</h1>\n  <pre>\n",
     );
     for i in 0..4096 {
-        body.push_str(&format!("line {:04}: RustHost static stress body\n", i));
+        let _ = writeln!(body, "line {i:04}: RustHost static stress body");
     }
     body.push_str("  </pre>\n</body>\n</html>\n");
     fs::write(large_path, body)?;

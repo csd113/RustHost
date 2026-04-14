@@ -123,8 +123,7 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
     let site_dir = canonical_dir
         .file_name()
         .and_then(|name| name.to_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| ".".to_owned());
+        .map_or_else(|| ".".to_owned(), str::to_owned);
 
     // Use the parent of `dir` as the data_dir so relative paths stay sane.
     let data_dir = canonical_dir
