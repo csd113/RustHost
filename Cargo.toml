@@ -3,7 +3,7 @@ name = "rusthost"
 version = "1.3.1"
 edition = "2021"
 # Bumped from 1.86 → 1.90 to match the highest MSRV in the transitive dep tree:
-# arti-client 0.40 and most tor-* crates require 1.89
+# arti-client 0.41 and most tor-* crates require 1.90
 # typed-index-collections 3.5 (via tor-netdir) requires 1.90
 rust-version = "1.90"
 description = "Single-binary, zero-setup static site hosting appliance with Tor support"
@@ -62,13 +62,13 @@ tokio = { version = "1", features = [
 
 # default-features = false removes the implicit "native-tls" default that
 # would otherwise pull in openssl-sys and break cross-compilation.
-arti-client = { version = "0.40", default-features = false, features = [
+arti-client = { version = "0.41", default-features = false, features = [
     "tokio",
     "rustls",
     "onion-service-service",
 ] }
-tor-hsservice = { version = "0.40", default-features = false }
-tor-cell      = { version = "0.40", default-features = false }
+tor-hsservice = { version = "0.41", default-features = false }
+tor-cell      = { version = "0.41", default-features = false }
 futures       = "0.3"
 
 # Terminal auto-launcher (Phase 0): TTY detection uses std::io::IsTerminal
