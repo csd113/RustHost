@@ -117,14 +117,19 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
     };
     use std::num::NonZeroU16;
 
-    let dir_str = dir.to_string_lossy().into_owned();
+    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    // Use "." when the served path has no leaf name (for example `/`), so the
+    // resulting `data_dir.join(site.directory)` still resolves back to `dir`.
+    let site_dir = canonical_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| ".".to_owned());
 
     // Use the parent of `dir` as the data_dir so relative paths stay sane.
-    let data_dir = dir
-        .canonicalize()
-        .unwrap_or_else(|_| dir.clone())
+    let data_dir = canonical_dir
         .parent()
-        .map_or_else(|| dir.clone(), Path::to_path_buf);
+        .map_or_else(|| canonical_dir.clone(), Path::to_path_buf);
 
     let config = Arc::new(crate::config::Config {
         server: ServerConfig {
@@ -141,7 +146,7 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
             trusted_proxies: None,
         },
         site: SiteConfig {
-            directory: dir_str,
+            directory: site_dir,
             index_file: "index.html".into(),
             enable_directory_listing: true,
             expose_dotfiles: false,

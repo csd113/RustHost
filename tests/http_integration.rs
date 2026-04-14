@@ -1178,8 +1178,9 @@ async fn connection_limit_rejects_second_socket() -> Result<(), Box<dyn std::err
 
     let rejected = match write_result {
         Ok(()) => {
-            let mut buf = [0u8; 16];
+            let mut buf = [0u8; 256];
             match tokio::time::timeout(Duration::from_secs(2), second.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => matches!(status_code(&buf[..n]), Ok(503)),
                 Ok(Ok(0)) => true,
                 Ok(Err(err))
                     if matches!(
