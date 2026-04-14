@@ -23,7 +23,7 @@ RustHost is intentionally a **static public content server**. It does not provid
 - Per-IP and global connection limits
 - Optional HTTP to HTTPS redirect server
 - Custom `404` and `503` pages
-- Strict Clippy and test coverage in the repo itself
+- Strict Clippy and test coverage in the repo itself, including a real HTTP stress suite for mixed static assets
 
 ## Project Scope
 
@@ -211,6 +211,11 @@ The project uses strict linting and tests:
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
+
+The integration test suite includes `tests/html_stress.rs`, which serves the
+fixture tree under `tests/fixtures/html_stress/` through the real server and
+checks bursty keep-alive traffic, concurrent clients, range requests, directory
+listings, percent-encoded paths, and mixed HTML/CSS/JS/SVG assets.
 
 `unsafe` Rust is forbidden in this project.
 
