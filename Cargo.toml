@@ -8,6 +8,9 @@ edition = "2021"
 rust-version = "1.90"
 description = "Single-binary, zero-setup static site hosting appliance with Tor support"
 license = "MIT"
+repository = "https://github.com/csd113/RustHost"
+keywords = ["static-site", "hosting", "https", "tor", "server"]
+categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
 authors = []
 
 [lib]
@@ -33,6 +36,9 @@ all      = { level = "deny", priority = -1 }
 pedantic = { level = "deny", priority = -1 }
 # nursery lints warn but do not gate CI; they surface improvement candidates.
 nursery  = { level = "warn", priority = -1 }
+# Transitive dependency ecosystems used here (notably Arti/Tor, TLS, proc
+# macros, and platform crates) intentionally carry parallel semver lines.
+multiple_crate_versions = "allow"
 
 [dependencies]
 

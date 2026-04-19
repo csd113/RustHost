@@ -8,6 +8,10 @@
 
 #![deny(warnings)]
 #![deny(clippy::all, clippy::pedantic)]
+// This project depends on Arti/Tor plus TLS/proc-macro/platform ecosystems
+// that intentionally carry parallel semver lines; forcing unification here is
+// outside this crate's control and would make dependency upgrades brittle.
+#![allow(clippy::multiple_crate_versions)]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
