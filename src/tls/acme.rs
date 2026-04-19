@@ -212,10 +212,9 @@ pub fn build_acme_acceptor(cfg: &AcmeConfig, data_dir: &Path) -> AcmeBuildResult
             .with_cert_resolver(state.resolver()),
     );
 
-    // FIXME(rustls-acme): migrate to `axum_acceptor`, `AcmeState::incoming`,
-    // or a manual CertResolver integration once `acceptor()` is removed.
-    // Track: https://github.com/FlorianUekermann/rustls-acme — replace this
-    // comment with the upstream issue URL when filed.
+    // Compatibility note: rustls-acme deprecated `acceptor()` in favor of
+    // `axum_acceptor`, `AcmeState::incoming`, or manual CertResolver
+    // integration. Keep this isolated so the migration is one call site.
     #[allow(deprecated)]
     let acme_acceptor = Arc::new(state.acceptor());
 

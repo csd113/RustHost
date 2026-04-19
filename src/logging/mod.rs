@@ -100,15 +100,20 @@ struct AccessLogState {
 /// written to `<data_dir>/runtime/logs/access.log`.  Rotation follows the same
 /// `MAX_LOG_BYTES` limit as the application log.
 ///
-/// Safe to call even when `logging.enabled = false`; the access log is
-/// always written when this function succeeds.
+/// Safe to call even when `logging.enabled = false`; in that case any existing
+/// access-log worker is stopped and future access records are discarded.
 ///
 /// # Errors
 ///
 /// Returns [`AppError::Io`] if the log directory cannot be created or the
 /// file cannot be opened. Returns [`AppError::LogInit`] if an access log has
 /// already been initialized for a different path.
-pub fn init_access_log(data_dir: &Path) -> Result<()> {
+pub fn init_access_log(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
+    if !config.enabled {
+        shutdown_access_log();
+        return Ok(());
+    }
+
     let log_path = data_dir.join("runtime/logs/access.log");
 
     if let Some(parent) = log_path.parent() {
@@ -693,7 +698,10 @@ mod tests {
     // catches regressions even on Linux/macOS build runners.
     #[cfg(windows)]
     use super::validate_windows_name;
-    use crate::logging::AccessRecord;
+    use crate::{
+        config::Config,
+        logging::{init_access_log, log_access, shutdown_access_log, AccessRecord},
+    };
 
     // Provide a shim for non-Windows test runs so the test bodies compile.
     #[cfg(not(windows))]
@@ -808,5 +816,32 @@ mod tests {
         };
         let rendered = record.to_string();
         assert!(rendered.contains(" 304 - "));
+    }
+
+    #[test]
+    fn disabled_logging_disables_access_log_file(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let mut config = Config::default().logging;
+        config.enabled = false;
+
+        init_access_log(&config, tmp.path())?;
+        log_access(&AccessRecord {
+            remote_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            method: "GET",
+            path: "/",
+            protocol: "HTTP/1.1",
+            status: 200,
+            bytes_sent: Some(0),
+            user_agent: None,
+            referer: None,
+        });
+        shutdown_access_log();
+
+        assert!(
+            !tmp.path().join("runtime/logs/access.log").exists(),
+            "logging.enabled = false must not create access.log"
+        );
+        Ok(())
     }
 }

@@ -30,7 +30,7 @@ pub(super) fn cache_control_for(content_type: &str, path: &str) -> &'static str 
     }
 }
 
-pub fn is_hashed_asset(name: &str) -> bool {
+pub(super) fn is_hashed_asset(name: &str) -> bool {
     name.split('.')
         .any(|seg| (8..=16).contains(&seg.len()) && seg.chars().all(|c| c.is_ascii_hexdigit()))
 }
@@ -51,7 +51,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     stack.iter().collect()
 }
 
-pub fn resolved_path_has_dotfile(resolved: &Path, root: &Path) -> bool {
+pub(super) fn resolved_path_has_dotfile(resolved: &Path, root: &Path) -> bool {
     resolved
         .strip_prefix(root)
         .unwrap_or(resolved)
@@ -112,14 +112,20 @@ pub(super) fn resolve_path(opts: &ResolveOptions<'_>) -> Resolved {
     let candidate = canonical_root.join(relative);
 
     let target = if candidate.is_dir() {
+        let Ok(canonical_dir) = candidate.canonicalize() else {
+            return Resolved::Fallback;
+        };
+        if !canonical_dir.starts_with(canonical_root) {
+            return Resolved::Forbidden;
+        }
         if !url_path.ends_with('/') {
             return Resolved::Redirect(format!("{url_path}/"));
         }
-        let idx = candidate.join(index_file);
+        let idx = canonical_dir.join(index_file);
         if idx.exists() {
             idx
         } else if dir_listing {
-            return Resolved::DirectoryListing(candidate);
+            return Resolved::DirectoryListing(canonical_dir);
         } else {
             return Resolved::Fallback;
         }
@@ -295,7 +301,7 @@ fn percent_encode_path(s: &str) -> String {
 }
 
 #[must_use]
-pub fn percent_decode(input: &str) -> String {
+pub(super) fn percent_decode(input: &str) -> String {
     use percent_encoding::percent_decode_str;
 
     percent_decode_str(input)

@@ -24,3 +24,4 @@ dev-check-strict.sh
 clippy_reports
 src/.DS_Store
 build-release.sh
+tests/fixtures/runtime/

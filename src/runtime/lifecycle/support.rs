@@ -126,6 +126,7 @@ pub(super) async fn setup_tls(
                 let bind_addr = config.server.bind;
                 let redir_plain_port = config.tls.http_port.get();
                 let redir_tls_port = config.tls.port.get();
+                let redir_state = Arc::clone(state);
                 let redir_shutdown = shutdown_rx.clone();
                 let redir_sem = std::sync::Arc::clone(&budget.semaphore);
                 let redir_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
@@ -141,6 +142,7 @@ pub(super) async fn setup_tls(
                             max_per_ip: redir_max_per_ip,
                             drain_timeout: redir_drain_timeout,
                         },
+                        redir_state,
                         redir_shutdown,
                         redir_port_tx,
                         redir_sem,
@@ -177,7 +179,7 @@ pub(super) async fn maybe_open_browser(config: &Config, state: &SharedState) {
 pub(super) async fn graceful_shutdown(
     config: &Config,
     shutdown_tx: watch::Sender<bool>,
-    server_handle: tokio::task::JoinHandle<()>,
+    server_handle: Option<tokio::task::JoinHandle<()>>,
     tor_handle: Option<tokio::task::JoinHandle<()>>,
     mut background_tasks: BackgroundTasks,
 ) {
@@ -186,15 +188,17 @@ pub(super) async fn graceful_shutdown(
 
     let http_budget = Duration::from_secs(config.server.shutdown_grace_secs);
 
-    if tokio::time::timeout(http_budget, server_handle)
-        .await
-        .is_err()
-    {
-        let secs = http_budget.as_secs();
-        log::warn!(
-            "HTTP drain did not complete within {secs} s; \
-             some connections may be abruptly closed",
-        );
+    if let Some(server_handle) = server_handle {
+        if tokio::time::timeout(http_budget, server_handle)
+            .await
+            .is_err()
+        {
+            let secs = http_budget.as_secs();
+            log::warn!(
+                "HTTP drain did not complete within {secs} s; \
+                 some connections may be abruptly closed",
+            );
+        }
     }
 
     if let Some(handle) = tor_handle {

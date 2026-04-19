@@ -12,6 +12,7 @@
 //! - [`handler`] — per-connection request handling and file serving
 //! - [`mime`] — file-extension → MIME type mapping
 //! - [`fallback`] — built-in "No site found" page
+mod admission;
 pub mod fallback;
 pub mod handler;
 pub mod mime;
@@ -22,14 +23,12 @@ use crate::{
     tls::Acceptor,
     AppError, Result,
 };
+use admission::{admit_connection, AdmissionRejection};
 use dashmap::DashMap;
 use std::{
     net::{IpAddr, TcpListener as StdTcpListener},
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicU32, Arc},
     time::Duration,
 };
 use tokio::{
@@ -37,73 +36,7 @@ use tokio::{
     sync::{oneshot, watch, Semaphore},
     task::JoinSet,
 };
-// ─── Per-IP rate limiting (C-4) ───────────────────────────────────────────────
-/// RAII guard that decrements the per-IP counter when dropped.
-///
-/// The guard is moved into each spawned handler task. When the task
-/// completes — normally or via panic — the `Drop` impl decrements the counter
-/// and removes the map entry when the count reaches zero, preventing unbounded
-/// map growth.
-struct PerIpGuard {
-    counter: Arc<AtomicU32>,
-    map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
-    addr: IpAddr,
-}
-impl Drop for PerIpGuard {
-    fn drop(&mut self) {
-        let prev = self.counter.fetch_sub(1, Ordering::Relaxed);
-        // If this was the last connection from this IP, remove the entry.
-        // Keeping zero-count entries would let the map grow without bound on
-        // servers with many distinct client IPs.
-        if prev == 1 {
-            self.map.remove(&self.addr);
-        }
-    }
-}
-/// Attempt to acquire a per-IP connection slot using a lock-free CAS loop.
-///
-/// Returns `Ok(guard)` when a slot is available. The caller moves the guard
-/// into the handler task; `Drop` releases the slot automatically.
-///
-/// Returns `Err(())` when `addr` already holds `limit` connections. The
-/// caller should drop the `TcpStream` without writing any HTTP response —
-/// the OS-level TCP RST is intentional: it signals rejection at near-zero
-/// cost compared to sending a `503 Service Unavailable` body.
-fn try_acquire_per_ip(
-    map: &Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
-    addr: IpAddr,
-    limit: u32,
-) -> std::result::Result<PerIpGuard, ()> {
-    // `or_insert_with` holds the DashMap shard lock only for the duration of
-    // the closure, which is shorter than holding it across the CAS loop.
-    let counter = Arc::clone(
-        map.entry(addr)
-            .or_insert_with(|| Arc::new(AtomicU32::new(0)))
-            .value(),
-    );
-    // Lock-free increment: loop until CAS succeeds or limit is exceeded.
-    let mut current = counter.load(Ordering::Relaxed);
-    loop {
-        if current >= limit {
-            return Err(());
-        }
-        match counter.compare_exchange_weak(
-            current,
-            current.saturating_add(1),
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {
-                return Ok(PerIpGuard {
-                    counter,
-                    map: Arc::clone(map),
-                    addr,
-                });
-            }
-            Err(updated) => current = updated,
-        }
-    }
-}
+
 // ─── Server context ───────────────────────────────────────────────────────────
 /// Shared references prepared once before the accept loop starts.
 ///
@@ -209,24 +142,23 @@ impl ServerContext {
         join_set: &mut JoinSet<()>,
     ) -> bool {
         let peer_ip = peer.ip();
-        let ip_guard = if let Some(limit) = self.max_per_ip {
-            let Ok(ip_guard) = try_acquire_per_ip(&self.per_ip_map, peer_ip, limit) else {
-                log::warn!("Per-IP limit ({limit}) reached for {peer_ip}; dropping connection");
-                drop(stream);
-                return true;
+        let admission =
+            match admit_connection(&self.semaphore, &self.per_ip_map, peer_ip, self.max_per_ip) {
+                Ok(admission) => admission,
+                Err(AdmissionRejection::PerIpLimit { limit }) => {
+                    log::warn!("Per-IP limit ({limit}) reached for {peer_ip}; dropping connection");
+                    drop(stream);
+                    return true;
+                }
+                Err(AdmissionRejection::GlobalLimit) => {
+                    log::warn!(
+                        "Connection limit ({}) reached; dropping connection from {peer_ip}",
+                        self.max_conns
+                    );
+                    drop(stream);
+                    return true;
+                }
             };
-            Some(ip_guard)
-        } else {
-            None
-        };
-        let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
-            log::warn!(
-                "Connection limit ({}) reached; rejecting connection from {peer_ip}",
-                self.max_conns
-            );
-            drop(stream);
-            return true;
-        };
         let site = Arc::clone(&self.canonical_root);
         let idx = Arc::clone(&self.index_file);
         let met = Arc::clone(metrics);
@@ -244,8 +176,7 @@ impl ServerContext {
         let redirects = Arc::clone(&self.redirects);
         let trusted_proxies = Arc::clone(&self.trusted_proxies);
         join_set.spawn(async move {
-            let _permit = permit;
-            let _ip_guard = ip_guard;
+            let _admission = admission;
             if let Err(e) = handler::handle(
                 stream,
                 peer,
@@ -330,10 +261,8 @@ pub async fn run(
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
     loop {
-        // H-2 — Non-blocking check for a new canonical_root sent by the [R]
-        // reload handler in events.rs. `has_changed` is true if a value was
-        // sent since the last `borrow_and_update`, so we only update when there
-        // is actually a new root to apply.
+        // Apply site-root updates pushed by the reload handler without blocking
+        // the accept loop.
         if root_watch.has_changed().unwrap_or(false) {
             let new_root = Arc::clone(&root_watch.borrow_and_update());
             log::info!("Site root refreshed: {}", new_root.display());
@@ -487,25 +416,28 @@ pub async fn run_https(
                             }
                         };
                         let peer_ip = peer.ip();
-                        let ip_guard = if let Some(limit) = ctx.max_per_ip {
-                            let Ok(ip_guard) = try_acquire_per_ip(&ctx.per_ip_map, peer_ip, limit) else {
+                        let admission = match admit_connection(
+                            &ctx.semaphore,
+                            &ctx.per_ip_map,
+                            peer_ip,
+                            ctx.max_per_ip,
+                        ) {
+                            Ok(admission) => admission,
+                            Err(AdmissionRejection::PerIpLimit { limit }) => {
                                 log::warn!(
                                     "Per-IP limit ({limit}) reached for {peer_ip}; dropping TLS connection"
                                 );
                                 drop(tcp_stream);
                                 continue;
-                            };
-                            Some(ip_guard)
-                        } else {
-                            None
-                        };
-                        let Ok(permit) = Arc::clone(&ctx.semaphore).try_acquire_owned() else {
-                            log::warn!(
-                                "Connection limit ({}) reached; rejecting TLS connection from {peer_ip}",
-                                ctx.max_conns
-                            );
-                            drop(tcp_stream);
-                            continue;
+                            }
+                            Err(AdmissionRejection::GlobalLimit) => {
+                                log::warn!(
+                                    "Connection limit ({}) reached; dropping TLS connection from {peer_ip}",
+                                    ctx.max_conns
+                                );
+                                drop(tcp_stream);
+                                continue;
+                            }
                         };
                         let site = Arc::clone(&ctx.canonical_root);
                         let idx = Arc::clone(&ctx.index_file);
@@ -531,8 +463,7 @@ pub async fn run_https(
                             trait TlsStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
                             impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TlsStream for T {}
 
-                            let _permit = permit;
-                            let _ip_guard = ip_guard;
+                            let _admission = admission;
                             // Perform the TLS handshake. The two acceptor variants
                             // produce different concrete stream types, so we erase them
                             // behind a boxed trait object for the generic handler.

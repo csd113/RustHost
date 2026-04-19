@@ -5,8 +5,8 @@ spawning the system C Tor binary as a subprocess to running Arti, the
 official Tor Project Rust implementation, fully in-process. Use this as a
 step-by-step reference for applying the same migration to other projects.
 
-> **Tested against:** `arti-client 0.40`, `tor-hsservice 0.40`, `tor-cell 0.40`
-> on Rust 1.86 (macOS arm64 + x86, Linux x86_64).
+> **Tested against:** `arti-client 0.41.0`, `tor-hsservice 0.41.0`, `tor-cell 0.41.0`
+> on Rust 1.90 (macOS arm64 + x86, Linux x86_64).
 
 ---
 
@@ -52,15 +52,15 @@ Project and versioned together.
 
 ### MSRV
 
-Arti 0.40+ requires Rust **1.86**. If your project targets 1.85 or lower,
-bump it:
+Arti 0.41+ requires Rust **1.90** in this codebase. If your project targets
+1.89 or lower, bump it:
 
 ```toml
 # Before
-rust-version = "1.85"
+rust-version = "1.89"
 
 # After
-rust-version = "1.86"
+rust-version = "1.90"
 ```
 
 ### Add dependencies
@@ -70,27 +70,27 @@ Add these six entries to `[dependencies]`:
 ```toml
 # arti-client: high-level Tor client. Features needed for onion service hosting:
 #   tokio                 — Tokio async runtime backend (required)
-#   native-tls            — TLS for connecting to Tor relays (required)
+#   rustls                — TLS for connecting to Tor relays (required)
 #   onion-service-service — enables *hosting* onion services
-arti-client = { version = "0.40", features = [
+arti-client = { version = "0.41", features = [
     "tokio",
-    "native-tls",
+    "rustls",
     "onion-service-service",
 ] }
 
 # tor-hsservice: lower-level onion service types used directly:
 #   OnionServiceConfigBuilder, handle_rend_requests, HsId, StreamRequest
-tor-hsservice = { version = "0.40" }
+tor-hsservice = { version = "0.41" }
 
 # tor-cell: needed to construct the Connected message passed to
 #   StreamRequest::accept(Connected) — see the stream proxying section
-tor-cell = { version = "0.40" }
+tor-cell = { version = "0.41" }
 
 # futures: StreamExt::next() for iterating the stream of incoming connections
 futures = "0.3"
 
 # sha3 + data-encoding: used to encode HsId → "${base32}.onion" manually.
-# HsId does not implement std::fmt::Display in arti-client 0.40 — see the
+# HsId does not implement std::fmt::Display in arti-client 0.41 — see the
 # "Getting the onion address" section for the full explanation.
 sha3 = "0.10"
 data-encoding = "2"
@@ -139,7 +139,7 @@ use tor_hsservice::{config::OnionServiceConfigBuilder, handle_rend_requests, HsI
 
 Notes on the import changes:
 - `TorClientConfig` is **not** imported — it is not used directly. The builder is accessed via `TorClientConfigBuilder` instead (see the config section below).
-- `HsId` is imported from `tor_hsservice`, **not** from `arti_client`. In arti 0.40, the re-export in `arti_client` is gated behind `feature = "onion-service-client"` and `feature = "experimental-api"` — neither of which is enabled in this setup. `tor_hsservice::HsId` is the ungated path.
+- `HsId` is imported from `tor_hsservice`, **not** from `arti_client`. In arti 0.41, the re-export in `arti_client` is gated behind `feature = "onion-service-client"` and `feature = "experimental-api"` — neither of which is enabled in this setup. `tor_hsservice::HsId` is the ungated path.
 
 ---
 
@@ -299,7 +299,7 @@ is no subprocess stderr to collect and no child process to kill on panic.
 **Pitfall 1:** `onion_name()` is deprecated. Use `onion_address()` instead.
 
 **Pitfall 2:** `HsId` does **not** implement `std::fmt::Display` in
-`arti-client 0.40`. Neither `format!("{}", hsid)` nor `.to_string()` compile,
+`arti-client 0.41`. Neither `format!("{}", hsid)` nor `.to_string()` compile,
 regardless of whether you got the `HsId` from `onion_name()` or
 `onion_address()`:
 
@@ -330,7 +330,7 @@ Import `HsId` from `tor_hsservice` instead — it is ungated there.
 // Wrong — deprecated
 let onion_name = onion_service.onion_name()?.to_string();  // ← deprecated + E0599
 
-// Wrong — onion_address() returns HsId, which still has no Display in 0.40
+// Wrong — onion_address() returns HsId, which still has no Display in 0.41
 let onion_name = format!(
     "{}",
     onion_service.onion_address().ok_or("...")?              // ← E0599
@@ -378,7 +378,7 @@ fn hsid_to_onion_address(hsid: HsId) -> String {
 ```
 
 This implements the [v3 onion address spec](https://spec.torproject.org/rend-spec/overview.html)
-directly. `HsId: AsRef<[u8; 32]>` is stable across arti 0.40+, so it will
+directly. `HsId: AsRef<[u8; 32]>` is stable across arti 0.41+, so it will
 keep working regardless of whether `Display` is ever added to `HsId`.
 
 The address is available immediately when `launch_onion_service` returns —
@@ -641,7 +641,7 @@ async fn set_onion(state: &SharedState, addr: String) {
 
 | File | Change |
 |---|---|
-| `Cargo.toml` | `rust-version` 1.85 → 1.86; add `arti-client`, `tor-hsservice`, `tor-cell`, `futures`, `sha3`, `data-encoding` |
+| `Cargo.toml` | `rust-version` 1.89 → 1.90; add `arti-client`, `tor-hsservice`, `tor-cell`, `futures`, `sha3`, `data-encoding` |
 | `src/tor/mod.rs` | Complete rewrite (see above) |
 | `src/tor/torrc.rs` | Delete |
 | `src/config/defaults.rs` | Update `[tor]` comment block |
@@ -664,7 +664,7 @@ exact fix for each one.
 | `E0277: CfgPath: From<PathBuf>` | Used `.storage().cache_dir(PathBuf)` | Use `TorClientConfigBuilder::from_directories(state, cache)` |
 | `E0599: no method named 'from_directories'` | Called `TorClientConfig::builder().from_directories(…)` as a method chain | `from_directories` is an associated function — call it as `TorClientConfigBuilder::from_directories(…).build()?` directly |
 | `deprecated: onion_name` | Called `.onion_name()` | Use `.onion_address()` instead |
-| `E0599: HsId doesn't implement Display` | Called `format!("{}", hsid)` or `.to_string()` on `HsId` | `HsId` has no `Display` in arti 0.40. Add `sha3 = "0.10"` and `data-encoding = "2"` deps and encode the address manually with `hsid_to_onion_address(hsid)` using `HsId: AsRef<[u8; 32]>` |
+| `E0599: HsId doesn't implement Display` | Called `format!("{}", hsid)` or `.to_string()` on `HsId` | `HsId` has no `Display` in arti 0.41. Add `sha3 = "0.10"` and `data-encoding = "2"` deps and encode the address manually with `hsid_to_onion_address(hsid)` using `HsId: AsRef<[u8; 32]>` |
 | `E0425: cannot find type 'HsId' in crate 'arti_client'` | Wrote `arti_client::HsId` in function signature | `HsId` is feature-gated in `arti_client`. Import it from `tor_hsservice::HsId` instead — it is ungated there |
 | `E0061: accept() takes 1 argument` | Called `stream_req.accept()` with no args | Use `stream_req.accept(Connected::new_empty())` |
 | `warn(unused_imports): sync::Arc` | Pre-existing unused import unmasked | Remove `Arc` from the import line |
