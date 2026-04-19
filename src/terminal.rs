@@ -306,7 +306,6 @@ fn is_on_path(name: &str) -> bool {
         .map(|dir| dir.join(name))
         .any(|p| {
             p.metadata()
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
 }
