@@ -378,13 +378,12 @@ pub struct SiteConfig {
     /// `index.html` (with status 200) instead of a 404.
     /// Required for single-page applications with client-side routing
     /// (`React Router`, `Vue Router`, `SvelteKit`, etc.).
-    /// Addresses C-6 — React/Vue/Svelte apps silently 404 without this.
     #[serde(default)]
     pub spa_routing: bool,
 
     /// Optional custom 404 page path, relative to the site directory.
     /// When set and the file exists, it is served with status 404 for all
-    /// requests that resolve to `NotFound`. Addresses H-10.
+    /// requests that resolve to `NotFound`.
     #[serde(default)]
     pub error_404: Option<String>,
 

@@ -3,11 +3,8 @@
 //! **File:** `lib.rs`
 //! **Location:** `src/lib.rs`
 //!
-//! Exposes the public API surface used by integration tests in `tests/` and
-//! by the binary entry point in `src/main.rs`.
-//!
-//! Internal modules are `pub(crate)` by default; only items that form part of
-//! the documented operator/integration-test API are re-exported here.
+//! Exposes the public API surface used by the binary entry point in
+//! `src/main.rs`, integration tests in `tests/`, and downstream callers.
 
 #![deny(warnings)]
 #![deny(clippy::all, clippy::pedantic)]
@@ -19,17 +16,13 @@
     clippy::unimplemented
 )]
 
-// Public modules — part of the documented external API.
+// Public modules used by the CLI, integration tests, and library callers.
 pub mod config;
+pub mod console;
 pub mod error;
+pub mod logging;
 pub mod runtime;
 pub mod server;
-
-// Internal modules — exposed `pub` only so integration tests in `tests/`
-// can import them.  Use `pub(crate)` within the codebase; prefer these
-// re-exports for test access.
-pub mod console;
-pub mod logging;
 pub mod terminal;
 pub mod tls;
 pub mod tor;
@@ -42,15 +35,3 @@ pub use error::AppError;
 /// All subsystems return this type so callers can match on specific variants
 /// rather than inspecting an opaque `Box<dyn Error>` string.
 pub type Result<T, E = AppError> = std::result::Result<T, E>;
-
-// ─── Integration-test-only re-exports ────────────────────────────────────────
-//
-// These items are not part of the stable public API.  They are gated behind
-// `#[cfg(test)]` so that they do not appear in `rustdoc` output or in the
-// symbol table of release binaries.  Integration tests import them via the
-// crate root without needing to reach into internal module paths.
-
-#[cfg(test)]
-pub use server::handler::{percent_decode, ByteRange, Encoding};
-#[cfg(test)]
-pub use tor::onion_address_from_pubkey;

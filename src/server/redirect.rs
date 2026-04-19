@@ -14,13 +14,11 @@
 
 use std::{
     net::IpAddr,
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        Arc,
-    },
+    sync::{atomic::AtomicU32, Arc},
     time::Duration,
 };
 
+use super::admission::{admit_connection, AdmissionRejection};
 use dashmap::DashMap;
 use tokio::{
     io::AsyncWriteExt as _,
@@ -28,6 +26,8 @@ use tokio::{
     sync::{oneshot, watch, Semaphore},
     task::JoinSet,
 };
+
+use crate::runtime::state::SharedState;
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,54 +38,6 @@ pub struct RedirectServerConfig {
     pub tls_port: u16,
     pub max_per_ip: u32,
     pub drain_timeout: Duration,
-}
-
-struct PerIpGuard {
-    counter: Arc<AtomicU32>,
-    map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
-    addr: IpAddr,
-}
-
-impl Drop for PerIpGuard {
-    fn drop(&mut self) {
-        let previous = self.counter.fetch_sub(1, Ordering::Relaxed);
-        if previous == 1 {
-            self.map.remove(&self.addr);
-        }
-    }
-}
-
-fn try_acquire_per_ip(
-    map: &Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
-    addr: IpAddr,
-    limit: u32,
-) -> std::result::Result<PerIpGuard, ()> {
-    let counter = Arc::clone(
-        map.entry(addr)
-            .or_insert_with(|| Arc::new(AtomicU32::new(0)))
-            .value(),
-    );
-    let mut current = counter.load(Ordering::Relaxed);
-    loop {
-        if current >= limit {
-            return Err(());
-        }
-        match counter.compare_exchange_weak(
-            current,
-            current.saturating_add(1),
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {
-                return Ok(PerIpGuard {
-                    counter,
-                    map: Arc::clone(map),
-                    addr,
-                });
-            }
-            Err(updated) => current = updated,
-        }
-    }
 }
 
 /// Bind a plain-HTTP listener on `bind_addr:http_port` and redirect every
@@ -107,6 +59,7 @@ fn try_acquire_per_ip(
 /// body into what is effectively a TCP-level redirect pump.
 pub async fn run_redirect_server(
     config: RedirectServerConfig,
+    state: SharedState,
     mut shutdown: watch::Receiver<bool>,
     port_tx: oneshot::Sender<u16>,
     semaphore: Arc<Semaphore>,
@@ -128,6 +81,11 @@ pub async fn run_redirect_server(
         }
     };
     let _ = port_tx.send(plain_port);
+    {
+        let mut s = state.write().await;
+        s.actual_port = plain_port;
+        s.server_running = true;
+    }
     log::info!(
         "HTTP-redirect server listening on {bind_addr}:{plain_port} \
          → HTTPS port {tls_port}"
@@ -141,23 +99,30 @@ pub async fn run_redirect_server(
                     Ok((mut stream, peer)) => {
                         log::debug!("Redirect connection from {peer}");
                         let peer_ip = peer.ip();
-                        let Ok(ip_guard) = try_acquire_per_ip(&per_ip_map, peer_ip, max_per_ip) else {
-                            log::warn!(
-                                "Per-IP limit ({max_per_ip}) reached for {peer_ip}; dropping redirect connection"
-                            );
-                            drop(stream);
-                            continue;
-                        };
-                        let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
-                            log::warn!(
-                                "Connection limit reached; rejecting redirect connection from {peer_ip}"
-                            );
-                            drop(stream);
-                            continue;
+                        let admission = match admit_connection(
+                            &semaphore,
+                            &per_ip_map,
+                            peer_ip,
+                            Some(max_per_ip),
+                        ) {
+                            Ok(admission) => admission,
+                            Err(AdmissionRejection::PerIpLimit { limit }) => {
+                                log::warn!(
+                                    "Per-IP limit ({limit}) reached for {peer_ip}; dropping redirect connection"
+                                );
+                                drop(stream);
+                                continue;
+                            }
+                            Err(AdmissionRejection::GlobalLimit) => {
+                                log::warn!(
+                                    "Connection limit reached; rejecting redirect connection from {peer_ip}"
+                                );
+                                drop(stream);
+                                continue;
+                            }
                         };
                         join_set.spawn(async move {
-                            let _permit = permit;
-                            let _ip_guard = ip_guard;
+                            let _admission = admission;
                             handle_redirect(&mut stream, bind_addr, tls_port).await;
                         });
                     }
@@ -179,6 +144,7 @@ pub async fn run_redirect_server(
 
     let drain = async { while join_set.join_next().await.is_some() {} };
     let _ = tokio::time::timeout(drain_timeout, drain).await;
+    state.write().await.server_running = false;
     log::info!("HTTP-redirect server stopped.");
 }
 

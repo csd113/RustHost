@@ -7,7 +7,7 @@ use hyper::{header, Request};
 
 /// Encoding negotiated from `Accept-Encoding`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Encoding {
+pub(super) enum Encoding {
     Brotli,
     Gzip,
     Identity,

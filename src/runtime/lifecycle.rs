@@ -277,7 +277,7 @@ fn schedule_initial_site_scan(config: &Arc<Config>, state: &SharedState, data_di
 async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Result<()> {
     // 2. Initialise logging.
     logging::init(&config.logging, &data_dir)?;
-    if let Err(e) = logging::init_access_log(&data_dir) {
+    if let Err(e) = logging::init_access_log(&config.logging, &data_dir) {
         log::warn!("Could not initialise access log: {e}");
     }
     log::info!("RustHost starting — version {}", env!("CARGO_PKG_VERSION"));
@@ -301,8 +301,6 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     // 5. Shutdown channels.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // 6. Start HTTP server task.
-    let (port_tx, port_rx) = oneshot::channel::<u16>();
     #[allow(clippy::cast_possible_truncation)]
     let budget = SharedConnectionBudget {
         semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
@@ -310,29 +308,39 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
         )),
         per_ip_map: std::sync::Arc::new(dashmap::DashMap::new()),
     };
-    let (server_handle, root_tx) = spawn_server(
-        &config,
-        &state,
-        &metrics,
-        &shutdown_rx,
-        port_tx,
-        data_dir.clone(),
-        budget.clone(),
-    );
+    let (root_tx, root_rx) = make_root_watch(&config, &data_dir);
+    let redirect_public_http = uses_redirect_public_http(&config);
+    let server_handle = if redirect_public_http {
+        None
+    } else {
+        // 6. Start HTTP server task.
+        let (port_tx, port_rx) = oneshot::channel::<u16>();
+        let server_handle = spawn_server(
+            &config,
+            &state,
+            &metrics,
+            &shutdown_rx,
+            port_tx,
+            data_dir.clone(),
+            root_rx,
+            budget.clone(),
+        );
 
-    // Wait for the server to signal its bound port via the oneshot channel.
-    match wait_for_bind_port(port_rx, "HTTP server").await {
-        Ok(port) => port,
-        Err(err) => {
-            let _ = shutdown_tx.send(true);
-            wait_for_background_task(
-                Some(server_handle),
-                Duration::from_secs(5),
-                "HTTP server startup task",
-            )
-            .await;
-            return Err(err);
-        }
+        // Wait for the server to signal its bound port via the oneshot channel.
+        match wait_for_bind_port(port_rx, "HTTP server").await {
+            Ok(port) => port,
+            Err(err) => {
+                let _ = shutdown_tx.send(true);
+                wait_for_background_task(
+                    Some(server_handle),
+                    Duration::from_secs(5),
+                    "HTTP server startup task",
+                )
+                .await;
+                return Err(err);
+            }
+        };
+        Some(server_handle)
     };
 
     // 6b. TLS / HTTPS — optional, non-fatal.
@@ -435,6 +443,7 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
 ///
 /// Returns the `JoinHandle` and the `watch::Sender` used to push a new
 /// `canonical_root` to the accept loop when the operator presses `[R]`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_server(
     config: &Arc<Config>,
     state: &SharedState,
@@ -442,24 +451,14 @@ fn spawn_server(
     shutdown: &watch::Receiver<bool>,
     port_tx: oneshot::Sender<u16>,
     data_dir: PathBuf,
+    root_rx: watch::Receiver<Arc<std::path::Path>>,
     budget: SharedConnectionBudget,
-) -> (
-    tokio::task::JoinHandle<()>,
-    watch::Sender<Arc<std::path::Path>>,
-) {
-    // Resolve initial canonical root for the watch channel seed value.
-    let initial_root: Arc<std::path::Path> = {
-        let site_path = data_dir.join(&config.site.directory);
-        let resolved = site_path.canonicalize().unwrap_or(site_path);
-        Arc::from(resolved.as_path())
-    };
-    let (root_tx, root_rx) = watch::channel(initial_root);
-
+) -> tokio::task::JoinHandle<()> {
     let server_config = Arc::clone(config);
     let server_state = Arc::clone(state);
     let server_metrics = Arc::clone(metrics);
     let server_shutdown = shutdown.clone();
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         server::run(
             server_config,
             server_state,
@@ -472,8 +471,26 @@ fn spawn_server(
             budget.per_ip_map,
         )
         .await;
-    });
-    (handle, root_tx)
+    })
+}
+
+fn make_root_watch(
+    config: &Config,
+    data_dir: &Path,
+) -> (
+    watch::Sender<Arc<std::path::Path>>,
+    watch::Receiver<Arc<std::path::Path>>,
+) {
+    let initial_root: Arc<std::path::Path> = {
+        let site_path = data_dir.join(&config.site.directory);
+        let resolved = site_path.canonicalize().unwrap_or(site_path);
+        Arc::from(resolved.as_path())
+    };
+    watch::channel(initial_root)
+}
+
+const fn uses_redirect_public_http(config: &Config) -> bool {
+    config.tls.enabled && config.tls.redirect_http
 }
 
 async fn start_console(
@@ -727,3 +744,19 @@ const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
 </body>
 </html>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::uses_redirect_public_http;
+    use crate::config::Config;
+
+    #[test]
+    fn redirect_http_replaces_public_plain_http_only_when_tls_is_enabled() {
+        let mut config = Config::default();
+        config.tls.redirect_http = true;
+        assert!(!uses_redirect_public_http(&config));
+
+        config.tls.enabled = true;
+        assert!(uses_redirect_public_http(&config));
+    }
+}

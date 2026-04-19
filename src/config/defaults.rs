@@ -103,11 +103,9 @@ port = 8443
 # Redirect every HTTP request to HTTPS (301).
 redirect_http = false
 
-# ── IMPORTANT: Port conflict warning ───────────────────────────────────────
-# When redirect_http = true the redirect listener binds to http_port.
-# The main HTTP listener (when active) uses [server].port.
-# Both defaults are currently 8080 — change one of them before enabling
-# both TLS + redirect_http or the server will fail to bind.
+# Plain HTTP port used by the redirect listener when redirect_http = true.
+# The file-serving HTTP listener is not started in redirect mode, so the
+# default can match [server].port.
 http_port = 8080
 
 # ── Let's Encrypt / ACME ─────────────────────────────────────────────────────
