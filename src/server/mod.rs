@@ -33,7 +33,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::AsyncWriteExt as _,
     net::TcpListener,
     sync::{oneshot, watch, Semaphore},
     task::JoinSet,
@@ -106,28 +105,6 @@ fn try_acquire_per_ip(
     }
 }
 
-const OVERLOAD_RESPONSE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 0\r\n\r\n";
-
-fn reject_overloaded_connection(
-    stream: tokio::net::TcpStream,
-    peer_ip: IpAddr,
-    label: &'static str,
-) {
-    tokio::spawn(async move {
-        let mut stream = stream;
-        if let Err(e) = stream.write_all(OVERLOAD_RESPONSE).await {
-            log::debug!(
-                "Could not send overload response for {label} connection from {peer_ip}: {e}"
-            );
-            return;
-        }
-        if let Err(e) = stream.shutdown().await {
-            log::debug!(
-                "Could not close overload response for {label} connection from {peer_ip}: {e}"
-            );
-        }
-    });
-}
 // ─── Server context ───────────────────────────────────────────────────────────
 /// Shared references prepared once before the accept loop starts.
 ///
@@ -235,8 +212,8 @@ impl ServerContext {
         let peer_ip = peer.ip();
         let ip_guard = if let Some(limit) = self.max_per_ip {
             let Ok(ip_guard) = try_acquire_per_ip(&self.per_ip_map, peer_ip, limit) else {
-                log::warn!("Per-IP limit ({limit}) reached for {peer_ip}; sending 503 response");
-                reject_overloaded_connection(stream, peer_ip, "HTTP");
+                log::warn!("Per-IP limit ({limit}) reached for {peer_ip}; dropping connection");
+                drop(stream);
                 return true;
             };
             Some(ip_guard)
@@ -245,10 +222,10 @@ impl ServerContext {
         };
         let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
             log::warn!(
-                "Connection limit ({}) reached; sending 503 response to {peer_ip}",
+                "Connection limit ({}) reached; dropping connection from {peer_ip}",
                 self.max_conns
             );
-            reject_overloaded_connection(stream, peer_ip, "HTTP");
+            drop(stream);
             return true;
         };
         let site = Arc::clone(&self.canonical_root);
@@ -514,9 +491,9 @@ pub async fn run_https(
                         let ip_guard = if let Some(limit) = ctx.max_per_ip {
                             let Ok(ip_guard) = try_acquire_per_ip(&ctx.per_ip_map, peer_ip, limit) else {
                                 log::warn!(
-                                    "Per-IP limit ({limit}) reached for {peer_ip}; sending 503 response"
+                                    "Per-IP limit ({limit}) reached for {peer_ip}; dropping TLS connection"
                                 );
-                                reject_overloaded_connection(tcp_stream, peer_ip, "HTTPS");
+                                drop(tcp_stream);
                                 continue;
                             };
                             Some(ip_guard)
@@ -525,10 +502,10 @@ pub async fn run_https(
                         };
                         let Ok(permit) = Arc::clone(&ctx.semaphore).try_acquire_owned() else {
                             log::warn!(
-                                "Connection limit ({}) reached; sending 503 response to {peer_ip}",
+                                "Connection limit ({}) reached; dropping TLS connection from {peer_ip}",
                                 ctx.max_conns
                             );
-                            reject_overloaded_connection(tcp_stream, peer_ip, "HTTPS");
+                            drop(tcp_stream);
                             continue;
                         };
                         let site = Arc::clone(&ctx.canonical_root);
