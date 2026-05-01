@@ -993,11 +993,151 @@ async fn serves_precompressed_sidecar_when_client_accepts_brotli(
     Ok(())
 }
 
-// This test previously asserted status 400 for a POST request, which encoded
-// the *incorrect* behaviour (RFC 9110 §15.5.6 requires 405 + Allow header for
-// known-but-disallowed methods).  The old assertion would pass when the bug was
-// present and fail when it was fixed, causing developers to mistakenly revert
-// the fix to make CI green again.
+#[tokio::test(flavor = "current_thread")]
+async fn if_none_match_takes_precedence_over_if_modified_since(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"<h1>cache me</h1>")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let initial = server
+        .send(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let last_modified = header_value(&initial, "last-modified")?
+        .ok_or("expected Last-Modified header on initial response")?;
+
+    let revalidated = server
+        .send(
+            format!(
+                "GET /index.html HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"not-current\"\r\nIf-Modified-Since: {last_modified}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(
+        status_code(&revalidated)?,
+        200,
+        "If-Modified-Since must be ignored when If-None-Match is present and does not match:\n{}",
+        response_to_str(&revalidated)?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn precompressed_revalidation_uses_selected_representation_etag(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[
+        ("app.js", b"console.log('original');"),
+        ("app.js.br", b"pretend-brotli-bytes"),
+    ])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let identity = server
+        .send(b"GET /app.js HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let identity_etag =
+        header_value(&identity, "etag")?.ok_or("expected ETag on identity response")?;
+
+    let selected_brotli = server
+        .send(
+            format!(
+                "GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\nIf-None-Match: {identity_etag}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    let brotli = server
+        .send(b"GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\n\r\n")
+        .await?;
+    let brotli_etag = header_value(&brotli, "etag")?.ok_or("expected ETag on Brotli response")?;
+
+    let revalidated_brotli = server
+        .send(
+            format!(
+                "GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\nIf-None-Match: {brotli_etag}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&selected_brotli)?, 200);
+    assert_eq!(
+        header_value(&selected_brotli, "content-encoding")?.as_deref(),
+        Some("br")
+    );
+    assert!(
+        response_to_str(&selected_brotli)?.contains("pretend-brotli-bytes"),
+        "identity ETag must not validate the selected Brotli sidecar:\n{}",
+        response_to_str(&selected_brotli)?
+    );
+    assert_eq!(status_code(&revalidated_brotli)?, 304);
+    assert_eq!(
+        header_value(&revalidated_brotli, "content-encoding")?.as_deref(),
+        Some("br")
+    );
+    assert_eq!(
+        header_value(&revalidated_brotli, "vary")?.as_deref(),
+        Some("Accept-Encoding")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dynamic_compressed_revalidation_preserves_selected_representation_headers(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let css = b"body{color:#123456;}\n".repeat(128);
+    let (tmp, site) = make_site(&[("style.css", &css)])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let initial = server
+        .send_no_body(
+            b"HEAD /style.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n",
+        )
+        .await?;
+    let etag = header_value(&initial, "etag")?.ok_or("expected ETag on gzip HEAD response")?;
+
+    let revalidated = server
+        .send_no_body(
+            format!(
+                "HEAD /style.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nIf-None-Match: {etag}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(
+        header_value(&initial, "content-encoding")?.as_deref(),
+        Some("gzip")
+    );
+    assert_eq!(status_code(&revalidated)?, 304);
+    assert_eq!(
+        header_value(&revalidated, "content-encoding")?.as_deref(),
+        Some("gzip")
+    );
+    assert_eq!(
+        header_value(&revalidated, "vary")?.as_deref(),
+        Some("Accept-Encoding")
+    );
+    assert!(body_is_empty(&revalidated)?);
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn disallowed_method_returns_405_with_allow_header() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -1178,8 +1318,9 @@ async fn connection_limit_rejects_second_socket() -> Result<(), Box<dyn std::err
 
     let rejected = match write_result {
         Ok(()) => {
-            let mut buf = [0u8; 16];
+            let mut buf = [0u8; 256];
             match tokio::time::timeout(Duration::from_secs(2), second.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => matches!(status_code(&buf[..n]), Ok(503)),
                 Ok(Ok(0)) => true,
                 Ok(Err(err))
                     if matches!(
@@ -1227,6 +1368,7 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
     let tls_port = 8443;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
+    let state = Arc::new(RwLock::new(AppState::new()));
     let handle = tokio::spawn(async move {
         rusthost::server::redirect::run_redirect_server(
             rusthost::server::redirect::RedirectServerConfig {
@@ -1236,6 +1378,7 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
                 max_per_ip: 8,
                 drain_timeout: Duration::from_secs(5),
             },
+            state,
             shutdown_rx,
             port_tx,
             Arc::new(Semaphore::new(8)),

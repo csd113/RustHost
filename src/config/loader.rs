@@ -209,15 +209,8 @@ fn validate(cfg: &Config) -> Result<()> {
         errors.push("[tor] shutdown_grace_secs must be at least 1".into());
     }
 
-    if cfg.tls.redirect_http {
-        if !cfg.tls.enabled {
-            errors.push("[tls] redirect_http requires [tls] enabled = true".into());
-        }
-        if cfg.tls.http_port == cfg.server.port {
-            errors.push(
-                "[tls] http_port must differ from [server] port when redirect_http = true".into(),
-            );
-        }
+    if cfg.tls.redirect_http && !cfg.tls.enabled {
+        errors.push("[tls] redirect_http requires [tls] enabled = true".into());
     }
 
     if errors.is_empty() {
@@ -305,17 +298,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_redirect_http_rejects_port_conflict() {
+    fn validate_redirect_http_allows_default_http_port() {
         let mut cfg = valid();
         cfg.tls.enabled = true;
         cfg.tls.redirect_http = true;
         cfg.tls.http_port = cfg.server.port;
-        let result = validate(&cfg);
-        assert!(
-            matches!(&result, Err(AppError::ConfigValidation(e))
-                if e.iter().any(|s| s.contains("http_port must differ"))),
-            "expected ConfigValidation error mentioning http_port conflict, got: {result:?}"
-        );
+        assert!(validate(&cfg).is_ok());
     }
 
     // ── validate — [site] directory ─────────────────────────────────────────
