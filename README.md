@@ -49,6 +49,7 @@ RustHost is intentionally not a web framework or application server. It does not
 
 - `unsafe` Rust is forbidden by crate lints.
 - Strict Clippy configuration is checked by the documented quality gate.
+- Project changes are intended to stay small, explicit, and reviewable.
 - Integration tests exercise the real server with keep-alive, range requests, directory listings, percent-encoded paths, and mixed static assets.
 
 ## When to Use It
