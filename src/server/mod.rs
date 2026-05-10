@@ -1,8 +1,4 @@
 //! # Server Module
-//!
-//! **File:** `mod.rs`
-//! **Location:** `src/server/mod.rs`
-//!
 //! Provides a safe HTTP/1.1 static-file server. The implementation migrated
 //! per-connection handler from a hand-rolled single-shot parser to
 //! [`hyper`]'s keep-alive connection loop, eliminating the large Tor
@@ -162,37 +158,27 @@ impl ServerContext {
         let site = Arc::clone(&self.canonical_root);
         let idx = Arc::clone(&self.index_file);
         let met = Arc::clone(metrics);
-        let state = Arc::clone(&self.state);
-        let csp = Arc::clone(&self.csp_header);
-        let flags = handler::FeatureFlags {
-            dir_listing: self.dir_list,
-            expose_dotfiles: self.expose_dots,
-            spa_routing: self.spa_routing,
-            is_https: false,
-            keep_alive: self.keep_alive,
+        let handler_config = handler::HandlerConfig {
+            peer_addr: peer,
+            canonical_root: site,
+            index_file: idx,
+            flags: handler::FeatureFlags {
+                dir_listing: self.dir_list,
+                expose_dotfiles: self.expose_dots,
+                spa_routing: self.spa_routing,
+                is_https: false,
+                keep_alive: self.keep_alive,
+            },
+            state: Arc::clone(&self.state),
+            csp: Arc::clone(&self.csp_header),
+            error_404_page: self.error_404_page.clone(),
+            error_503_page: self.error_503_page.clone(),
+            redirects: Arc::clone(&self.redirects),
+            trusted_proxies: Arc::clone(&self.trusted_proxies),
         };
-        let e404 = self.error_404_page.clone();
-        let e503 = self.error_503_page.clone();
-        let redirects = Arc::clone(&self.redirects);
-        let trusted_proxies = Arc::clone(&self.trusted_proxies);
         join_set.spawn(async move {
             let _admission = admission;
-            if let Err(e) = handler::handle(
-                stream,
-                peer,
-                site,
-                idx,
-                flags,
-                met,
-                state,
-                csp,
-                e404,
-                e503,
-                redirects,
-                trusted_proxies,
-            )
-            .await
-            {
+            if let Err(e) = handler::handle(stream, handler_config, met).await {
                 log::debug!("Handler error: {e}");
             }
         });
@@ -516,22 +502,19 @@ pub async fn run_https(
                                     }
                                 }
                             };
-                            if let Err(e) = handler::handle(
-                                tls_stream,
-                                peer,
-                                site,
-                                idx,
+                            let handler_config = handler::HandlerConfig {
+                                peer_addr: peer,
+                                canonical_root: site,
+                                index_file: idx,
                                 flags,
-                                met,
                                 state,
                                 csp,
-                                e404,
-                                e503,
+                                error_404_page: e404,
+                                error_503_page: e503,
                                 redirects,
                                 trusted_proxies,
-                            )
-                            .await
-                            {
+                            };
+                            if let Err(e) = handler::handle(tls_stream, handler_config, met).await {
                                 log::debug!("HTTPS handler error: {e}");
                             }
                         });

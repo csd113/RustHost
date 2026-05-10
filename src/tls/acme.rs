@@ -1,7 +1,4 @@
 //! # ACME TLS Support
-//!
-//! **File:** `acme.rs`
-//! **Location:** `src/tls/acme.rs`
 use crate::Result;
 use crate::{config::AcmeConfig, error::AppError};
 use futures::StreamExt as _;

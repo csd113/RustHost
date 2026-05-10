@@ -1,7 +1,4 @@
 //! # Handler Encoding Helpers
-//!
-//! **File:** `encoding.rs`
-//! **Location:** `src/server/handler/encoding.rs`
 
 use hyper::{header, Request};
 

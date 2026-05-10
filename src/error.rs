@@ -1,8 +1,4 @@
 //! # Application Error Types
-//!
-//! **File:** `error.rs`
-//! **Location:** `src/error.rs`
-//!
 //! Defines [`AppError`], the single typed error enum for the entire application.
 //! All public functions returning `Result<T>` use `Result<T, AppError>` via the
 //! crate-level alias in `main.rs`.

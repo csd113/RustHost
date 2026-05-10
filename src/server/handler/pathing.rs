@@ -1,7 +1,4 @@
 //! # Handler Path Helpers
-//!
-//! **File:** `pathing.rs`
-//! **Location:** `src/server/handler/pathing.rs`
 
 use std::{
     borrow::Cow,

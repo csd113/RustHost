@@ -1,8 +1,4 @@
 //! # Lifecycle
-//!
-//! **File:** `lifecycle.rs`
-//! **Location:** `src/runtime/lifecycle.rs`
-//!
 //! Two paths:
 //! 1. **First run** — creates the directory tree, writes defaults, prints a
 //!    "fresh install" notice, then continues directly into the normal run.

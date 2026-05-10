@@ -1,8 +1,4 @@
 //! # MIME Type Mapping
-//!
-//! **File:** `mime.rs`
-//! **Location:** `src/server/mime.rs`
-//!
 //! Maps file extensions to MIME type strings.  Unknown extensions fall
 //! back to `application/octet-stream` so the browser offers a download
 //! rather than attempting to display binary data.

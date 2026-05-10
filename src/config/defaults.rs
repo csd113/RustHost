@@ -1,7 +1,4 @@
 //! # Config Defaults
-//!
-//! **File:** `defaults.rs`
-//! **Location:** `src/config/defaults.rs`
 
 use crate::Result;
 use std::path::Path;
@@ -115,7 +112,8 @@ enabled = false
 # Domains to request cert for (required if ACME enabled).
 domains = []
 # Contact email for expiry notices.
-email = ""
+# Leave unset to skip contact email.
+# email = "admin@example.com"
 # true = staging (recommended for testing), false = production.
 staging = true
 # Cache directory relative to data dir.
@@ -138,7 +136,6 @@ cache_dir = "runtime/tls/acme"
 ///
 /// Returns [`crate::AppError::Io`] on any filesystem error.
 pub fn write_default_config(path: &Path) -> Result<()> {
-    // ←←← NEVER overwrite an existing config (critical safety improvement)
     if path.exists() {
         return Ok(());
     }

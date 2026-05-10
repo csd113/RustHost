@@ -1,8 +1,4 @@
 //! # HTTP → HTTPS Redirect Server
-//!
-//! **File:** `redirect.rs`
-//! **Location:** `src/server/redirect.rs`
-//!
 //! A lightweight HTTP/1.1 listener that issues permanent `301` redirects to
 //! the HTTPS equivalent of every incoming request.  Activated when
 //! `[tls] redirect_http = true` in `settings.toml`.
@@ -91,12 +87,14 @@ pub async fn run_redirect_server(
          → HTTPS port {tls_port}"
     );
     let mut join_set: JoinSet<()> = JoinSet::new();
+    let mut backoff_ms: u64 = 1;
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((mut stream, peer)) => {
+                        backoff_ms = 1;
                         log::debug!("Redirect connection from {peer}");
                         let peer_ip = peer.ip();
                         let admission = match admit_connection(
@@ -128,6 +126,8 @@ pub async fn run_redirect_server(
                     }
                     Err(e) => {
                         log::debug!("Redirect accept error: {e}");
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = backoff_ms.saturating_mul(2).min(1_000);
                     }
                 }
             }

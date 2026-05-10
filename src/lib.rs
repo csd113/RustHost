@@ -1,8 +1,4 @@
 //! # rusthost — library crate
-//!
-//! **File:** `lib.rs`
-//! **Location:** `src/lib.rs`
-//!
 //! Exposes the public API surface used by the binary entry point in
 //! `src/main.rs`, integration tests in `tests/`, and downstream callers.
 
@@ -30,6 +26,7 @@ pub mod server;
 pub mod terminal;
 pub mod tls;
 pub mod tor;
+pub(crate) mod windows_identity;
 
 pub use error::AppError;
 

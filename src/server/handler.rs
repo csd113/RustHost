@@ -1,8 +1,4 @@
 //! # Request Handler
-//!
-//! **File:** `handler.rs`
-//! **Location:** `src/server/handler.rs`
-//!
 //! Handles HTTP connections using [`hyper`]'s HTTP/1.1 connection loop,
 //! which provides keep-alive transparently.
 //!
@@ -18,8 +14,6 @@
 //! Security: every resolved path is checked to be a descendant of the
 //! configured site root via [`std::fs::canonicalize`]. Any attempt to
 //! escape (e.g. `/../secret`) is rejected with HTTP 403.
-
-#![allow(clippy::too_many_arguments)] // HTTP write_* fns mirror the wire format
 
 mod encoding;
 mod pathing;
@@ -95,6 +89,20 @@ pub struct FeatureFlags {
     pub spa_routing: bool,
     pub is_https: bool,
     pub keep_alive: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct HandlerConfig {
+    pub(crate) peer_addr: std::net::SocketAddr,
+    pub(crate) canonical_root: Arc<Path>,
+    pub(crate) index_file: Arc<str>,
+    pub(crate) flags: FeatureFlags,
+    pub(crate) state: SharedState,
+    pub(crate) csp: Arc<str>,
+    pub(crate) error_404_page: Option<Arc<CustomErrorPage>>,
+    pub(crate) error_503_page: Option<Arc<CustomErrorPage>>,
+    pub(crate) redirects: Arc<Vec<crate::config::RedirectRule>>,
+    pub(crate) trusted_proxies: Arc<Vec<std::net::IpAddr>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,43 +202,29 @@ pub(crate) fn load_custom_error_page(
 /// Propagates I/O errors from hyper's connection driver.
 pub(crate) async fn handle<S>(
     stream: S,
-    // Real socket address of the connecting client. This is used as
-    // the remote-IP in access logs unless the peer is in trusted_proxies, in
-    // which case X-Forwarded-For is consulted instead.
-    peer_addr: std::net::SocketAddr,
-    canonical_root: Arc<Path>,
-    index_file: Arc<str>,
-    flags: FeatureFlags,
+    config: HandlerConfig,
     metrics: SharedMetrics,
-    state: SharedState,
-    csp: Arc<str>,
-    error_404_page: Option<Arc<CustomErrorPage>>,
-    error_503_page: Option<Arc<CustomErrorPage>>,
-    redirects: Arc<Vec<crate::config::RedirectRule>>,
-    // IPs or networks from which X-Forwarded-For may be trusted.
-    // An empty slice means XFF is ignored entirely (default / safest).
-    trusted_proxies: Arc<Vec<std::net::IpAddr>>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let cfg = Arc::new(RouteConfig {
-        canonical_root,
-        index_file,
-        csp,
-        flags,
-        state,
-        error_404_page,
-        error_503_page,
-        redirects,
-        peer_addr,
-        trusted_proxies,
+        canonical_root: config.canonical_root,
+        index_file: config.index_file,
+        csp: config.csp,
+        flags: config.flags,
+        state: config.state,
+        error_404_page: config.error_404_page,
+        error_503_page: config.error_503_page,
+        redirects: config.redirects,
+        peer_addr: config.peer_addr,
+        trusted_proxies: config.trusted_proxies,
     });
 
     let io = TokioIo::new(stream);
 
     hyper::server::conn::http1::Builder::new()
-        .keep_alive(flags.keep_alive)
+        .keep_alive(cfg.flags.keep_alive)
         .max_buf_size(MAX_REQUEST_BUFFER_BYTES)
         .serve_connection(
             io,
@@ -242,6 +236,26 @@ where
         )
         .await
         .map_err(|e| crate::AppError::Io(std::io::Error::other(e.to_string())))
+}
+
+struct RequestContext<'a> {
+    req: &'a Request<Incoming>,
+    is_head: bool,
+    metrics: &'a SharedMetrics,
+    canonical_root: &'a Path,
+    csp: &'a str,
+    decoded: &'a str,
+    expose_dotfiles: bool,
+    error_503_page: Option<&'a CustomErrorPage>,
+}
+
+struct FileResponseContext<'a> {
+    content_type: &'a str,
+    path_str: &'a str,
+    is_head: bool,
+    csp: &'a str,
+    etag: &'a str,
+    last_modified: Option<&'a str>,
 }
 
 // ─── Router ──────────────────────────────────────────────────────────────────
@@ -372,14 +386,16 @@ async fn route(
 
     let resp = dispatch_resolved(
         resolved,
-        &req,
-        is_head,
-        metrics,
-        cfg.canonical_root.as_ref(),
-        &cfg.csp,
-        &decoded,
-        cfg.flags.expose_dotfiles,
-        cfg.error_503_page.as_deref(),
+        RequestContext {
+            req: &req,
+            is_head,
+            metrics,
+            canonical_root: cfg.canonical_root.as_ref(),
+            csp: &cfg.csp,
+            decoded: &decoded,
+            expose_dotfiles: cfg.flags.expose_dotfiles,
+            error_503_page: cfg.error_503_page.as_deref(),
+        },
     )
     .await?;
 
@@ -402,73 +418,55 @@ async fn route(
 /// Extracted from [`route`] to keep that function within the 100-line limit.
 async fn dispatch_resolved(
     resolved: Resolved,
-    req: &Request<Incoming>,
-    is_head: bool,
-    metrics: &SharedMetrics,
-    canonical_root: &Path,
-    csp: &str,
-    decoded: &str,
-    expose_dotfiles: bool,
-    error_503_page: Option<&CustomErrorPage>,
+    ctx: RequestContext<'_>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
     Ok(match resolved {
-        Resolved::File(abs_path) => {
-            serve_file(
-                req,
-                &abs_path,
-                is_head,
-                metrics,
-                canonical_root,
-                csp,
-                error_503_page,
-            )
-            .await?
-        }
+        Resolved::File(abs_path) => serve_file(&abs_path, &ctx).await?,
         Resolved::NotFound => {
-            let decoded_for_log = sanitize_header_value(decoded);
+            let decoded_for_log = sanitize_header_value(ctx.decoded);
             log::debug!("404 Not Found: {decoded_for_log}");
-            metrics.add_request();
-            text_response(StatusCode::NOT_FOUND, "Not Found", csp, "")
+            ctx.metrics.add_request();
+            text_response(StatusCode::NOT_FOUND, "Not Found", ctx.csp, "")
         }
         Resolved::Redirect(location) => {
             let safe = sanitize_header_value(&location);
-            metrics.add_request();
-            redirect_response(&safe, csp)
+            ctx.metrics.add_request();
+            redirect_response(&safe, ctx.csp)
         }
         Resolved::Fallback => {
-            metrics.add_request();
-            error_503_page.map_or_else(
+            ctx.metrics.add_request();
+            ctx.error_503_page.map_or_else(
                 || {
                     html_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         fallback::NO_SITE_HTML,
-                        is_head,
-                        csp,
+                        ctx.is_head,
+                        ctx.csp,
                         "",
                     )
                 },
-                |page| page.response(is_head, csp, ""),
+                |page| page.response(ctx.is_head, ctx.csp, ""),
             )
         }
         Resolved::Forbidden => {
-            let decoded_for_log = sanitize_header_value(decoded);
+            let decoded_for_log = sanitize_header_value(ctx.decoded);
             log::warn!("403 Forbidden: {decoded_for_log}");
-            metrics.add_error();
-            text_response(StatusCode::FORBIDDEN, "Forbidden", csp, "")
+            ctx.metrics.add_error();
+            text_response(StatusCode::FORBIDDEN, "Forbidden", ctx.csp, "")
         }
         Resolved::DirectoryListing(dir_path) => {
-            let decoded_owned = decoded.to_owned();
+            let decoded_owned = ctx.decoded.to_owned();
             let html = tokio::task::spawn_blocking(move || {
-                build_directory_listing(&dir_path, &decoded_owned, expose_dotfiles)
+                build_directory_listing(&dir_path, &decoded_owned, ctx.expose_dotfiles)
             })
             .await
             .map_err(|e| std::io::Error::other(format!("directory listing task panicked: {e}")))?;
-            metrics.add_request();
-            html_response(StatusCode::OK, &html, is_head, csp, decoded)
+            ctx.metrics.add_request();
+            html_response(StatusCode::OK, &html, ctx.is_head, ctx.csp, ctx.decoded)
         }
         Resolved::CustomError(page) => {
-            metrics.add_request();
-            page.response(is_head, csp, "")
+            ctx.metrics.add_request();
+            page.response(ctx.is_head, ctx.csp, "")
         }
     })
 }
@@ -559,13 +557,8 @@ fn external_redirect_response(
 /// Serve a file, honoring conditional requests, ranges, and compression.
 #[allow(clippy::too_many_lines)] // file serving intentionally centralizes validators and sidecar selection
 async fn serve_file(
-    req: &Request<Incoming>,
     abs_path: &std::path::Path,
-    is_head: bool,
-    metrics: &SharedMetrics,
-    canonical_root: &Path,
-    csp: &str,
-    error_503_page: Option<&CustomErrorPage>,
+    ctx: &RequestContext<'_>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
     let file = match tokio::fs::File::open(abs_path).await {
         Ok(file) => file,
@@ -573,10 +566,10 @@ async fn serve_file(
             return Ok(open_error_response(
                 abs_path,
                 &e,
-                metrics,
-                csp,
-                is_head,
-                error_503_page,
+                ctx.metrics,
+                ctx.csp,
+                ctx.is_head,
+                ctx.error_503_page,
             ))
         }
     };
@@ -585,8 +578,12 @@ async fn serve_file(
         Ok(metadata) => metadata,
         Err(e) => {
             log::warn!("Failed to read metadata for {}: {e}", abs_path.display());
-            metrics.add_error();
-            return Ok(internal_error_response(csp, is_head, error_503_page));
+            ctx.metrics.add_error();
+            return Ok(internal_error_response(
+                ctx.csp,
+                ctx.is_head,
+                ctx.error_503_page,
+            ));
         }
     };
 
@@ -596,17 +593,29 @@ async fn serve_file(
     let path_str = abs_path.to_str().unwrap_or("");
     let etag = weak_etag(&metadata);
     let last_modified = last_modified_header(&metadata);
+    let response_ctx = FileResponseContext {
+        content_type,
+        path_str,
+        is_head: ctx.is_head,
+        csp: ctx.csp,
+        etag: &etag,
+        last_modified: last_modified.as_deref(),
+    };
 
-    let accepted_encoding = best_encoding(req);
+    let accepted_encoding = best_encoding(ctx.req);
 
-    if let Some(sidecar) =
-        open_precompressed_variant(abs_path, accepted_encoding, content_type, canonical_root)
-            .await?
+    if let Some(sidecar) = open_precompressed_variant(
+        abs_path,
+        accepted_encoding,
+        content_type,
+        ctx.canonical_root,
+    )
+    .await?
     {
         let etag = strong_variant_etag(&sidecar.metadata, sidecar.encoding_token);
         let last_modified = last_modified_header(&sidecar.metadata);
-        if selected_representation_not_modified(req, &etag, &sidecar.metadata) {
-            metrics.add_request();
+        if selected_representation_not_modified(ctx.req, &etag, &sidecar.metadata) {
+            ctx.metrics.add_request();
             return Ok(not_modified_variant_response(
                 &etag,
                 last_modified.as_deref(),
@@ -615,8 +624,18 @@ async fn serve_file(
                 sidecar.content_encoding,
             ));
         }
-        metrics.add_request();
-        return build_precompressed_response(sidecar, content_type, path_str, is_head, csp, &etag);
+        ctx.metrics.add_request();
+        return build_precompressed_response(
+            sidecar,
+            &FileResponseContext {
+                content_type,
+                path_str,
+                is_head: ctx.is_head,
+                csp: ctx.csp,
+                etag: &etag,
+                last_modified: last_modified.as_deref(),
+            },
+        );
     }
 
     let preferred_encoding = if should_compress(content_type, file_len) {
@@ -626,16 +645,23 @@ async fn serve_file(
     };
 
     // ── Conditional request ──────────────────────────────────────────────────
-    if selected_representation_not_modified(req, &etag, &metadata) {
-        metrics.add_request();
+    if selected_representation_not_modified(ctx.req, &etag, &metadata) {
+        ctx.metrics.add_request();
         let resp = encoding_header(preferred_encoding).map_or_else(
-            || not_modified_response(&etag, last_modified.as_deref(), content_type, path_str),
+            || {
+                not_modified_response(
+                    response_ctx.etag,
+                    response_ctx.last_modified,
+                    response_ctx.content_type,
+                    response_ctx.path_str,
+                )
+            },
             |content_encoding| {
                 not_modified_variant_response(
-                    &etag,
-                    last_modified.as_deref(),
-                    content_type,
-                    path_str,
+                    response_ctx.etag,
+                    response_ctx.last_modified,
+                    response_ctx.content_type,
+                    response_ctx.path_str,
                     content_encoding,
                 )
             },
@@ -645,24 +671,13 @@ async fn serve_file(
 
     // ── Range request ────────────────────────────────────────────────────────
     if preferred_encoding == Encoding::Identity {
-        if let Some(range_result) = parse_range(req, file_len) {
+        if let Some(range_result) = parse_range(ctx.req, file_len) {
             return if let Ok(range) = range_result {
-                let response = build_range_response(
-                    file,
-                    range,
-                    file_len,
-                    content_type,
-                    path_str,
-                    is_head,
-                    csp,
-                    &etag,
-                    last_modified.as_deref(),
-                )
-                .await?;
-                metrics.add_request();
+                let response = build_range_response(file, range, file_len, &response_ctx).await?;
+                ctx.metrics.add_request();
                 Ok(response)
             } else {
-                metrics.add_error();
+                ctx.metrics.add_error();
                 Ok(finalize_response(
                     Response::builder()
                         .status(StatusCode::RANGE_NOT_SATISFIABLE)
@@ -675,18 +690,8 @@ async fn serve_file(
     }
 
     // ── Full-file response ────────────────────────────────────────────────────
-    metrics.add_request();
-    build_full_response(
-        preferred_encoding,
-        file,
-        file_len,
-        content_type,
-        path_str,
-        is_head,
-        csp,
-        &etag,
-        last_modified.as_deref(),
-    )
+    ctx.metrics.add_request();
+    build_full_response(preferred_encoding, file, file_len, &response_ctx)
 }
 
 struct PrecompressedVariant {
@@ -756,18 +761,13 @@ async fn build_range_response(
     mut file: tokio::fs::File,
     range: ByteRange,
     file_len: u64,
-    content_type: &str,
-    path_str: &str,
-    is_head: bool,
-    csp: &str,
-    etag: &str,
-    last_modified: Option<&str>,
+    ctx: &FileResponseContext<'_>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
     use tokio::io::AsyncSeekExt as _;
 
     file.seek(std::io::SeekFrom::Start(range.start)).await?;
     let send_len = range.end.saturating_sub(range.start).saturating_add(1);
-    let body = if is_head {
+    let body = if ctx.is_head {
         empty_body()
     } else {
         stream_body(file, send_len, Encoding::Identity)
@@ -780,13 +780,16 @@ async fn build_range_response(
             format!("bytes {}-{}/{}", range.start, range.end, file_len),
         )
         .header("Accept-Ranges", "bytes")
-        .header("ETag", etag)
-        .header("Cache-Control", cache_control_for(content_type, path_str))
-        .header(header::CONTENT_TYPE, content_type);
-    if let Some(last_modified) = last_modified {
+        .header("ETag", ctx.etag)
+        .header(
+            "Cache-Control",
+            cache_control_for(ctx.content_type, ctx.path_str),
+        )
+        .header(header::CONTENT_TYPE, ctx.content_type);
+    if let Some(last_modified) = ctx.last_modified {
         builder = builder.header(header::LAST_MODIFIED, last_modified);
     }
-    builder = security_headers(builder, csp, content_type);
+    builder = security_headers(builder, ctx.csp, ctx.content_type);
     builder = builder.header(header::CONTENT_LENGTH, send_len);
 
     finalize_response(builder, body, "range response")
@@ -796,15 +799,10 @@ fn build_full_response(
     encoding: Encoding,
     file: tokio::fs::File,
     file_len: u64,
-    content_type: &str,
-    path_str: &str,
-    is_head: bool,
-    csp: &str,
-    etag: &str,
-    last_modified: Option<&str>,
+    ctx: &FileResponseContext<'_>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
     let content_encoding = encoding_header(encoding);
-    let body = if is_head {
+    let body = if ctx.is_head {
         empty_body()
     } else {
         stream_body(file, file_len, encoding)
@@ -812,16 +810,19 @@ fn build_full_response(
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header("ETag", etag)
-        .header("Cache-Control", cache_control_for(content_type, path_str));
-    if let Some(last_modified) = last_modified {
+        .header(header::CONTENT_TYPE, ctx.content_type)
+        .header("ETag", ctx.etag)
+        .header(
+            "Cache-Control",
+            cache_control_for(ctx.content_type, ctx.path_str),
+        );
+    if let Some(last_modified) = ctx.last_modified {
         builder = builder.header(header::LAST_MODIFIED, last_modified);
     }
     if content_encoding.is_none() {
         builder = builder.header("Accept-Ranges", "bytes");
     }
-    builder = security_headers(builder, csp, content_type);
+    builder = security_headers(builder, ctx.csp, ctx.content_type);
     if let Some(enc) = content_encoding {
         builder = builder
             .header("Content-Encoding", enc)
@@ -835,15 +836,10 @@ fn build_full_response(
 
 fn build_precompressed_response(
     variant: PrecompressedVariant,
-    content_type: &str,
-    path_str: &str,
-    is_head: bool,
-    csp: &str,
-    etag: &str,
+    ctx: &FileResponseContext<'_>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
-    let last_modified = last_modified_header(&variant.metadata);
     let content_length = variant.metadata.len();
-    let body = if is_head {
+    let body = if ctx.is_head {
         empty_body()
     } else {
         identity_reader_body(variant.file.take(content_length))
@@ -851,16 +847,19 @@ fn build_precompressed_response(
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_TYPE, ctx.content_type)
         .header(header::CONTENT_ENCODING, variant.content_encoding)
         .header(header::VARY, "Accept-Encoding")
         .header(header::CONTENT_LENGTH, content_length)
-        .header("ETag", etag)
-        .header("Cache-Control", cache_control_for(content_type, path_str));
-    if let Some(last_modified) = last_modified.as_deref() {
+        .header("ETag", ctx.etag)
+        .header(
+            "Cache-Control",
+            cache_control_for(ctx.content_type, ctx.path_str),
+        );
+    if let Some(last_modified) = ctx.last_modified {
         builder = builder.header(header::LAST_MODIFIED, last_modified);
     }
-    builder = security_headers(builder, csp, content_type);
+    builder = security_headers(builder, ctx.csp, ctx.content_type);
     finalize_response(builder, body, "precompressed response")
 }
 

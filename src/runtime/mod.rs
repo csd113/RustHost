@@ -1,8 +1,4 @@
 //! # Runtime Module
-//!
-//! **File:** `mod.rs`
-//! **Location:** `src/runtime/mod.rs`
-//!
 //! Owns the application lifecycle, shared state, and top-level event
 //! dispatch.  Sub-modules:
 //!
@@ -17,15 +13,6 @@ pub mod state;
 use std::path::{Path, PathBuf};
 
 /// Open `url` in the system default browser.
-///
-/// Single canonical definition extracted from `lifecycle.rs` and `events.rs`
-/// to eliminate the duplicated function. Any future improvement — URL
-/// sanitisation, logging, sandboxing — needs to be applied here only.
-///
-/// Spawn errors are now logged at `warn` level rather than silently discarded.
-/// A missing `open`/`xdg-open`/`cmd` binary is a
-/// recoverable condition (the server continues to run), but swallowing the
-/// error made it impossible to diagnose why the browser never appeared.
 pub fn open_browser(url: &str) {
     let result = {
         #[cfg(target_os = "macos")]

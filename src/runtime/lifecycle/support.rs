@@ -1,7 +1,4 @@
 //! # Lifecycle Support
-//!
-//! **File:** `support.rs`
-//! **Location:** `src/runtime/lifecycle/support.rs`
 
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -23,6 +20,16 @@ pub(super) struct BackgroundTasks {
     pub(super) tor_ingress: Option<tokio::task::JoinHandle<()>>,
     pub(super) acme: Option<tokio::task::JoinHandle<()>>,
     pub(super) acme_guard: Option<tls::acme::AcmeInitGuard>,
+}
+
+struct HttpsTaskArgs<'a> {
+    config: &'a Arc<Config>,
+    state: &'a SharedState,
+    metrics: &'a SharedMetrics,
+    shutdown_rx: &'a watch::Receiver<bool>,
+    data_dir: &'a Path,
+    budget: &'a SharedConnectionBudget,
+    root_tx: &'a watch::Sender<Arc<std::path::Path>>,
 }
 
 pub(super) async fn wait_for_bind_port(
@@ -78,84 +85,141 @@ pub(super) async fn setup_tls(
             tasks.acme = acme_task;
             tasks.acme_guard = acme_guard;
 
-            {
-                let mut s = state.write().await;
-                s.tls_cert_status = if config.tls.acme.enabled {
-                    config.tls.acme.domains.first().map_or(
-                        CertStatus::Acme {
-                            domain: String::new(),
-                        },
-                        |d| CertStatus::Acme { domain: d.clone() },
-                    )
-                } else if config.tls.manual_cert.is_some() {
-                    CertStatus::Manual
-                } else {
-                    CertStatus::SelfSigned
-                };
-            }
-
-            {
-                let tls_config = Arc::clone(config);
-                let tls_state = Arc::clone(state);
-                let tls_metrics = Arc::clone(metrics);
-                let tls_shutdown = shutdown_rx.clone();
-                let tls_data_dir = data_dir.to_path_buf();
-                let tls_sem = std::sync::Arc::clone(&budget.semaphore);
-                let tls_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
-                let tls_root_rx = root_tx.subscribe();
-                let (tls_port_tx, tls_port_rx) = oneshot::channel::<u16>();
-                tasks.https = Some(tokio::spawn(async move {
-                    server::run_https(
-                        tls_config,
-                        tls_state,
-                        tls_metrics,
-                        tls_data_dir,
-                        tls_shutdown,
-                        acceptor,
-                        tls_port_tx,
-                        tls_sem,
-                        tls_ip_map,
-                        tls_root_rx,
-                    )
-                    .await;
-                }));
-                wait_for_bind_port(tls_port_rx, "HTTPS server").await?;
+            set_tls_cert_status(config, state).await;
+            let tls_port_rx = spawn_https_task(
+                &mut tasks,
+                &HttpsTaskArgs {
+                    config,
+                    state,
+                    metrics,
+                    shutdown_rx,
+                    data_dir,
+                    budget,
+                    root_tx,
+                },
+                acceptor,
+            );
+            if let Err(err) = wait_for_bind_port(tls_port_rx, "HTTPS server").await {
+                abort_startup_tasks(&mut tasks).await;
+                return Err(err);
             }
 
             if config.tls.redirect_http {
-                let bind_addr = config.server.bind;
-                let redir_plain_port = config.tls.http_port.get();
-                let redir_tls_port = config.tls.port.get();
-                let redir_state = Arc::clone(state);
-                let redir_shutdown = shutdown_rx.clone();
-                let redir_sem = std::sync::Arc::clone(&budget.semaphore);
-                let redir_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
-                let redir_max_per_ip = config.server.max_connections_per_ip;
-                let redir_drain_timeout = Duration::from_secs(config.server.shutdown_grace_secs);
-                let (redir_port_tx, redir_port_rx) = oneshot::channel::<u16>();
-                tasks.redirect = Some(tokio::spawn(async move {
-                    server::redirect::run_redirect_server(
-                        server::redirect::RedirectServerConfig {
-                            bind_addr,
-                            plain_port: redir_plain_port,
-                            tls_port: redir_tls_port,
-                            max_per_ip: redir_max_per_ip,
-                            drain_timeout: redir_drain_timeout,
-                        },
-                        redir_state,
-                        redir_shutdown,
-                        redir_port_tx,
-                        redir_sem,
-                        redir_ip_map,
-                    )
-                    .await;
-                }));
-                wait_for_bind_port(redir_port_rx, "HTTP redirect server").await?;
+                let redir_port_rx =
+                    spawn_redirect_task(&mut tasks, config, state, shutdown_rx, budget);
+                if let Err(err) = wait_for_bind_port(redir_port_rx, "HTTP redirect server").await {
+                    abort_startup_tasks(&mut tasks).await;
+                    return Err(err);
+                }
             }
         }
     }
 
     Ok(tasks)
+}
+
+async fn set_tls_cert_status(config: &Config, state: &SharedState) {
+    let mut s = state.write().await;
+    s.tls_cert_status = if config.tls.acme.enabled {
+        config.tls.acme.domains.first().map_or(
+            CertStatus::Acme {
+                domain: String::new(),
+            },
+            |d| CertStatus::Acme { domain: d.clone() },
+        )
+    } else if config.tls.manual_cert.is_some() {
+        CertStatus::Manual
+    } else {
+        CertStatus::SelfSigned
+    };
+}
+
+fn spawn_https_task(
+    tasks: &mut BackgroundTasks,
+    args: &HttpsTaskArgs<'_>,
+    acceptor: tls::Acceptor,
+) -> oneshot::Receiver<u16> {
+    let tls_config = Arc::clone(args.config);
+    let tls_state = Arc::clone(args.state);
+    let tls_metrics = Arc::clone(args.metrics);
+    let tls_shutdown = args.shutdown_rx.clone();
+    let tls_data_dir = args.data_dir.to_path_buf();
+    let tls_sem = std::sync::Arc::clone(&args.budget.semaphore);
+    let tls_ip_map = std::sync::Arc::clone(&args.budget.per_ip_map);
+    let tls_root_rx = args.root_tx.subscribe();
+    let (tls_port_tx, tls_port_rx) = oneshot::channel::<u16>();
+    tasks.https = Some(tokio::spawn(async move {
+        server::run_https(
+            tls_config,
+            tls_state,
+            tls_metrics,
+            tls_data_dir,
+            tls_shutdown,
+            acceptor,
+            tls_port_tx,
+            tls_sem,
+            tls_ip_map,
+            tls_root_rx,
+        )
+        .await;
+    }));
+    tls_port_rx
+}
+
+fn spawn_redirect_task(
+    tasks: &mut BackgroundTasks,
+    config: &Arc<Config>,
+    state: &SharedState,
+    shutdown_rx: &watch::Receiver<bool>,
+    budget: &SharedConnectionBudget,
+) -> oneshot::Receiver<u16> {
+    let bind_addr = config.server.bind;
+    let redir_plain_port = config.tls.http_port.get();
+    let redir_tls_port = config.tls.port.get();
+    let redir_state = Arc::clone(state);
+    let redir_shutdown = shutdown_rx.clone();
+    let redir_sem = std::sync::Arc::clone(&budget.semaphore);
+    let redir_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
+    let redir_max_per_ip = config.server.max_connections_per_ip;
+    let redir_drain_timeout = Duration::from_secs(config.server.shutdown_grace_secs);
+    let (redir_port_tx, redir_port_rx) = oneshot::channel::<u16>();
+    tasks.redirect = Some(tokio::spawn(async move {
+        server::redirect::run_redirect_server(
+            server::redirect::RedirectServerConfig {
+                bind_addr,
+                plain_port: redir_plain_port,
+                tls_port: redir_tls_port,
+                max_per_ip: redir_max_per_ip,
+                drain_timeout: redir_drain_timeout,
+            },
+            redir_state,
+            redir_shutdown,
+            redir_port_tx,
+            redir_sem,
+            redir_ip_map,
+        )
+        .await;
+    }));
+    redir_port_rx
+}
+
+async fn abort_startup_tasks(tasks: &mut BackgroundTasks) {
+    abort_task(tasks.redirect.take(), "HTTP redirect server startup task").await;
+    abort_task(tasks.https.take(), "HTTPS server startup task").await;
+    abort_task(tasks.acme.take(), "ACME startup task").await;
+    tasks.acme_guard.take();
+}
+
+async fn abort_task(task: Option<tokio::task::JoinHandle<()>>, label: &str) {
+    let Some(task) = task else {
+        return;
+    };
+    task.abort();
+    if let Err(e) = task.await {
+        if !e.is_cancelled() {
+            log::warn!("{label} ended with a join error during startup cleanup: {e}");
+        }
+    }
 }
 
 pub(super) async fn maybe_open_browser(config: &Config, state: &SharedState) {

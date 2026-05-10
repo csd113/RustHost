@@ -1,7 +1,4 @@
 //! # Self-Signed TLS Certificates
-//!
-//! **File:** `self_signed.rs`
-//! **Location:** `src/tls/self_signed.rs`
 use crate::error::AppError;
 use crate::Result;
 use std::{path::Path, sync::Arc, time::SystemTime};

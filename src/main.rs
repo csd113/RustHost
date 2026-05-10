@@ -1,8 +1,4 @@
 //! # rusthost-cli
-//!
-//! **File:** `main.rs`
-//! **Location:** `src/main.rs`
-//!
 //! Binary entry point. Parses CLI arguments then delegates all startup logic
 //! to [`rusthost::runtime::lifecycle::run`].
 //!

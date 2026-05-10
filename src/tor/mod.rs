@@ -1,8 +1,4 @@
 //! # Tor Module — Arti (in-process)
-//!
-//! **File:** `mod.rs`
-//! **Location:** `src/tor/mod.rs`
-//!
 //! Replaces the old subprocess + torrc approach with Arti, the official
 //! Tor implementation in Rust, running entirely in-process.
 //!
