@@ -1,8 +1,4 @@
 //! # Logging Module
-//!
-//! **File:** `mod.rs`
-//! **Location:** `src/logging/mod.rs`
-//!
 //! Implements the [`log::Log`] trait so that standard `log::info!()`,
 //! `log::warn!()` etc. macros work everywhere without importing a concrete
 //! logger.
@@ -18,7 +14,7 @@
 use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
-    io::Write,
+    io::Write as _,
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -31,6 +27,8 @@ use std::{
 use chrono::Local;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
+#[cfg(windows)]
+use crate::windows_identity::current_windows_identity;
 use crate::{config::LoggingConfig, AppError, Result};
 
 // ─── Structured access log ────────────────────────────────────────────────────
@@ -100,29 +98,46 @@ struct AccessLogState {
 /// written to `<data_dir>/runtime/logs/access.log`.  Rotation follows the same
 /// `MAX_LOG_BYTES` limit as the application log.
 ///
-/// Safe to call even when `logging.enabled = false`; the access log is
-/// always written when this function succeeds.
+/// Safe to call even when `logging.enabled = false`; in that case any existing
+/// access-log worker is stopped and future access records are discarded.
 ///
 /// # Errors
 ///
 /// Returns [`AppError::Io`] if the log directory cannot be created or the
 /// file cannot be opened. Returns [`AppError::LogInit`] if an access log has
 /// already been initialized for a different path.
-pub fn init_access_log(data_dir: &Path) -> Result<()> {
+pub fn init_access_log(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
+    if !config.enabled {
+        shutdown_access_log();
+        return Ok(());
+    }
+
     let log_path = data_dir.join("runtime/logs/access.log");
+
+    if let Some(existing) = ACCESS_LOG.get() {
+        let guard = existing
+            .lock()
+            .map_err(|_poisoned| AppError::LogInit("access log mutex is poisoned".into()))?;
+        if guard
+            .as_ref()
+            .is_some_and(|current| current.path == log_path)
+        {
+            return Ok(());
+        }
+    }
 
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::PermissionsExt as _;
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
 
     #[cfg(unix)]
     let f = {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt as _;
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -153,19 +168,12 @@ pub fn init_access_log(data_dir: &Path) -> Result<()> {
         writes_since_check: 0,
         cached_size: 0,
     };
-    let new_state = spawn_access_log_worker(log_path.clone(), new_log)?;
+    let new_state = spawn_access_log_worker(log_path, new_log)?;
 
     if let Some(existing) = ACCESS_LOG.get() {
         let mut guard = existing
             .lock()
-            .map_err(|_| AppError::LogInit("access log mutex is poisoned".into()))?;
-        if guard
-            .as_ref()
-            .is_some_and(|current| current.path == log_path)
-        {
-            drop(guard);
-            return Ok(());
-        }
+            .map_err(|_poisoned| AppError::LogInit("access log mutex is poisoned".into()))?;
         let old_state = guard.replace(new_state);
         drop(guard);
         if let Some(old_state) = old_state {
@@ -176,7 +184,7 @@ pub fn init_access_log(data_dir: &Path) -> Result<()> {
 
     ACCESS_LOG
         .set(Mutex::new(Some(new_state)))
-        .map_err(|_| AppError::LogInit("access log already initialized".into()))?;
+        .map_err(|_already_set| AppError::LogInit("access log already initialized".into()))?;
     Ok(())
 }
 
@@ -307,15 +315,18 @@ impl LogFile {
     ///
     /// Rotation sequence: `.log.4` is deleted, `.log.3` → `.log.4`, …,
     /// `.log.1` → `.log.2`, current `.log` → `.log.1`, then a fresh file
-    /// is opened.  All renames are best-effort; errors (read-only filesystem,
-    /// missing backup) are silently ignored so a single rename failure does
-    /// not abort the entire rotation.
+    /// is opened. Rotation stays best-effort, but unexpected failures are
+    /// logged for diagnosis.
     fn rotate(&mut self) {
         const MAX_LOG_BACKUPS: u32 = 5;
 
         // Delete the oldest backup to make room.
         let oldest = self.path.with_extension(format!("log.{MAX_LOG_BACKUPS}"));
-        let _ = std::fs::remove_file(&oldest);
+        if let Err(e) = std::fs::remove_file(&oldest) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("Could not remove old log backup {}: {e}", oldest.display());
+            }
+        }
 
         // Shift .log.N → .log.(N+1) from highest to lowest to avoid overwriting.
         for n in (1..MAX_LOG_BACKUPS).rev() {
@@ -324,17 +335,31 @@ impl LogFile {
                 .path
                 .with_extension(format!("log.{}", n.saturating_add(1)));
             if from.exists() {
-                let _ = std::fs::rename(&from, &to);
+                if let Err(e) = std::fs::rename(&from, &to) {
+                    log::warn!(
+                        "Could not rotate log backup {} -> {}: {e}",
+                        from.display(),
+                        to.display()
+                    );
+                }
             }
         }
 
         // Move the current log to .log.1.
-        let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
+        let backup = self.path.with_extension("log.1");
+        if let Err(e) = std::fs::rename(&self.path, &backup) {
+            log::warn!(
+                "Could not rotate active log {} -> {}: {e}",
+                self.path.display(),
+                backup.display()
+            );
+            return;
+        }
 
         // Re-open a fresh file with the same restrictive permissions.
         #[cfg(unix)]
         let new_file = {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::OpenOptionsExt as _;
             OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -346,9 +371,14 @@ impl LogFile {
             .create(true)
             .append(true)
             .open(&self.path);
-        if let Ok(f) = new_file {
-            self.file = f;
-            self.cached_size = 0;
+        match new_file {
+            Ok(f) => {
+                self.file = f;
+                self.cached_size = 0;
+            }
+            Err(e) => {
+                log::warn!("Could not reopen rotated log {}: {e}", self.path.display());
+            }
         }
     }
 }
@@ -373,12 +403,19 @@ fn access_log_worker(rx: Receiver<AccessLogCommand>, mut file: LogFile) {
         }
     }
     report_dropped_access_logs();
-    let _ = file.file.flush();
+    if let Err(e) = file.file.flush() {
+        log::warn!(
+            "Could not flush access log worker file {}: {e}",
+            file.path.display()
+        );
+    }
 }
 
 fn stop_access_log_worker(state: AccessLogState) {
     let _ = state.tx.send(AccessLogCommand::Shutdown);
-    let _ = state.handle.join();
+    if state.handle.join().is_err() {
+        log::warn!("Access log worker thread panicked during shutdown");
+    }
 }
 
 fn report_dropped_access_logs() {
@@ -425,9 +462,8 @@ impl Log for RustHostLogger {
         let line = format!("[{level}] [{timestamp}] {}", record.args());
 
         // Push to ring buffer.
-        // 3.5 — Clone before acquiring the lock so the String heap allocation
-        // does not contend with concurrent Arti logging threads. The lock is
-        // then held only for the O(1) push_back pointer swap.
+        // Clone before acquiring the lock so allocation stays outside the
+        // critical section.
         if let Some(buf) = LOG_BUFFER.get() {
             let ring_line = line.clone();
             if let Ok(mut guard) = buf.lock() {
@@ -449,66 +485,16 @@ impl Log for RustHostLogger {
     fn flush(&self) {
         if let Some(file_mutex) = &self.file {
             if let Ok(mut lf) = file_mutex.lock() {
-                let _ = lf.file.flush();
+                if let Err(e) = lf.file.flush() {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "warn: failed to flush log file {}: {e}",
+                        lf.path.display()
+                    );
+                }
             }
         }
     }
-}
-
-/// Validate a Windows identity name component (username or domain).
-///
-/// Rejects control characters and the `icacls` metacharacters that would
-/// confuse argument parsing. Intentionally does **not** log the raw value on
-/// failure — adversarial input must not reach log sinks.
-///
-/// Mirrors the identical function in `src/tor/mod.rs` (`harden_windows_permissions`).
-/// If the validation rules need updating, both copies must be kept in sync —
-/// a shared utility in `crate::util` is the long-term home.
-#[cfg(windows)]
-fn validate_windows_name(s: &str) -> std::io::Result<()> {
-    if s.is_empty() || s.len() > 256 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "Windows identity name has unexpected length: {} bytes",
-                s.len()
-            ),
-        ));
-    }
-    // Illegal in Windows names: " / \ [ ] : ; | = , + * ? < >
-    // Also reject: ( ) — icacls grant-string metacharacters.
-    // Also reject: control characters and & (shell metacharacter on cmd.exe).
-    let has_bad_char = s.chars().any(|c| {
-        c.is_control()
-            || matches!(
-                c,
-                '"' | '/'
-                    | '\\'
-                    | '['
-                    | ']'
-                    | ':'
-                    | ';'
-                    | '|'
-                    | '='
-                    | ','
-                    | '+'
-                    | '*'
-                    | '?'
-                    | '<'
-                    | '>'
-                    | '('
-                    | ')'
-                    | '&'
-            )
-    });
-    if has_bad_char {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            // Raw value intentionally omitted to avoid logging attacker input.
-            "Windows identity name component contains disallowed characters",
-        ));
-    }
-    Ok(())
 }
 
 /// Flush all buffered log entries to the log file.
@@ -549,7 +535,7 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
+                use std::os::unix::fs::PermissionsExt as _;
                 let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
             // Use env-var lookup rather than spawning `whoami`.
@@ -563,29 +549,14 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
             // every process's environment — they are equivalent in value to `whoami`
             // but never require a subprocess or shell expansion.
             //
-            // Both values are validated by `validate_windows_name` before use.
+            // Both values are validated by `current_windows_identity` before use.
             // The Tor module (tor/mod.rs) already follows this pattern correctly;
             // this brings logging into alignment.
             #[cfg(windows)]
             {
-                let username = std::env::var("USERNAME").map_err(|e| {
-                    AppError::LogInit(format!("USERNAME environment variable not available: {e}"))
-                })?;
-                let userdomain = std::env::var("USERDOMAIN").map_err(|e| {
+                let (userdomain, username) = current_windows_identity(&['&']).map_err(|e| {
                     AppError::LogInit(format!(
-                        "USERDOMAIN environment variable not available: {e}"
-                    ))
-                })?;
-
-                validate_windows_name(&username).map_err(|e| {
-                    AppError::LogInit(format!(
-                        "USERNAME contains disallowed characters — \
-                         cannot harden log directory ACL: {e}"
-                    ))
-                })?;
-                validate_windows_name(&userdomain).map_err(|e| {
-                    AppError::LogInit(format!(
-                        "USERDOMAIN contains disallowed characters — \
+                        "USERNAME or USERDOMAIN contains disallowed characters or is unavailable — \
                          cannot harden log directory ACL: {e}"
                     ))
                 })?;
@@ -599,14 +570,28 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
                 //   (OI) = object inherit, (CI) = container inherit, F = full control.
                 let grant_arg = format!("{userdomain}\\{username}:(OI)(CI)F");
                 let path_str = parent.to_string_lossy();
-                let _ = std::process::Command::new("icacls")
+                let icacls_output = std::process::Command::new("icacls")
                     .args([
                         path_str.as_ref(),
                         "/inheritance:r",
                         "/grant:r",
                         grant_arg.as_str(),
                     ])
-                    .output();
+                    .output()
+                    .map_err(|e| {
+                        AppError::LogInit(format!(
+                            "could not run icacls for {}: {e}",
+                            parent.display()
+                        ))
+                    })?;
+                if !icacls_output.status.success() {
+                    return Err(AppError::LogInit(format!(
+                        "icacls failed for {} (exit {:?}): {}",
+                        parent.display(),
+                        icacls_output.status.code(),
+                        String::from_utf8_lossy(&icacls_output.stderr).trim()
+                    )));
+                }
             }
         }
 
@@ -615,7 +600,7 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
         // readable 0o644 file.
         #[cfg(unix)]
         let f = {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::OpenOptionsExt as _;
             OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -689,52 +674,13 @@ fn escape_clf_field(s: &str) -> String {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
-    // These run on all platforms (cfg(test) is not gated on windows) so CI
-    // catches regressions even on Linux/macOS build runners.
-    #[cfg(windows)]
-    use super::validate_windows_name;
-    use crate::logging::AccessRecord;
+    use crate::{
+        config::Config,
+        logging::{init_access_log, log_access, shutdown_access_log, AccessRecord},
+    };
 
-    // Provide a shim for non-Windows test runs so the test bodies compile.
-    #[cfg(not(windows))]
     fn validate_windows_name(s: &str) -> std::io::Result<()> {
-        // Mirror the real implementation so tests remain meaningful on Linux CI.
-        if s.is_empty() || s.len() > 256 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Windows identity name has unexpected length",
-            ));
-        }
-        let bad = s.chars().any(|c| {
-            c.is_control()
-                || matches!(
-                    c,
-                    '"' | '/'
-                        | '\\'
-                        | '['
-                        | ']'
-                        | ':'
-                        | ';'
-                        | '|'
-                        | '='
-                        | ','
-                        | '+'
-                        | '*'
-                        | '?'
-                        | '<'
-                        | '>'
-                        | '('
-                        | ')'
-                        | '&'
-                )
-        });
-        if bad {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Windows identity name component contains disallowed characters",
-            ));
-        }
-        Ok(())
+        crate::windows_identity::validate_windows_identity_name_component(s, &['&'])
     }
 
     #[test]
@@ -808,5 +754,32 @@ mod tests {
         };
         let rendered = record.to_string();
         assert!(rendered.contains(" 304 - "));
+    }
+
+    #[test]
+    fn disabled_logging_disables_access_log_file(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let mut config = Config::default().logging;
+        config.enabled = false;
+
+        init_access_log(&config, tmp.path())?;
+        log_access(&AccessRecord {
+            remote_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            method: "GET",
+            path: "/",
+            protocol: "HTTP/1.1",
+            status: 200,
+            bytes_sent: Some(0),
+            user_agent: None,
+            referer: None,
+        });
+        shutdown_access_log();
+
+        assert!(
+            !tmp.path().join("runtime/logs/access.log").exists(),
+            "logging.enabled = false must not create access.log"
+        );
+        Ok(())
     }
 }

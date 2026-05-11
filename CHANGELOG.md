@@ -74,7 +74,7 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Multiple log rotation backups** — `LogFile::rotate` now keeps up to five numbered backup files (`.log.1`–`.log.5`) instead of one, matching what operators expect from tools like `logrotate`.
 
 ### Changed
-- **`lib.rs` visibility audit** — items only used in integration tests (`percent_decode`, `ByteRange`, `Encoding`, `onion_address_from_pubkey`) are now re-exported under `#[cfg(test)]` rather than unconditionally, reducing the public API surface.
+- **`lib.rs` visibility audit** — handler parsing helpers and onion-address internals are no longer re-exported from the crate root, reducing the public API surface.
 - **Comment hygiene** — all internal `fix X.Y` tags have been replaced with descriptive prose so the rationale for each decision is clear to contributors.
 
 ---

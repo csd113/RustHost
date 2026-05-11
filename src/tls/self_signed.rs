@@ -1,7 +1,4 @@
 //! # Self-Signed TLS Certificates
-//!
-//! **File:** `self_signed.rs`
-//! **Location:** `src/tls/self_signed.rs`
 use crate::error::AppError;
 use crate::Result;
 use std::{path::Path, sync::Arc, time::SystemTime};
@@ -212,7 +209,7 @@ fn needs_regeneration(cert_path: &Path) -> bool {
 // from "cert is corrupted" or "system clock is wrong", all of which
 // previously produced identical silent regeneration with no diagnostic trail.
 fn remaining_validity_days(cert_path: &Path) -> Option<u64> {
-    use x509_cert::der::Decode;
+    use x509_cert::der::Decode as _;
 
     let pem_bytes = std::fs::read(cert_path)
         .map_err(|e| {
@@ -238,7 +235,7 @@ fn remaining_validity_days(cert_path: &Path) -> Option<u64> {
         .ok()?;
 
     // `not_after` is stored as an ASN.1 Time; convert via Unix timestamp.
-    let not_after: SystemTime = cert.tbs_certificate.validity.not_after.to_system_time();
+    let not_after = cert.tbs_certificate.validity.not_after.to_system_time();
     let remaining = not_after
         .duration_since(SystemTime::now())
         .map_err(|e| {
@@ -264,10 +261,10 @@ fn remaining_validity_days(cert_path: &Path) -> Option<u64> {
 /// never written under a broader umask-derived permission set.
 fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     use std::fs::OpenOptions;
-    use std::io::Write;
+    use std::io::Write as _;
 
     #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::OpenOptionsExt as _;
     #[cfg(unix)]
     let mut file = OpenOptions::new()
         .write(true)

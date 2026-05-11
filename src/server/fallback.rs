@@ -1,8 +1,4 @@
 //! # Fallback Page
-//!
-//! **File:** `fallback.rs`
-//! **Location:** `src/server/fallback.rs`
-//!
 //! The built-in HTML page served when `./data/site/index.html` is missing
 //! and directory listing is disabled.  Served with HTTP 200 so the browser
 //! shows a helpful message rather than an error screen.

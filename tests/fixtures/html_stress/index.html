@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RustHost Stress Suite</title>
+  <meta name="description" content="Static asset mix for load and regression testing.">
+  <link rel="stylesheet" href="/styles/app.css">
+  <script defer src="/scripts/app.js"></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <h1>RustHost Stress Suite</h1>
+      <p id="status">The app should serve this page, its linked assets, and nested pages without failing under bursty keep-alive traffic.</p>
+    </header>
+
+    <nav aria-label="fixture navigation">
+      <a href="/pages/about.html">About page</a>
+      <a href="/pages/nested/index.html">Nested page</a>
+      <a href="/pages/space%20name.html">Space name page</a>
+      <a href="/pages/huge.html">Generated large page</a>
+      <a href="/gallery/">Gallery listing</a>
+    </nav>
+
+    <section class="cards" aria-label="asset summary">
+      <article>
+        <h2>HTML</h2>
+        <p>Root, nested, and spaced filenames.</p>
+      </article>
+      <article>
+        <h2>CSS</h2>
+        <p>One stylesheet with obvious markers.</p>
+      </article>
+      <article>
+        <h2>JS</h2>
+        <p>One defer-loaded script with a window flag.</p>
+      </article>
+      <article>
+        <h2>Images</h2>
+        <p>SVG asset for content-type coverage.</p>
+      </article>
+    </section>
+
+    <figure class="brand">
+      <img src="/assets/logo.svg" alt="RustHost mark" width="96" height="96">
+      <figcaption>Static content with real browser-like references.</figcaption>
+    </figure>
+  </main>
+</body>
+</html>

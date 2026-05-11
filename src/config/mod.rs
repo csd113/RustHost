@@ -1,7 +1,4 @@
 //! # Config Module
-//!
-//! **File:** `mod.rs`
-//! **Location:** `src/config/mod.rs`
 pub mod defaults;
 pub mod loader;
 use log::LevelFilter;
@@ -12,10 +9,8 @@ use std::num::NonZeroU16;
 // ─── Log level ───────────────────────────────────────────────────────────────
 /// Typed log-level value that serde deserialises directly from the TOML string.
 ///
-/// Replaces the `level: String` field + the duplicate `parse_level` /
-/// validation logic that previously existed in both `loader.rs` and
-/// `logging/mod.rs`. An invalid value (e.g. `level = "verbose"`)
-/// is now rejected at parse time with a clear serde error.
+/// Invalid values (for example `level = "verbose"`) are rejected during TOML
+/// parsing with a clear serde error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
@@ -40,8 +35,7 @@ impl From<LogLevel> for LevelFilter {
 // ─── Serde helpers ────────────────────────────────────────────────────────────
 /// Deserialise `bind` from a TOML string directly into `IpAddr`.
 ///
-/// Replaces the post-parse `.parse::<IpAddr>()` check in `loader.rs` with a
-/// parse-time error so an invalid IP is caught the moment the file is read
+/// Invalid IPs are rejected while parsing the config file.
 fn deserialize_ip_addr<'de, D: Deserializer<'de>>(d: D) -> Result<IpAddr, D::Error> {
     let s = String::deserialize(d)?;
     s.parse().map_err(serde::de::Error::custom)
@@ -378,13 +372,12 @@ pub struct SiteConfig {
     /// `index.html` (with status 200) instead of a 404.
     /// Required for single-page applications with client-side routing
     /// (`React Router`, `Vue Router`, `SvelteKit`, etc.).
-    /// Addresses C-6 — React/Vue/Svelte apps silently 404 without this.
     #[serde(default)]
     pub spa_routing: bool,
 
     /// Optional custom 404 page path, relative to the site directory.
     /// When set and the file exists, it is served with status 404 for all
-    /// requests that resolve to `NotFound`. Addresses H-10.
+    /// requests that resolve to `NotFound`.
     #[serde(default)]
     pub error_404: Option<String>,
 

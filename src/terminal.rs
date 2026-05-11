@@ -1,8 +1,4 @@
 //! # terminal – cross-platform auto-terminal launcher
-//!
-//! **File:** `terminal.rs`
-//! **Location:** `src/terminal.rs`
-//!
 //! Detects whether the process is attached to a TTY. If it is not (e.g. the
 //! binary was double-clicked in a file manager), the process relaunches itself
 //! inside an appropriate terminal emulator and exits, so the user always sees
@@ -49,8 +45,8 @@
 
 use std::env;
 use std::io::IsTerminal as _;
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::process;
 
 /// Sentinel environment variable used to prevent re-spawn loops.
 const SPAWNED_VAR: &str = "RUSTHOST_SPAWNED";
@@ -63,7 +59,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
-/// Check whether a relaunch is necessary and, if so, perform it then exit.
+/// Check whether a relaunch is necessary and, if so, perform it.
 ///
 /// The function is a no-op when:
 /// - the process is already attached to a TTY, **or**
@@ -71,10 +67,14 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// If a relaunch is needed but fails, a short message is printed to stderr and
 /// the process continues (it may produce garbled output but does not crash).
-pub fn maybe_relaunch() {
+///
+/// Returns `true` when the current process should stop immediately because a
+/// child terminal process was spawned successfully.
+#[must_use]
+pub fn maybe_relaunch() -> bool {
     // Already inside a terminal spawned by us – do nothing.
     if env::var(SPAWNED_VAR).is_ok() {
-        return;
+        return false;
     }
 
     // Already attached to a TTY – no relaunch required.
@@ -83,19 +83,19 @@ pub fn maybe_relaunch() {
     // unmaintained `atty` crate, which carried a known memory-safety
     // vulnerability on Windows (RUSTSEC-2021-0145).
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return;
+        return false;
     }
 
     // Not a TTY and env-var not set → try to relaunch inside a terminal.
     match spawn_in_terminal() {
-        Ok(()) => {
-            // The child terminal was successfully launched; exit this headless
-            // instance so only the terminal window remains.
-            process::exit(0);
-        }
+        Ok(()) => true,
         Err(e) => {
-            eprintln!("[rusthost] terminal relaunch failed: {e}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "[rusthost] terminal relaunch failed: {e}"
+            );
             // Fall through and run headlessly – better than a silent crash.
+            false
         }
     }
 }
@@ -259,12 +259,18 @@ fn spawn_linux(exe: &std::path::Path, cli_args: &[String]) -> Result<(), BoxErro
             // `Ok(())`, at which point the OS reaps all children.
             Ok(_child) => return Ok(()),
             Err(e) => {
-                eprintln!("[rusthost] could not launch `{term}`: {e}");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[rusthost] could not launch `{term}`: {e}"
+                );
             }
         }
     }
 
-    eprintln!("Please run this application from a terminal.");
+    let _ = writeln!(
+        std::io::stderr(),
+        "Please run this application from a terminal."
+    );
     Err("no suitable terminal emulator found on PATH".into())
 }
 
@@ -275,8 +281,8 @@ fn spawn_linux(exe: &std::path::Path, cli_args: &[String]) -> Result<(), BoxErro
 /// | `gnome-terminal` | `gnome-terminal -- <cmd> [args]` |
 /// | everything else  | `<terminal> -e <cmd> [args]`     |
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn build_terminal_command(term: &str, exec_argv: &[String]) -> process::Command {
-    let mut cmd = process::Command::new(term);
+fn build_terminal_command(term: &str, exec_argv: &[String]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(term);
 
     if term == "gnome-terminal" {
         cmd.arg("--");
@@ -306,7 +312,6 @@ fn is_on_path(name: &str) -> bool {
         .map(|dir| dir.join(name))
         .any(|p| {
             p.metadata()
-                .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-                .unwrap_or(false)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
 }

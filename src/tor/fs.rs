@@ -1,7 +1,7 @@
 //! # Tor Filesystem Helpers
-//!
-//! **File:** `fs.rs`
-//! **Location:** `src/tor/fs.rs`
+
+#[cfg(windows)]
+use crate::windows_identity::current_windows_identity;
 
 /// Create a directory intended to be private to the current user and harden
 /// its permissions.
@@ -87,7 +87,7 @@ fn ensure_real_directory(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn create_single_directory(path: &std::path::Path) -> std::io::Result<()> {
     use std::fs::DirBuilder;
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::DirBuilderExt as _;
 
     match DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
@@ -108,7 +108,7 @@ fn create_single_directory(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn create_private_dir_unix(path: &std::path::Path) -> std::io::Result<()> {
     use std::fs::DirBuilder;
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::DirBuilderExt as _;
 
     match DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
@@ -119,7 +119,7 @@ fn create_private_dir_unix(path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn harden_unix_permissions(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
 
     let meta = std::fs::symlink_metadata(path)?;
     let ft = meta.file_type();
@@ -138,63 +138,7 @@ fn harden_unix_permissions(path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn harden_windows_permissions(path: &std::path::Path) -> std::io::Result<()> {
-    fn validate_windows_name(s: &str) -> std::io::Result<()> {
-        if s.is_empty() || s.len() > 256 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Windows identity name has unexpected length: {} bytes",
-                    s.len()
-                ),
-            ));
-        }
-        let has_bad_char = s.chars().any(|c| {
-            c.is_control()
-                || matches!(
-                    c,
-                    '"' | '/'
-                        | '\\'
-                        | '['
-                        | ']'
-                        | ':'
-                        | ';'
-                        | '|'
-                        | '='
-                        | ','
-                        | '+'
-                        | '*'
-                        | '?'
-                        | '<'
-                        | '>'
-                        | '('
-                        | ')'
-                )
-        });
-        if has_bad_char {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Windows identity name component contains disallowed characters",
-            ));
-        }
-        Ok(())
-    }
-
-    let username = std::env::var("USERNAME").map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("USERNAME environment variable not available: {e}"),
-        )
-    })?;
-    let userdomain = std::env::var("USERDOMAIN").map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("USERDOMAIN environment variable not available: {e}"),
-        )
-    })?;
-
-    validate_windows_name(&username)?;
-    validate_windows_name(&userdomain)?;
-
+    let (userdomain, username) = current_windows_identity(&[])?;
     let grant_arg = format!("{userdomain}\\{username}:(OI)(CI)F");
 
     let path_str = path.to_string_lossy();

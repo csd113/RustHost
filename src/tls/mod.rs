@@ -1,7 +1,4 @@
 //! # TLS Module
-//!
-//! **File:** `mod.rs`
-//! **Location:** `src/tls/mod.rs`
 pub mod acme;
 pub mod self_signed;
 

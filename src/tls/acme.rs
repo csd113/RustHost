@@ -1,7 +1,4 @@
 //! # ACME TLS Support
-//!
-//! **File:** `acme.rs`
-//! **Location:** `src/tls/acme.rs`
 use crate::Result;
 use crate::{config::AcmeConfig, error::AppError};
 use futures::StreamExt as _;
@@ -18,7 +15,7 @@ use std::{
 use tokio::{runtime::Handle, task::JoinHandle};
 
 #[cfg(unix)]
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::DirBuilderExt as _;
 
 fn is_rooted_path(path: &Path) -> bool {
     path.components()
@@ -212,11 +209,13 @@ pub fn build_acme_acceptor(cfg: &AcmeConfig, data_dir: &Path) -> AcmeBuildResult
             .with_cert_resolver(state.resolver()),
     );
 
-    // FIXME(rustls-acme): migrate to `axum_acceptor`, `AcmeState::incoming`,
-    // or a manual CertResolver integration once `acceptor()` is removed.
-    // Track: https://github.com/FlorianUekermann/rustls-acme — replace this
-    // comment with the upstream issue URL when filed.
-    #[allow(deprecated)]
+    // Compatibility note: rustls-acme deprecated `acceptor()` in favor of
+    // `axum_acceptor`, `AcmeState::incoming`, or manual CertResolver
+    // integration. Keep this isolated so the migration is one call site.
+    #[expect(
+        deprecated,
+        reason = "rustls-acme still requires the deprecated acceptor() entrypoint here."
+    )]
     let acme_acceptor = Arc::new(state.acceptor());
 
     // The environment label is runtime-derived, so Arc<str> matches its
@@ -225,7 +224,7 @@ pub fn build_acme_acceptor(cfg: &AcmeConfig, data_dir: &Path) -> AcmeBuildResult
 
     // Use try_current() to convert a missing-runtime panic into a recoverable
     // AppError.
-    let rt_handle = Handle::try_current().map_err(|_| {
+    let rt_handle = Handle::try_current().map_err(|_missing_runtime| {
         AppError::Tls(
             "build_acme_acceptor must be called from within an active Tokio runtime".into(),
         )
@@ -240,7 +239,7 @@ fn acquire_acme_init_guard() -> Result<AcmeInitGuard> {
     let lock = ACME_INITIALIZED.get_or_init(|| Mutex::new(false));
     let mut initialized = lock
         .lock()
-        .map_err(|_| AppError::Tls("ACME initialization mutex is poisoned".into()))?;
+        .map_err(|_poisoned| AppError::Tls("ACME initialization mutex is poisoned".into()))?;
     if *initialized {
         return Err(AppError::Tls(
             "build_acme_acceptor has already been called; \

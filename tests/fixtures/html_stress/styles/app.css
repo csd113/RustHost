@@ -1,0 +1,51 @@
+:root {
+  color-scheme: light;
+  --bg: #f4efe8;
+  --fg: #1f2430;
+  --accent: #c18d2a;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: radial-gradient(circle at top, #fff7ec 0%, var(--bg) 55%, #e6dfd6 100%);
+  color: var(--fg);
+  font-family: Georgia, "Times New Roman", serif;
+}
+
+.shell {
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 3rem 1.5rem 4rem;
+}
+
+.hero h1 {
+  margin: 0 0 0.5rem;
+  font-size: clamp(2.5rem, 6vw, 4.5rem);
+  line-height: 1.05;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 1rem;
+  margin-top: 2rem;
+}
+
+.cards article,
+.brand {
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(31, 36, 48, 0.12);
+  border-radius: 1rem;
+  box-shadow: 0 1rem 2.5rem rgba(31, 36, 48, 0.08);
+  padding: 1rem 1.1rem;
+}
+
+a {
+  color: var(--accent);
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}

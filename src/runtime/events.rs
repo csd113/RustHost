@@ -1,7 +1,4 @@
 //! # Key Event Dispatch
-//!
-//! **File:** `events.rs`
-//! **Location:** `src/runtime/events.rs`
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -135,13 +132,12 @@ pub async fn handle(
         }
 
         KeyEvent::Reload => {
-            reload_site(config, state.clone(), data_dir.clone(), root_tx).await?;
+            reload_site(config, Arc::clone(&state), data_dir.clone(), root_tx).await?;
         }
 
         KeyEvent::Open => {
             let port = state.read().await.actual_port;
-            // use the actual bind address, not hardcoded "localhost".
-            // If bind = "::1", localhost may resolve to 127.0.0.1 and miss the listener.
+            // Use the actual bind address so IPv6-only listeners still open correctly.
             let url = match config.server.bind {
                 std::net::IpAddr::V4(a) if a.is_unspecified() => {
                     format!("http://127.0.0.1:{port}")
@@ -165,4 +161,3 @@ pub async fn handle(
 
     Ok(false)
 }
-// open_browser removed — canonical definition lives in crate::runtime (mod.rs)

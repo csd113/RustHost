@@ -1,8 +1,4 @@
 //! # Application State
-//!
-//! **File:** `state.rs`
-//! **Location:** `src/runtime/state.rs`
-//!
 //! Defines [`AppState`] — the single source of truth for all runtime values.
 //! Wrapped in [`SharedState`] (`Arc<RwLock<AppState>>`) so every subsystem
 //! can read and write it safely across async tasks and std threads.
@@ -172,7 +168,10 @@ impl Default for Metrics {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Human-readable byte formatting intentionally converts to f64 for decimal units."
+)]
 #[must_use]
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1_024;

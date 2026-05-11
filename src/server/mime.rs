@@ -1,8 +1,4 @@
 //! # MIME Type Mapping
-//!
-//! **File:** `mime.rs`
-//! **Location:** `src/server/mime.rs`
-//!
 //! Maps file extensions to MIME type strings.  Unknown extensions fall
 //! back to `application/octet-stream` so the browser offers a download
 //! rather than attempting to display binary data.
@@ -17,9 +13,9 @@
 /// ```
 #[must_use]
 pub fn for_extension(ext: &str) -> &'static str {
-    // 3.4 — Normalise to lowercase in a fixed stack buffer to avoid a heap
-    // allocation on every served file request. Extensions longer than 16 bytes
-    // are not in the table, so we short-circuit to the fallback immediately.
+    // Normalise to lowercase in a fixed stack buffer to avoid a heap allocation
+    // on every served file request. Extensions longer than 16 bytes are not in
+    // the table, so we short-circuit to the fallback immediately.
     let bytes = ext.as_bytes();
     let mut buf = [0u8; 16];
     if bytes.len() > buf.len() {

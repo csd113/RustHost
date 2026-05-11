@@ -1,8 +1,4 @@
 //! # Tor Module — Arti (in-process)
-//!
-//! **File:** `mod.rs`
-//! **Location:** `src/tor/mod.rs`
-//!
 //! Replaces the old subprocess + torrc approach with Arti, the official
 //! Tor implementation in Rust, running entirely in-process.
 //!
@@ -39,7 +35,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::TorClient;
-use futures::StreamExt;
+use futures::StreamExt as _;
 use tokio::{
     net::TcpStream,
     sync::watch,
@@ -75,7 +71,7 @@ pub fn init(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if max_connections == 0 {
-            let msg = "Tor: max_connections must be >= 1".to_string();
+            let msg = "Tor: max_connections must be >= 1".to_owned();
             log::error!("{msg}");
             set_failed_and_clear_onion(&state, msg).await;
             return;
@@ -90,7 +86,7 @@ pub fn init(
                 bind_port,
                 bind_addr,
                 max_connections,
-                state.clone(),
+                Arc::clone(&state),
                 shutdown.clone(),
             )
             .await
@@ -189,7 +185,7 @@ async fn bootstrap_and_launch(
                 TorClient::create_bootstrapped(config)
             ) => {
                 result
-                    .map_err(|_| anyhow::anyhow!(
+                    .map_err(|_elapsed| anyhow::anyhow!(
                         "Tor bootstrap timed out after {}s — check network connectivity",
                         BOOTSTRAP_TIMEOUT.as_secs()
                     ))?
@@ -495,7 +491,7 @@ where
             tokio::io::AsyncReadExt::read(&mut reader, &mut buffer),
         )
         .await
-        .map_err(|_| {
+        .map_err(|_elapsed| {
             std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!("stream idle timeout after {}s", idle_timeout.as_secs()),
@@ -520,7 +516,7 @@ fn hsid_to_onion_address(hsid: HsId) -> String {
 
 #[must_use]
 pub fn onion_address_from_pubkey(pubkey: &[u8; 32]) -> String {
-    use sha3::{Digest, Sha3_256};
+    use sha3::{Digest as _, Sha3_256};
 
     let version: u8 = 3;
 
@@ -533,20 +529,21 @@ pub fn onion_address_from_pubkey(pubkey: &[u8; 32]) -> String {
     // All indices are provably in-bounds at compile time:
     //   address_bytes: [0u8; 35]  — indices 32, 33, 34 are valid.
     //   hash: GenericArray<u8, U32> — indices 0, 1 are valid.
-    #[allow(clippy::indexing_slicing)]
-    {
-        let mut address_bytes = [0u8; 35];
-        address_bytes[..32].copy_from_slice(pubkey);
-        address_bytes[32] = hash[0];
-        address_bytes[33] = hash[1];
-        address_bytes[34] = version;
+    let checksum = hash
+        .get(..2)
+        .ok_or(())
+        .and_then(|bytes| <[u8; 2]>::try_from(bytes).map_err(|_invalid_len| ()))
+        .unwrap_or([0, 0]);
+    let mut address_bytes = [0u8; 35];
+    address_bytes[..32].copy_from_slice(pubkey);
+    address_bytes[32..34].copy_from_slice(&checksum);
+    address_bytes[34] = version;
 
-        let encoded = data_encoding::BASE32_NOPAD
-            .encode(&address_bytes)
-            .to_ascii_lowercase();
+    let encoded = data_encoding::BASE32_NOPAD
+        .encode(&address_bytes)
+        .to_ascii_lowercase();
 
-        format!("{encoded}.onion")
-    }
+    format!("{encoded}.onion")
 }
 
 // ─── Backoff helper ───────────────────────────────────────────────────────────

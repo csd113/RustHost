@@ -1,7 +1,4 @@
 //! # Config Defaults
-//!
-//! **File:** `defaults.rs`
-//! **Location:** `src/config/defaults.rs`
 
 use crate::Result;
 use std::path::Path;
@@ -103,11 +100,9 @@ port = 8443
 # Redirect every HTTP request to HTTPS (301).
 redirect_http = false
 
-# ── IMPORTANT: Port conflict warning ───────────────────────────────────────
-# When redirect_http = true the redirect listener binds to http_port.
-# The main HTTP listener (when active) uses [server].port.
-# Both defaults are currently 8080 — change one of them before enabling
-# both TLS + redirect_http or the server will fail to bind.
+# Plain HTTP port used by the redirect listener when redirect_http = true.
+# The file-serving HTTP listener is not started in redirect mode, so the
+# default can match [server].port.
 http_port = 8080
 
 # ── Let's Encrypt / ACME ─────────────────────────────────────────────────────
@@ -117,7 +112,8 @@ enabled = false
 # Domains to request cert for (required if ACME enabled).
 domains = []
 # Contact email for expiry notices.
-email = ""
+# Leave unset to skip contact email.
+# email = "admin@example.com"
 # true = staging (recommended for testing), false = production.
 staging = true
 # Cache directory relative to data dir.
@@ -140,7 +136,6 @@ cache_dir = "runtime/tls/acme"
 ///
 /// Returns [`crate::AppError::Io`] on any filesystem error.
 pub fn write_default_config(path: &Path) -> Result<()> {
-    // ←←← NEVER overwrite an existing config (critical safety improvement)
     if path.exists() {
         return Ok(());
     }

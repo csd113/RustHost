@@ -1,8 +1,4 @@
 //! # Console Module
-//!
-//! **File:** `mod.rs`
-//! **Location:** `src/console/mod.rs`
-//!
 //! Manages the interactive terminal UI: raw-mode setup, render loop, and
 //! key input.
 //!
@@ -25,7 +21,7 @@ pub mod dashboard;
 pub mod input;
 
 use std::{
-    io::{stdout, Write},
+    io::{stdout, Write as _},
     sync::Arc,
 };
 
@@ -71,8 +67,12 @@ pub fn start(
 
     terminal::enable_raw_mode()
         .map_err(|e| AppError::Console(format!("Failed to enable raw mode: {e}")))?;
-    execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide)
-        .map_err(|e| AppError::Console(format!("Failed to enter alternate screen: {e}")))?;
+    if let Err(e) = execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide) {
+        let _ = terminal::disable_raw_mode();
+        return Err(AppError::Console(format!(
+            "Failed to enter alternate screen: {e}"
+        )));
+    }
     RAW_MODE_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
 
     execute!(
@@ -92,7 +92,7 @@ pub fn start(
     let rate = config.console.refresh_rate_ms;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(rate));
-        let mut last_rendered = String::new(); // 3.3 — change-detection state
+        let mut last_rendered = String::new();
 
         loop {
             tokio::select! {
@@ -117,7 +117,7 @@ async fn render(
     config: &Config,
     state: &SharedState,
     metrics: &SharedMetrics,
-    last_rendered: &mut String, // 3.3 — previous frame for change-detection
+    last_rendered: &mut String,
 ) -> Result<()> {
     // Acquire the lock ONCE and extract everything needed for this frame.
     // Previously this function locked twice: once to read `console_mode`, then
@@ -140,9 +140,7 @@ async fn render(
         ConsoleMode::ConfirmQuit => dashboard::render_confirm_quit(),
     };
 
-    // 3.3 — Skip all terminal I/O when the frame is identical to the previous
-    // one. At 100 ms ticks this eliminates nearly every write during idle periods
-    // (no traffic, no state change).
+    // Skip terminal I/O when the frame is unchanged to avoid needless redraws.
     if output == *last_rendered {
         return Ok(());
     }
@@ -173,6 +171,6 @@ pub fn cleanup() {
     if RAW_MODE_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
         let _ = execute!(stdout(), cursor::Show, terminal::LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
-        println!();
+        let _ = writeln!(stdout());
     }
 }

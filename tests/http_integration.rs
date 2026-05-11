@@ -1,8 +1,4 @@
 //! # HTTP Server Integration Tests
-//!
-//! **File:** `http_integration.rs`
-//! **Location:** `tests/http_integration.rs`
-//!
 //! Each test spins up an isolated [`rusthost::server::run`] instance, connects
 //! to it via [`tokio::net::TcpStream`], sends raw HTTP/1.1, and inspects the
 //! raw response bytes.
@@ -22,6 +18,11 @@
 //! pre-bound listener.  On the loopback interface this window is on the order
 //! of microseconds and is acceptable in practice.
 
+#![allow(renamed_and_removed_lints)]
+
+mod support;
+
+use std::io::Write as _;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
@@ -30,34 +31,19 @@ use std::{
 };
 
 use dashmap::DashMap;
-use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-    sync::{watch, RwLock, Semaphore},
-};
-
 use rusthost::{
     config::Config,
     runtime::state::{AppState, Metrics},
 };
-
-// ─── Port helper ──────────────────────────────────────────────────────────────
-
-/// Ask the OS for a free port by binding on `:0`, record the port, then drop
-/// the listener so `server::run` can bind it.
-///
-/// The test never connects until `port_rx` fires (see [`TestServer::start`]),
-/// so the gap between this drop and the server's bind is not observable by the
-/// test logic.
-fn reserve_port_for(bind_addr: IpAddr) -> Result<u16, std::io::Error> {
-    let listener = std::net::TcpListener::bind(SocketAddr::new(bind_addr, 0))?;
-    Ok(listener.local_addr()?.port())
-    // listener dropped here — port released back to the OS
-}
-
-fn reserve_port() -> Result<u16, std::io::Error> {
-    reserve_port_for(IpAddr::V4(Ipv4Addr::LOCALHOST))
-}
+use support::{
+    build_test_config, header_value, read_headers_only, read_one_response, reserve_port,
+    reserve_port_for, response_to_str, status_code,
+};
+use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::TcpStream,
+    sync::{watch, RwLock, Semaphore},
+};
 
 // ─── Test harness ─────────────────────────────────────────────────────────────
 
@@ -90,6 +76,9 @@ impl TestServer {
         let port = reserve_port_for(bind_addr)?;
 
         let mut config = build_test_config(site_root, bind_addr, port)?;
+        config.server.max_connections = 16;
+        config.server.csp_level = rusthost::config::CspLevel::Strict;
+        config.site.enable_directory_listing = false;
         configure(&mut config);
         let config = Arc::new(config);
         let state = Arc::new(RwLock::new(AppState::new()));
@@ -145,8 +134,8 @@ impl TestServer {
         // server is listening.
         let bound_port = tokio::time::timeout(Duration::from_secs(5), port_rx)
             .await
-            .map_err(|_| "timed out waiting for server to report its bound port")?
-            .map_err(|_| "server port channel closed before sending")?;
+            .map_err(|_elapsed| "timed out waiting for server to report its bound port")?
+            .map_err(|_closed| "server port channel closed before sending")?;
 
         let addr = SocketAddr::new(bind_addr, bound_port);
 
@@ -175,7 +164,7 @@ impl TestServer {
 
         tokio::time::timeout(Duration::from_secs(5), read_one_response(&mut stream))
             .await
-            .map_err(|_| "read_one_response timed out after 5 s")?
+            .map_err(|_elapsed| "read_one_response timed out after 5 s")?
     }
 
     /// Like [`send`] but does not attempt to read a response body.
@@ -189,7 +178,7 @@ impl TestServer {
 
         tokio::time::timeout(Duration::from_secs(5), read_headers_only(&mut stream))
             .await
-            .map_err(|_| "read_headers_only timed out after 5 s")?
+            .map_err(|_elapsed| "read_headers_only timed out after 5 s")?
     }
 
     /// Gracefully shut the server down and await task exit.
@@ -198,8 +187,15 @@ impl TestServer {
         if let Some(handle) = self.handle.take() {
             match tokio::time::timeout(Duration::from_secs(5), handle).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("[TestServer] server task panicked: {e}"),
-                Err(_) => eprintln!("[TestServer] server shutdown timed out after 5 s"),
+                Ok(Err(e)) => {
+                    let _ = writeln!(std::io::stderr(), "[TestServer] server task panicked: {e}");
+                }
+                Err(_) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[TestServer] server shutdown timed out after 5 s"
+                    );
+                }
             }
         }
     }
@@ -226,7 +222,8 @@ async fn start_server_with_bind_or_skip(
                 )
             }) =>
         {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "[http_integration] skipping test: loopback sockets are blocked or unavailable in this environment"
             );
             Ok(None)
@@ -248,7 +245,8 @@ async fn start_https_server_or_skip(
                 )
             }) =>
         {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "[http_integration] skipping test: loopback sockets are blocked or unavailable in this environment"
             );
             Ok(None)
@@ -303,6 +301,9 @@ impl HttpsTestServer {
 
         let port = reserve_port()?;
         let mut config = build_test_config(site_root, IpAddr::V4(Ipv4Addr::LOCALHOST), port)?;
+        config.server.max_connections = 16;
+        config.server.csp_level = rusthost::config::CspLevel::Strict;
+        config.site.enable_directory_listing = false;
         config.tls.enabled = true;
         config.tls.port = std::num::NonZeroU16::new(port).ok_or("reserved HTTPS port was 0")?;
         config.tls.redirect_http = false;
@@ -380,14 +381,14 @@ impl HttpsTestServer {
 
         let stream = TcpStream::connect(self.addr).await?;
         let server_name = rustls::pki_types::ServerName::try_from("localhost")
-            .map_err(|_| "invalid localhost server name")?
+            .map_err(|_invalid_name| "invalid localhost server name")?
             .to_owned();
         let mut tls_stream = connector.connect(server_name, stream).await?;
         tls_stream.write_all(request).await?;
 
         tokio::time::timeout(Duration::from_secs(5), read_one_response(&mut tls_stream))
             .await
-            .map_err(|_| "HTTPS read_one_response timed out after 5 s")?
+            .map_err(|_elapsed| "HTTPS read_one_response timed out after 5 s")?
     }
 
     async fn stop(mut self) {
@@ -395,8 +396,18 @@ impl HttpsTestServer {
         if let Some(handle) = self.handle.take() {
             match tokio::time::timeout(Duration::from_secs(5), handle).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("[HttpsTestServer] server task panicked: {e}"),
-                Err(_) => eprintln!("[HttpsTestServer] server shutdown timed out after 5 s"),
+                Ok(Err(e)) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[HttpsTestServer] server task panicked: {e}"
+                    );
+                }
+                Err(_) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[HttpsTestServer] server shutdown timed out after 5 s"
+                    );
+                }
             }
         }
     }
@@ -422,7 +433,10 @@ async fn start_server_with_config_or_skip(
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied) =>
         {
-            eprintln!("[http_integration] skipping test: loopback sockets are blocked in this environment");
+            let _ = writeln!(
+                std::io::stderr(),
+                "[http_integration] skipping test: loopback sockets are blocked in this environment"
+            );
             Ok(None)
         }
         Err(err) => Err(err),
@@ -438,49 +452,6 @@ impl Drop for TestServer {
             handle.abort();
         }
     }
-}
-
-// ─── Config + fixture helpers ─────────────────────────────────────────────────
-
-/// Build a minimal [`Config`] whose site directory matches `site_root`.
-///
-/// Returns an error rather than silently falling back to a bad default if
-/// `site_root` does not have a valid UTF-8 directory name.
-fn build_test_config(
-    site_root: &Path,
-    bind_addr: IpAddr,
-    port: u16,
-) -> Result<Config, Box<dyn std::error::Error>> {
-    use std::num::NonZeroU16;
-
-    let dir_name = site_root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or("site_root must have a valid UTF-8 directory name")?
-        .to_owned();
-
-    let mut config = Config::default();
-
-    // reserve_port() binds on :0 so the OS always assigns a non-zero port.
-    // NonZeroU16::new returns None only for 0, which cannot happen here; the
-    // ok_or branch converts that impossible case into a propagated error
-    // rather than an unwrap/expect that clippy would flag.
-    config.server.port =
-        NonZeroU16::new(port).ok_or("reserve_port() returned port 0, which is invalid")?;
-    config.server.bind = bind_addr;
-
-    // auto_port_fallback = false: the server must bind exactly `port`.
-    config.server.auto_port_fallback = false;
-    config.server.open_browser_on_start = false;
-    config.server.max_connections = 16;
-    config.server.csp_level = rusthost::config::CspLevel::Strict;
-    // Use the directory basename; server joins data_dir + this name.
-    config.site.directory = dir_name;
-    config.site.index_file = "index.html".into();
-    config.site.enable_directory_listing = false;
-    config.tor.enabled = false;
-    config.console.interactive = false;
-    Ok(config)
 }
 
 /// Create a temporary `<tmp>/site/<files…>` tree.
@@ -500,28 +471,6 @@ fn make_site(
 }
 
 // ─── Response assertion helpers ───────────────────────────────────────────────
-
-/// Convert raw response bytes to a `&str`.
-///
-/// Returns `Err` on invalid UTF-8 so callers can propagate the failure through
-/// `?` without panicking.  All response bytes are echoed in the error message
-/// so failures are unambiguous.
-fn response_to_str(raw: &[u8]) -> Result<&str, Box<dyn std::error::Error>> {
-    std::str::from_utf8(raw)
-        .map_err(|e| format!("response contained non-UTF-8 bytes (error: {e}):\n{raw:?}").into())
-}
-
-/// Extract the numeric HTTP status code from the response status line.
-///
-/// Returns `Err` when the status line is absent or unparseable so that the
-/// caller's `?` produces a clear failure message rather than a panic.
-fn status_code(raw: &[u8]) -> Result<u16, Box<dyn std::error::Error>> {
-    let text = response_to_str(raw)?;
-    text.split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| format!("malformed status line in response:\n{text}").into())
-}
 
 /// `true` when there are no bytes after the `\r\n\r\n` header terminator.
 fn body_is_empty(raw: &[u8]) -> Result<bool, Box<dyn std::error::Error>> {
@@ -545,168 +494,6 @@ fn has_header(raw: &[u8], name: &str) -> Result<bool, Box<dyn std::error::Error>
         .lines()
         .skip(1) // skip status line
         .any(|l| l.to_ascii_lowercase().starts_with(&needle)))
-}
-
-/// Return the trimmed value of the first matching header (case-insensitive),
-/// or `None` if the header is not present.
-fn header_value(raw: &[u8], name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let needle = format!("{}:", name.to_ascii_lowercase());
-    let text = response_to_str(raw)?;
-    Ok(text
-        .lines()
-        .skip(1)
-        .find(|l| l.to_ascii_lowercase().starts_with(&needle))
-        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_owned())))
-}
-
-// ─── HTTP/1.1 response reader ────────────────────────────────────────────────
-
-/// Scan `buf` starting at `search_from` for the `\r\n\r\n` byte sequence.
-///
-/// Returns the index of the first byte *after* the terminator, or `None` if
-/// the sequence is not yet present.
-///
-/// `search_from` is typically `buf.len().saturating_sub(3)` from the previous
-/// iteration so that terminators split across two reads are not missed.
-///
-/// Using a dedicated helper keeps the unsafe-index-free contract in one place:
-/// `get()` is used throughout so this function never panics.
-fn find_header_end(buf: &[u8], search_from: usize) -> Option<usize> {
-    // get() returns None when search_from > buf.len(), making this
-    // unconditionally panic-free regardless of the caller's value.
-    let tail = buf.get(search_from..)?;
-    let pos = tail.windows(4).position(|w| w == b"\r\n\r\n")?;
-    // saturating_add is used for every intermediate step so that a
-    // pathologically large buffer cannot cause silent wraparound.
-    Some(search_from.saturating_add(pos).saturating_add(4))
-}
-
-/// Read only the HTTP/1.1 response headers (up to and including `\r\n\r\n`).
-///
-/// Uses a 4 KiB staging buffer so the common case needs only one or two
-/// `read` syscalls rather than one per byte.
-///
-/// Use for HEAD requests where the server sends `Content-Length` but no body
-/// bytes.
-async fn read_headers_only<S>(stream: &mut S) -> Result<Vec<u8>, Box<dyn std::error::Error>>
-where
-    S: AsyncRead + Unpin,
-{
-    let mut buf = Vec::with_capacity(4096);
-    let mut staging = [0u8; 4096];
-
-    loop {
-        // Overlap by 3 bytes so a terminator split across two reads is found.
-        let search_from = buf.len().saturating_sub(3);
-
-        let n = stream.read(&mut staging).await?;
-        if n == 0 {
-            return Err("connection closed before \\r\\n\\r\\n header terminator".into());
-        }
-        // Only extend by the bytes actually read, not the whole staging array.
-        buf.extend_from_slice(
-            staging
-                .get(..n)
-                .ok_or("read returned more bytes than the staging buffer can hold")?,
-        );
-
-        if let Some(end) = find_header_end(&buf, search_from) {
-            buf.truncate(end);
-            return Ok(buf);
-        }
-    }
-}
-
-/// Read exactly one HTTP/1.1 response from `stream`.
-///
-/// Accumulates bytes using a 4 KiB staging buffer until `\r\n\r\n` is found,
-/// then reads exactly `Content-Length` additional bytes (defaulting to 0).
-/// Avoids blocking on a keep-alive connection that never sends EOF.
-async fn read_one_response<S>(stream: &mut S) -> Result<Vec<u8>, Box<dyn std::error::Error>>
-where
-    S: AsyncRead + Unpin,
-{
-    // ── 1. Read headers ───────────────────────────────────────────────────────
-    let mut buf = Vec::with_capacity(4096);
-    let mut staging = [0u8; 4096];
-    let header_end; // index of the first byte after \r\n\r\n
-
-    loop {
-        let search_from = buf.len().saturating_sub(3);
-        let n = stream.read(&mut staging).await?;
-        if n == 0 {
-            return Err("connection closed before \\r\\n\\r\\n header terminator".into());
-        }
-        buf.extend_from_slice(
-            staging
-                .get(..n)
-                .ok_or("read returned more bytes than the staging buffer can hold")?,
-        );
-
-        if let Some(end) = find_header_end(&buf, search_from) {
-            header_end = end;
-            break;
-        }
-    }
-
-    // ── 2. Parse status and Content-Length from the header block ──────────────
-    // get() is used so we never produce a panicking slice index.
-    let header_bytes = buf
-        .get(..header_end)
-        .ok_or("header_end is out of bounds — this is a bug in read_one_response")?;
-
-    let header_str = std::str::from_utf8(header_bytes)
-        .map_err(|e| format!("response headers are not valid UTF-8: {e}"))?;
-
-    let status: u16 = header_str
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    let content_length: usize = header_str
-        .lines()
-        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.split_once(':').map(|x| x.1))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-
-    // ── 3. Decide whether a body is expected ──────────────────────────────────
-    // HEAD responses and 204/304 carry Content-Length but no body bytes.
-    let has_body = content_length > 0 && !matches!(status, 204 | 304);
-
-    if !has_body {
-        buf.truncate(header_end);
-        return Ok(buf);
-    }
-
-    // ── 4. Read exactly content_length body bytes ─────────────────────────────
-    // Some body bytes may already be in `buf` from the header read-ahead.
-    let already_have = buf.len().saturating_sub(header_end);
-
-    let total_needed = header_end
-        .checked_add(content_length)
-        .ok_or("Content-Length value causes usize overflow")?;
-
-    if already_have < content_length {
-        buf.resize(total_needed, 0);
-
-        let fill_start = header_end
-            .checked_add(already_have)
-            .ok_or("fill_start overflows usize")?;
-
-        // get_mut() rather than a direct index so this is panic-free.
-        let body_slice = buf
-            .get_mut(fill_start..total_needed)
-            .ok_or("body slice range is out of bounds — this is a bug in read_one_response")?;
-        stream.read_exact(body_slice).await?;
-    } else {
-        // Read-ahead gave us more than enough; truncate to the exact size.
-        buf.truncate(total_needed);
-    }
-
-    Ok(buf)
 }
 
 // ─── Core HTTP flow tests ─────────────────────────────────────────────────────
@@ -794,7 +581,8 @@ async fn https_response_includes_onion_location_when_onion_is_ready(
                 )
             }) =>
         {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "[http_integration] skipping test: loopback sockets are blocked or unavailable in this environment"
             );
             return Ok(());
@@ -896,11 +684,6 @@ async fn directory_traversal_returns_403() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-// oversized_request_header test removed: hyper does not enforce a configurable
-// header-size limit at the HTTP/1.1 layer — it buffers the full request and
-// serves it normally.  A 400/431 response would require a custom middleware
-// layer that is outside the current HTTP integration scope.
-
 #[tokio::test(flavor = "current_thread")]
 async fn get_nonexistent_file_returns_404() -> Result<(), Box<dyn std::error::Error>> {
     let (tmp, site) = make_site(&[("index.html", b"ok")])?;
@@ -993,11 +776,151 @@ async fn serves_precompressed_sidecar_when_client_accepts_brotli(
     Ok(())
 }
 
-// This test previously asserted status 400 for a POST request, which encoded
-// the *incorrect* behaviour (RFC 9110 §15.5.6 requires 405 + Allow header for
-// known-but-disallowed methods).  The old assertion would pass when the bug was
-// present and fail when it was fixed, causing developers to mistakenly revert
-// the fix to make CI green again.
+#[tokio::test(flavor = "current_thread")]
+async fn if_none_match_takes_precedence_over_if_modified_since(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"<h1>cache me</h1>")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let initial = server
+        .send(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let last_modified = header_value(&initial, "last-modified")?
+        .ok_or("expected Last-Modified header on initial response")?;
+
+    let revalidated = server
+        .send(
+            format!(
+                "GET /index.html HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: \"not-current\"\r\nIf-Modified-Since: {last_modified}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(
+        status_code(&revalidated)?,
+        200,
+        "If-Modified-Since must be ignored when If-None-Match is present and does not match:\n{}",
+        response_to_str(&revalidated)?
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn precompressed_revalidation_uses_selected_representation_etag(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[
+        ("app.js", b"console.log('original');"),
+        ("app.js.br", b"pretend-brotli-bytes"),
+    ])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let identity = server
+        .send(b"GET /app.js HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let identity_etag =
+        header_value(&identity, "etag")?.ok_or("expected ETag on identity response")?;
+
+    let selected_brotli = server
+        .send(
+            format!(
+                "GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\nIf-None-Match: {identity_etag}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    let brotli = server
+        .send(b"GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\n\r\n")
+        .await?;
+    let brotli_etag = header_value(&brotli, "etag")?.ok_or("expected ETag on Brotli response")?;
+
+    let revalidated_brotli = server
+        .send(
+            format!(
+                "GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br\r\nIf-None-Match: {brotli_etag}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&selected_brotli)?, 200);
+    assert_eq!(
+        header_value(&selected_brotli, "content-encoding")?.as_deref(),
+        Some("br")
+    );
+    assert!(
+        response_to_str(&selected_brotli)?.contains("pretend-brotli-bytes"),
+        "identity ETag must not validate the selected Brotli sidecar:\n{}",
+        response_to_str(&selected_brotli)?
+    );
+    assert_eq!(status_code(&revalidated_brotli)?, 304);
+    assert_eq!(
+        header_value(&revalidated_brotli, "content-encoding")?.as_deref(),
+        Some("br")
+    );
+    assert_eq!(
+        header_value(&revalidated_brotli, "vary")?.as_deref(),
+        Some("Accept-Encoding")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dynamic_compressed_revalidation_preserves_selected_representation_headers(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let css = b"body{color:#123456;}\n".repeat(128);
+    let (tmp, site) = make_site(&[("style.css", &css)])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let initial = server
+        .send_no_body(
+            b"HEAD /style.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n",
+        )
+        .await?;
+    let etag = header_value(&initial, "etag")?.ok_or("expected ETag on gzip HEAD response")?;
+
+    let revalidated = server
+        .send_no_body(
+            format!(
+                "HEAD /style.css HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nIf-None-Match: {etag}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(
+        header_value(&initial, "content-encoding")?.as_deref(),
+        Some("gzip")
+    );
+    assert_eq!(status_code(&revalidated)?, 304);
+    assert_eq!(
+        header_value(&revalidated, "content-encoding")?.as_deref(),
+        Some("gzip")
+    );
+    assert_eq!(
+        header_value(&revalidated, "vary")?.as_deref(),
+        Some("Accept-Encoding")
+    );
+    assert!(body_is_empty(&revalidated)?);
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn disallowed_method_returns_405_with_allow_header() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -1178,8 +1101,9 @@ async fn connection_limit_rejects_second_socket() -> Result<(), Box<dyn std::err
 
     let rejected = match write_result {
         Ok(()) => {
-            let mut buf = [0u8; 16];
+            let mut buf = [0u8; 256];
             match tokio::time::timeout(Duration::from_secs(2), second.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => matches!(status_code(&buf[..n]), Ok(503)),
                 Ok(Ok(0)) => true,
                 Ok(Err(err))
                     if matches!(
@@ -1219,7 +1143,10 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
     let plain_port = match reserve_port() {
         Ok(port) => port,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!("[http_integration] skipping test: loopback sockets are blocked in this environment");
+            let _ = writeln!(
+                std::io::stderr(),
+                "[http_integration] skipping test: loopback sockets are blocked in this environment"
+            );
             return Ok(());
         }
         Err(err) => return Err(err.into()),
@@ -1227,6 +1154,7 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
     let tls_port = 8443;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
+    let state = Arc::new(RwLock::new(AppState::new()));
     let handle = tokio::spawn(async move {
         rusthost::server::redirect::run_redirect_server(
             rusthost::server::redirect::RedirectServerConfig {
@@ -1236,6 +1164,7 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
                 max_per_ip: 8,
                 drain_timeout: Duration::from_secs(5),
             },
+            state,
             shutdown_rx,
             port_tx,
             Arc::new(Semaphore::new(8)),
@@ -1246,14 +1175,17 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
 
     let bound_port = tokio::time::timeout(Duration::from_secs(5), port_rx)
         .await
-        .map_err(|_| "redirect server did not signal readiness within 5 s")??;
+        .map_err(|_elapsed| "redirect server did not signal readiness within 5 s")??;
     let addr: SocketAddr = format!("127.0.0.1:{bound_port}").parse()?;
     let mut stream = match TcpStream::connect(addr).await {
         Ok(stream) => stream,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
             let _ = shutdown_tx.send(true);
             let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-            eprintln!("[http_integration] skipping test: loopback sockets are blocked in this environment");
+            let _ = writeln!(
+                std::io::stderr(),
+                "[http_integration] skipping test: loopback sockets are blocked in this environment"
+            );
             return Ok(());
         }
         Err(err) => return Err(err.into()),
