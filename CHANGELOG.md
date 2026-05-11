@@ -7,6 +7,19 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v0.1.4]
+
+### Changed
+
+- Bumped RustHost to `v0.1.4` and refreshed the Arti Tor dependency stack to `0.42`, including the accompanying lockfile updates.
+- Refactored request handling and runtime lifecycle plumbing to reduce long argument lists, centralize per-request and per-file state, and improve startup and shutdown robustness.
+- Tightened redirect, admission, and cache semantics so overloaded listeners and serve-root edge cases behave more predictably.
+- Hardened logging and console behavior with idempotent access-log initialization, clearer error reporting on rotation and flush failures, and cleaner terminal fallback handling.
+- Continued the broad Clippy cleanup pass across the codebase and test suite.
+- Updated the README and related documentation to match the current project overview and usage guidance.
+
+---
+
 ## [v0.1.3.1]
 
 ### Changed

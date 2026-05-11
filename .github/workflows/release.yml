@@ -8,15 +8,21 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
   RUST_BACKTRACE: 1
 
 jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
 
     strategy:
       fail-fast: false
@@ -24,28 +30,29 @@ jobs:
         include:
           - target: x86_64-apple-darwin
             runner: macos-latest
-            build_tool: cargo
-            asset_name: rusthost-cli-x86_64-apple-darwin
-
+            binary_suffix: ""
+            asset_suffix: macos-x86_64
+            use_cross: false
           - target: aarch64-apple-darwin
             runner: macos-latest
-            build_tool: cargo
-            asset_name: rusthost-cli-aarch64-apple-darwin
-
+            binary_suffix: ""
+            asset_suffix: macos-apple-silicon
+            use_cross: false
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            build_tool: cargo
-            asset_name: rusthost-cli-x86_64-unknown-linux-gnu
-
+            runner: ubuntu-24.04
+            binary_suffix: ""
+            asset_suffix: linux-x86_64
+            use_cross: false
           - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-latest
-            build_tool: cross
-            asset_name: rusthost-cli-aarch64-unknown-linux-gnu
-
+            runner: ubuntu-24.04
+            binary_suffix: ""
+            asset_suffix: linux-arm64
+            use_cross: true
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
-            build_tool: cargo
-            asset_name: rusthost-cli-x86_64-pc-windows-msvc.exe
+            binary_suffix: ".exe"
+            asset_suffix: windows-x86_64
+            use_cross: false
 
     steps:
       - name: Checkout
@@ -56,49 +63,102 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo artifacts
-        uses: actions/cache@v4
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/.cargo/bin
-            target
-          key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-
+          shared-key: release
+          key: ${{ matrix.target }}
 
       - name: Install cross
-        if: matrix.build_tool == 'cross'
-        run: cargo install cross --locked --force
+        if: matrix.use_cross
+        run: cargo install cross --locked
 
       - name: Build release binary
-        run: ${{ matrix.build_tool }} build --locked --release --target ${{ matrix.target }} --bin rusthost-cli
-
-      - name: Stage artifact on Unix
-        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          RUSTHOST_TARGET: ${{ matrix.target }}
+          USE_CROSS: ${{ matrix.use_cross }}
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/rusthost-cli dist/${{ matrix.asset_name }}
+          set -euo pipefail
 
-      - name: Stage artifact on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
+          if [ "${USE_CROSS}" = "true" ]; then
+            cross build --locked --release --target "${RUSTHOST_TARGET}"
+          else
+            cargo build --locked --release --target "${RUSTHOST_TARGET}"
+          fi
+
+      - name: Prepare release archive
+        shell: bash
+        env:
+          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+          BINARY_SUFFIX: ${{ matrix.binary_suffix }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RUSTHOST_TARGET: ${{ matrix.target }}
+          RUNNER_OS: ${{ runner.os }}
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target\${{ matrix.target }}\release\rusthost-cli.exe" "dist\${{ matrix.asset_name }}"
+          set -euo pipefail
+
+          case "${RELEASE_TAG}" in
+            v | *[!0-9A-Za-z._-]*)
+              echo "Release tag '${RELEASE_TAG}' is not safe for archive names" >&2
+              exit 1
+              ;;
+            v*)
+              ;;
+          esac
+
+          case "${ASSET_SUFFIX}" in
+            "" | *[!0-9A-Za-z._-]*)
+              echo "Asset suffix '${ASSET_SUFFIX}' is not safe for archive names" >&2
+              exit 1
+              ;;
+            *)
+              ;;
+          esac
+
+          binary_path="target/${RUSTHOST_TARGET}/release/rusthost-cli${BINARY_SUFFIX}"
+          for required_path in "${binary_path}" README.md LICENSE; do
+            if [ ! -f "${required_path}" ]; then
+              echo "Required release file '${required_path}' is missing" >&2
+              exit 1
+            fi
+          done
+
+          rm -rf dist
+          mkdir -p dist/package
+          asset_basename="rusthost-cli-${RELEASE_TAG}-${ASSET_SUFFIX}"
+          package_root="dist/package/${asset_basename}"
+
+          mkdir -p "${package_root}"
+          cp "${binary_path}" "${package_root}/rusthost-cli${BINARY_SUFFIX}"
+          cp README.md LICENSE "${package_root}/"
+
+          if [ "${RUNNER_OS}" = "Windows" ]; then
+            PACKAGE_ROOT="${package_root}" \
+            ARCHIVE_PATH="dist/${asset_basename}.zip" \
+              pwsh -NoLogo -NoProfile -Command \
+                'Compress-Archive -Path (Join-Path $env:PACKAGE_ROOT "*") -DestinationPath $env:ARCHIVE_PATH -CompressionLevel Optimal'
+          else
+            chmod 0755 "${package_root}/rusthost-cli${BINARY_SUFFIX}"
+            (
+              cd "dist/package"
+              zip -r -9 "../${asset_basename}.zip" "${asset_basename}"
+            )
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}
+          name: rusthost-cli-${{ matrix.asset_suffix }}
+          path: dist/*.zip
           if-no-files-found: error
+          retention-days: 7
 
   release:
-    name: Publish Release
-    runs-on: ubuntu-latest
+    name: Publish GitHub Release
+    runs-on: ubuntu-24.04
     needs: build
+    timeout-minutes: 10
     permissions:
       contents: write
 
@@ -106,8 +166,35 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v5
         with:
-          path: release-artifacts
+          pattern: rusthost-cli-*
+          path: release-assets
           merge-multiple: true
+
+      - name: Generate checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          shopt -s nullglob
+          archives=( *.zip )
+
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "No release archives were downloaded" >&2
+            exit 1
+          fi
+
+          LC_ALL=C printf '%s\n' "${archives[@]}" \
+            | sort \
+            | while IFS= read -r archive; do
+                sha256sum --binary "$archive"
+              done > SHA256SUMS.txt
+
+      - name: Verify checksum manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum --check --strict SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2.5.0
@@ -115,6 +202,5 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref_name }}
-          files: release-artifacts/rusthost-cli-*
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+          name: Release ${{ github.ref_name }}
+          files: release-assets/*
