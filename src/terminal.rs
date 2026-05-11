@@ -1,14 +1,24 @@
 //! # terminal – cross-platform auto-terminal launcher
-//! Detects whether the process is attached to a TTY. If it is not (e.g. the
-//! binary was double-clicked in a file manager), the process relaunches itself
-//! inside an appropriate terminal emulator and exits, so the user always sees
-//! interactive output.
+//! Detects whether the process was launched for an interactive, detached
+//! session (for example by double-clicking the binary in a file manager). In
+//! that narrow case, the process relaunches itself inside an appropriate
+//! terminal emulator and exits, so the user sees interactive output.
 //!
 //! ## Loop-prevention
 //!
 //! The env-var `RUSTHOST_SPAWNED=1` is injected into the child environment
 //! before the relaunch. On entry, [`maybe_relaunch`] checks for that var and
 //! skips respawning if it is set, preventing an infinite spawn loop.
+//!
+//! ## Relaunch policy
+//!
+//! Relaunch is intentionally suppressed for:
+//! - `--headless`
+//! - `--help`
+//! - `--version`
+//! - invalid CLI arguments
+//! - service / supervisor style runs where stdio is redirected to a pipe, file,
+//!   or socket rather than detached to `/dev/null`
 //!
 //! ## Platform behaviour
 //!
@@ -47,6 +57,8 @@ use std::env;
 use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::sync::OnceLock;
 
 /// Sentinel environment variable used to prevent re-spawn loops.
 const SPAWNED_VAR: &str = "RUSTHOST_SPAWNED";
@@ -57,12 +69,63 @@ const SPAWNED_VAR: &str = "RUSTHOST_SPAWNED";
 /// structured error type is not needed here.
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelaunchIntent {
+    Interactive,
+    Headless,
+    Help,
+    Version,
+    InvalidArguments,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StdioKind {
+    Terminal,
+    NullDevice,
+    Redirected,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StdioSummary {
+    stdin: StdioKind,
+    stdout: StdioKind,
+    stderr: StdioKind,
+}
+
+impl StdioSummary {
+    const fn all_null_devices(self) -> bool {
+        matches!(
+            self,
+            Self {
+                stdin: StdioKind::NullDevice,
+                stdout: StdioKind::NullDevice,
+                stderr: StdioKind::NullDevice,
+            }
+        )
+    }
+
+    const fn has_terminal(self) -> bool {
+        matches!(self.stdin, StdioKind::Terminal)
+            || matches!(self.stdout, StdioKind::Terminal)
+            || matches!(self.stderr, StdioKind::Terminal)
+    }
+
+    const fn has_redirected_stream(self) -> bool {
+        matches!(self.stdin, StdioKind::Redirected)
+            || matches!(self.stdout, StdioKind::Redirected)
+            || matches!(self.stderr, StdioKind::Redirected)
+    }
+}
+
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Check whether a relaunch is necessary and, if so, perform it.
 ///
 /// The function is a no-op when:
-/// - the process is already attached to a TTY, **or**
+/// - the invocation intent is not interactive,
+/// - the process is already attached to a TTY,
+/// - stdio is redirected like a service / supervisor run, **or**
 /// - `RUSTHOST_SPAWNED=1` is already set in the environment.
 ///
 /// If a relaunch is needed but fails, a short message is printed to stderr and
@@ -71,22 +134,15 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// Returns `true` when the current process should stop immediately because a
 /// child terminal process was spawned successfully.
 #[must_use]
-pub fn maybe_relaunch() -> bool {
-    // Already inside a terminal spawned by us – do nothing.
-    if env::var(SPAWNED_VAR).is_ok() {
+pub fn maybe_relaunch(intent: RelaunchIntent) -> bool {
+    if !should_relaunch(
+        intent,
+        env::var(SPAWNED_VAR).is_ok(),
+        detect_stdio_summary(),
+    ) {
         return false;
     }
 
-    // Already attached to a TTY – no relaunch required.
-    //
-    // `std::io::IsTerminal` (stable since Rust 1.70) supersedes the
-    // unmaintained `atty` crate, which carried a known memory-safety
-    // vulnerability on Windows (RUSTSEC-2021-0145).
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return false;
-    }
-
-    // Not a TTY and env-var not set → try to relaunch inside a terminal.
     match spawn_in_terminal() {
         Ok(()) => true,
         Err(e) => {
@@ -97,6 +153,72 @@ pub fn maybe_relaunch() -> bool {
             // Fall through and run headlessly – better than a silent crash.
             false
         }
+    }
+}
+
+const fn should_relaunch(intent: RelaunchIntent, spawned: bool, stdio: StdioSummary) -> bool {
+    if spawned || !matches!(intent, RelaunchIntent::Interactive) {
+        return false;
+    }
+    if stdio.has_terminal() || stdio.has_redirected_stream() {
+        return false;
+    }
+    stdio.all_null_devices()
+}
+
+fn detect_stdio_summary() -> StdioSummary {
+    StdioSummary {
+        stdin: classify_stdio(0, std::io::stdin().is_terminal()),
+        stdout: classify_stdio(1, std::io::stdout().is_terminal()),
+        stderr: classify_stdio(2, std::io::stderr().is_terminal()),
+    }
+}
+
+#[cfg(unix)]
+fn classify_stdio(fd: std::os::fd::RawFd, is_terminal: bool) -> StdioKind {
+    use std::os::unix::fs::FileTypeExt as _;
+
+    if is_terminal {
+        return StdioKind::Terminal;
+    }
+
+    let Ok(metadata) = std::fs::metadata(format!("/dev/fd/{fd}")) else {
+        return StdioKind::Other;
+    };
+
+    if is_dev_null(&metadata) {
+        return StdioKind::NullDevice;
+    }
+
+    let file_type = metadata.file_type();
+    if file_type.is_file() || file_type.is_fifo() || file_type.is_socket() {
+        StdioKind::Redirected
+    } else {
+        StdioKind::Other
+    }
+}
+
+#[cfg(unix)]
+fn is_dev_null(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    static DEV_NULL: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+
+    DEV_NULL
+        .get_or_init(|| {
+            std::fs::metadata("/dev/null")
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino()))
+        })
+        .is_some_and(|(dev, ino)| metadata.dev() == dev && metadata.ino() == ino)
+}
+
+#[cfg(not(unix))]
+fn classify_stdio(_fd: i32, is_terminal: bool) -> StdioKind {
+    if is_terminal {
+        StdioKind::Terminal
+    } else {
+        StdioKind::Other
     }
 }
 
@@ -314,4 +436,76 @@ fn is_on_path(name: &str) -> bool {
             p.metadata()
                 .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{should_relaunch, RelaunchIntent, StdioKind, StdioSummary};
+
+    const NULL_STDIO: StdioSummary = StdioSummary {
+        stdin: StdioKind::NullDevice,
+        stdout: StdioKind::NullDevice,
+        stderr: StdioKind::NullDevice,
+    };
+
+    const REDIRECTED_STDIO: StdioSummary = StdioSummary {
+        stdin: StdioKind::Redirected,
+        stdout: StdioKind::Redirected,
+        stderr: StdioKind::Redirected,
+    };
+
+    #[test]
+    fn headless_invocation_never_relaunches() {
+        assert!(!should_relaunch(
+            RelaunchIntent::Headless,
+            false,
+            NULL_STDIO
+        ));
+    }
+
+    #[test]
+    fn help_invocation_never_relaunches() {
+        assert!(!should_relaunch(RelaunchIntent::Help, false, NULL_STDIO));
+    }
+
+    #[test]
+    fn version_invocation_never_relaunches() {
+        assert!(!should_relaunch(RelaunchIntent::Version, false, NULL_STDIO));
+    }
+
+    #[test]
+    fn invalid_arguments_never_relaunch() {
+        assert!(!should_relaunch(
+            RelaunchIntent::InvalidArguments,
+            false,
+            NULL_STDIO
+        ));
+    }
+
+    #[test]
+    fn spawned_process_never_relaunches() {
+        assert!(!should_relaunch(
+            RelaunchIntent::Interactive,
+            true,
+            NULL_STDIO
+        ));
+    }
+
+    #[test]
+    fn redirected_stdio_is_treated_as_service_style() {
+        assert!(!should_relaunch(
+            RelaunchIntent::Interactive,
+            false,
+            REDIRECTED_STDIO
+        ));
+    }
+
+    #[test]
+    fn detached_interactive_stdio_requests_relaunch() {
+        assert!(should_relaunch(
+            RelaunchIntent::Interactive,
+            false,
+            NULL_STDIO
+        ));
+    }
 }

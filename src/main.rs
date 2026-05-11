@@ -33,6 +33,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 
 use rusthost::runtime::lifecycle::CliArgs;
+use rusthost::terminal::RelaunchIntent;
 
 /// Crate version, sourced once from `Cargo.toml` at compile time.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -283,10 +284,8 @@ fn validate_serve_flags(
 enum ParseOutcome {
     /// Fully parsed arguments; the caller should proceed with startup.
     Args(CliArgs),
-    /// A flag like `--help` or `--version` was handled; the caller should
-    /// exit with the given code. Any required output has already been written
-    /// to stdout.
-    EarlyExit(std::process::ExitCode),
+    Help,
+    Version,
 }
 
 /// Parse an iterator of raw argument strings into a [`ParseOutcome`].
@@ -338,16 +337,11 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<ParseOutcom
         match flag.as_str() {
             "--version" | "-V" => {
                 reject_inline_value(inline_value.as_deref(), &flag)?;
-                // Print to stdout and signal the caller to exit 0.
-                // We intentionally do NOT call process::exit here so that
-                // parse_args_from remains fully testable.
-                let _ = writeln!(std::io::stdout(), "rusthost {VERSION}");
-                return Ok(ParseOutcome::EarlyExit(std::process::ExitCode::SUCCESS));
+                return Ok(ParseOutcome::Version);
             }
             "--help" | "-h" => {
                 reject_inline_value(inline_value.as_deref(), &flag)?;
-                print_help();
-                return Ok(ParseOutcome::EarlyExit(std::process::ExitCode::SUCCESS));
+                return Ok(ParseOutcome::Help);
             }
             "--config" => {
                 check_duplicate(config_path.is_some(), "--config")?;
@@ -416,26 +410,15 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<ParseOutcom
     }))
 }
 
-/// Parse `std::env::args()` into a [`CliArgs`] value, exiting the process on
-/// early-exit flags (`--help`, `--version`) or any argument error.
-///
-/// This is the only location in the binary where [`std::process::exit`] is
-/// called for argument-related outcomes, keeping the underlying
-/// [`parse_args_from`] fully testable.
-///
-/// Argument errors exit with code `2` (POSIX convention for command-line
-/// syntax errors); early-exit flags exit with code `0`.
-fn parse_args() -> std::result::Result<CliArgs, std::process::ExitCode> {
-    match parse_args_from(std::env::args().skip(1)) {
-        Ok(ParseOutcome::Args(args)) => Ok(args),
-        Ok(ParseOutcome::EarlyExit(code)) => Err(code),
-        Err(err) => {
-            // Use writeln! on raw stderr: same rationale as in main() —
-            // reduces secondary-panic risk vs eprintln! when stderr is in a
-            // broken state.
-            let _ = writeln!(std::io::stderr(), "{err}");
-            Err(std::process::ExitCode::from(2))
-        }
+const fn relaunch_intent_for_parse_result(
+    parsed: &std::result::Result<ParseOutcome, ArgError>,
+) -> RelaunchIntent {
+    match parsed {
+        Ok(ParseOutcome::Args(args)) if args.headless => RelaunchIntent::Headless,
+        Ok(ParseOutcome::Args(_)) => RelaunchIntent::Interactive,
+        Ok(ParseOutcome::Help) => RelaunchIntent::Help,
+        Ok(ParseOutcome::Version) => RelaunchIntent::Version,
+        Err(_) => RelaunchIntent::InvalidArguments,
     }
 }
 
@@ -446,9 +429,12 @@ fn print_help() {
         .next()
         .unwrap_or_else(|| "rusthost-cli".to_owned());
 
-    let _ = write!(
-        std::io::stdout(),
-        "rusthost {ver}
+    let _ = write!(std::io::stdout(), "{}", format_help(&bin, VERSION));
+}
+
+fn format_help(bin: &str, version: &str) -> String {
+    format!(
+        "rusthost {version}
 {desc}
 
 USAGE:
@@ -470,19 +456,21 @@ OPTIONS:
 
 Both --flag value and --flag=value forms are accepted.
 Use -- to signal the end of options.",
-        ver = VERSION,
         desc = env!("CARGO_PKG_DESCRIPTION"),
-    );
+    )
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() -> std::process::ExitCode {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let parsed_args = parse_args_from(raw_args.iter().cloned());
+
     // ── Terminal auto-launcher ────────────────────────────────────────────────
-    // Must be the very first thing: if stdout is not a TTY (e.g. the binary
-    // was double-clicked), relaunch inside a terminal emulator and exit.
-    // The sentinel env var `RUSTHOST_SPAWNED=1` prevents an infinite loop.
-    if rusthost::terminal::maybe_relaunch() {
+    // Must happen before startup side effects. Relaunch is only attempted for
+    // the narrow detached-interactive case; help/version/headless/invalid
+    // invocations stay in the current process.
+    if rusthost::terminal::maybe_relaunch(relaunch_intent_for_parse_result(&parsed_args)) {
         return std::process::ExitCode::SUCCESS;
     }
 
@@ -502,9 +490,20 @@ fn main() -> std::process::ExitCode {
 
     // Parse arguments before starting the async runtime so that --help and
     // --version never pay the runtime-construction cost.
-    let args = match parse_args() {
-        Ok(args) => args,
-        Err(code) => return code,
+    let args = match parsed_args {
+        Ok(ParseOutcome::Args(args)) => args,
+        Ok(ParseOutcome::Help) => {
+            print_help();
+            return std::process::ExitCode::SUCCESS;
+        }
+        Ok(ParseOutcome::Version) => {
+            let _ = writeln!(std::io::stdout(), "rusthost {VERSION}");
+            return std::process::ExitCode::SUCCESS;
+        }
+        Err(err) => {
+            let _ = writeln!(std::io::stderr(), "{err}");
+            return std::process::ExitCode::from(2);
+        }
     };
 
     // Register a panic hook so the terminal is always restored even when a
@@ -585,4 +584,57 @@ fn main() -> std::process::ExitCode {
     }
 
     std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_help, parse_args_from, relaunch_intent_for_parse_result, ParseOutcome};
+    use rusthost::terminal::RelaunchIntent;
+
+    #[test]
+    fn headless_args_suppress_terminal_relaunch() {
+        let parsed = parse_args_from(std::iter::once("--headless").map(str::to_owned));
+        assert!(matches!(parsed, Ok(ParseOutcome::Args(_))));
+        assert_eq!(
+            relaunch_intent_for_parse_result(&parsed),
+            RelaunchIntent::Headless
+        );
+    }
+
+    #[test]
+    fn help_args_suppress_terminal_relaunch() {
+        let parsed = parse_args_from(std::iter::once("--help").map(str::to_owned));
+        assert!(matches!(parsed, Ok(ParseOutcome::Help)));
+        assert_eq!(
+            relaunch_intent_for_parse_result(&parsed),
+            RelaunchIntent::Help
+        );
+    }
+
+    #[test]
+    fn version_args_suppress_terminal_relaunch() {
+        let parsed = parse_args_from(std::iter::once("--version").map(str::to_owned));
+        assert!(matches!(parsed, Ok(ParseOutcome::Version)));
+        assert_eq!(
+            relaunch_intent_for_parse_result(&parsed),
+            RelaunchIntent::Version
+        );
+    }
+
+    #[test]
+    fn invalid_args_suppress_terminal_relaunch() {
+        let parsed = parse_args_from(std::iter::once("--definitely-invalid").map(str::to_owned));
+        assert!(parsed.is_err());
+        assert_eq!(
+            relaunch_intent_for_parse_result(&parsed),
+            RelaunchIntent::InvalidArguments
+        );
+    }
+
+    #[test]
+    fn help_text_mentions_headless_usage() {
+        let help = format_help("rusthost-cli", "1.2.3");
+        assert!(help.contains("--headless"));
+        assert!(help.contains("rusthost 1.2.3"));
+    }
 }

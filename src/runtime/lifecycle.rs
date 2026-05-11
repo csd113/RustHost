@@ -33,6 +33,7 @@ use crate::{
 };
 use support::{
     graceful_shutdown, maybe_open_browser, setup_tls, wait_for_background_task, wait_for_bind_port,
+    ListenerReady,
 };
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -144,6 +145,7 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
         site: SiteConfig {
             directory: site_dir,
             index_file: "index.html".into(),
+            favicon: None,
             enable_directory_listing: true,
             expose_dotfiles: false,
             spa_routing: false,
@@ -201,6 +203,7 @@ fn default_data_dir() -> PathBuf {
 
 fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
     std::fs::create_dir_all(data_dir.join("site"))?;
+    std::fs::create_dir_all(data_dir.join("favicon"))?;
     std::fs::create_dir_all(runtime_root(data_dir))?;
 
     config::defaults::write_default_config(settings_path)?;
@@ -295,6 +298,8 @@ fn schedule_initial_site_scan(config: &Arc<Config>, state: &SharedState, data_di
     reason = "Startup wiring intentionally centralizes subsystem initialization."
 )]
 async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Result<()> {
+    ensure_data_directories(&data_dir)?;
+
     // 2. Initialise logging.
     logging::init(&config.logging, &data_dir)?;
     if let Err(e) = logging::init_access_log(&config.logging, &data_dir) {
@@ -333,7 +338,7 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
         None
     } else {
         // 6. Start HTTP server task.
-        let (port_tx, port_rx) = oneshot::channel::<u16>();
+        let (port_tx, port_rx) = oneshot::channel::<ListenerReady>();
         let server_handle = spawn_server(
             &config,
             &state,
@@ -383,7 +388,7 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     //    Pass shutdown_rx so Tor's stream loop exits on clean shutdown.
     let tor_handle = if config.tor.enabled {
         let tor_bind_addr = server::tor_loopback_addr(config.server.bind);
-        let (tor_ingress_port_tx, tor_ingress_port_rx) = oneshot::channel::<u16>();
+        let (tor_ingress_port_tx, tor_ingress_port_rx) = oneshot::channel::<ListenerReady>();
         let tor_ingress_config = Arc::clone(&config);
         let tor_ingress_state = Arc::clone(&state);
         let tor_ingress_metrics = Arc::clone(&metrics);
@@ -454,6 +459,12 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     Ok(())
 }
 
+fn ensure_data_directories(data_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(data_dir.join("favicon"))?;
+    std::fs::create_dir_all(runtime_root(data_dir))?;
+    Ok(())
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Spawn the HTTP server task and return its `JoinHandle` so the shutdown
@@ -470,7 +481,7 @@ fn spawn_server(
     state: &SharedState,
     metrics: &SharedMetrics,
     shutdown: &watch::Receiver<bool>,
-    port_tx: oneshot::Sender<u16>,
+    port_tx: oneshot::Sender<ListenerReady>,
     data_dir: PathBuf,
     root_rx: watch::Receiver<Arc<std::path::Path>>,
     budget: SharedConnectionBudget,
@@ -772,7 +783,7 @@ const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
 
 #[cfg(test)]
 mod tests {
-    use super::uses_redirect_public_http;
+    use super::{ensure_data_directories, first_run_setup, uses_redirect_public_http};
     use crate::config::Config;
 
     #[test]
@@ -783,5 +794,30 @@ mod tests {
 
         config.tls.enabled = true;
         assert!(uses_redirect_public_http(&config));
+    }
+
+    #[test]
+    fn first_run_setup_creates_favicon_directory() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("rusthost-data");
+        let settings = data_dir.join("settings.toml");
+
+        first_run_setup(&data_dir, &settings)?;
+
+        assert!(data_dir.join("favicon").is_dir());
+        assert!(settings.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_data_directories_creates_favicon_directory() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("rusthost-data");
+
+        ensure_data_directories(&data_dir)?;
+
+        assert!(data_dir.join("favicon").is_dir());
+        assert!(data_dir.join("runtime").is_dir());
+        Ok(())
     }
 }

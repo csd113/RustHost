@@ -161,6 +161,16 @@ fn validate(cfg: &Config) -> Result<()> {
     if let Some(error_503) = &cfg.site.error_503 {
         reject_parent_dir(error_503, "error_503", &mut errors);
     }
+    if let Some(favicon) = &cfg.site.favicon {
+        reject_parent_dir(favicon, "favicon", &mut errors);
+        let ext = std::path::Path::new(favicon)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase);
+        if !matches!(ext.as_deref(), Some("ico" | "png" | "svg")) {
+            errors.push("[site] favicon must end in .ico, .png, or .svg".into());
+        }
+    }
 
     // [logging]
     if cfg.logging.file.is_empty() {
@@ -401,6 +411,30 @@ mod tests {
             matches!(&result, Err(AppError::ConfigValidation(e))
                 if e.iter().any(|s| s.contains("error_503"))),
             "expected ConfigValidation error mentioning error_503, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_favicon_traversal() {
+        let mut cfg = valid();
+        cfg.site.favicon = Some("../settings.toml".into());
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("favicon"))),
+            "expected ConfigValidation error mentioning favicon, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_favicon_extension() {
+        let mut cfg = valid();
+        cfg.site.favicon = Some("favicon/icon.txt".into());
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("favicon must end in"))),
+            "expected ConfigValidation error mentioning favicon extension, got: {result:?}"
         );
     }
 

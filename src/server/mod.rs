@@ -45,6 +45,7 @@ use tokio::{
 )]
 struct ServerContext {
     canonical_root: Arc<Path>,
+    favicon: Arc<handler::FaviconConfig>,
     index_file: Arc<str>,
     csp_header: Arc<str>,
     state: SharedState,
@@ -92,6 +93,8 @@ impl ServerContext {
         };
         let max_conns = config.server.max_connections as usize;
         let site_dir = data_dir.join(&config.site.directory);
+        let favicon_dir = data_dir.join("favicon");
+        let favicon_root = favicon_dir.canonicalize().unwrap_or(favicon_dir);
         let error_404_page = config.site.error_404.as_deref().and_then(|p| {
             handler::load_custom_error_page(
                 canonical_root.as_ref(),
@@ -109,7 +112,12 @@ impl ServerContext {
             )
         });
         Some(Self {
-            canonical_root,
+            canonical_root: Arc::clone(&canonical_root),
+            favicon: Arc::new(handler::FaviconConfig {
+                custom_path: config.site.favicon.as_ref().map(|path| data_dir.join(path)),
+                site_root: Arc::clone(&canonical_root),
+                favicon_root: Arc::from(favicon_root.as_path()),
+            }),
             index_file: Arc::from(config.site.index_file.as_str()),
             csp_header: Arc::from(config.server.csp_level.as_header_value()),
             state,
@@ -163,6 +171,7 @@ impl ServerContext {
         let handler_config = handler::HandlerConfig {
             peer_addr: peer,
             canonical_root: site,
+            favicon: Arc::clone(&self.favicon),
             index_file: idx,
             flags: handler::FeatureFlags {
                 dir_listing: self.dir_list,
@@ -213,21 +222,27 @@ pub async fn run(
     metrics: SharedMetrics,
     data_dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
-    port_tx: oneshot::Sender<u16>,
+    port_tx: oneshot::Sender<std::result::Result<u16, String>>,
     mut root_watch: watch::Receiver<Arc<Path>>,
     shared_semaphore: Arc<Semaphore>,
     shared_per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
 ) {
     let bind_addr = config.server.bind;
     let base_port = config.server.port.get();
-    let (listener, bound_port) =
-        match bind_with_fallback(bind_addr, base_port, config.server.auto_port_fallback) {
-            Ok(v) => v,
-            Err(e) => {
-                log::error!("Server failed to bind: {e}");
-                return;
-            }
-        };
+    let (listener, bound_port) = match bind_with_fallback(
+        "HTTP listener",
+        bind_addr,
+        base_port,
+        config.server.auto_port_fallback,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let message = e.to_string();
+            log::error!("{message}");
+            let _ = port_tx.send(Err(message));
+            return;
+        }
+    };
     if bound_port != base_port {
         log::warn!("Configured port {base_port} was in use; bound to {bound_port} instead.");
     }
@@ -247,7 +262,7 @@ pub async fn run(
         s.actual_port = bound_port;
         s.server_running = true;
     }
-    let _ = port_tx.send(bound_port);
+    let _ = port_tx.send(Ok(bound_port));
     log::info!("HTTP server listening on {bind_addr}:{bound_port}");
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
@@ -342,7 +357,7 @@ pub async fn run_https(
     data_dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
     tls_acceptor: Acceptor,
-    port_tx: oneshot::Sender<u16>,
+    port_tx: oneshot::Sender<std::result::Result<u16, String>>,
     shared_semaphore: Arc<Semaphore>,
     shared_per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
     mut root_watch: watch::Receiver<Arc<Path>>,
@@ -353,18 +368,30 @@ pub async fn run_https(
     let std_listener = match StdTcpListener::bind(bind_socket) {
         Ok(l) => l,
         Err(e) => {
-            log::error!("HTTPS server failed to bind {bind_addr}:{port}: {e}");
+            let message = AppError::ServerBind {
+                listener: "HTTPS listener",
+                addr: bind_socket,
+                source: e,
+            }
+            .to_string();
+            log::error!("{message}");
+            let _ = port_tx.send(Err(message));
             return;
         }
     };
     if let Err(e) = std_listener.set_nonblocking(true) {
-        log::error!("HTTPS listener set_nonblocking failed: {e}");
+        let message =
+            format!("failed to configure HTTPS listener on {bind_socket} for nonblocking I/O: {e}");
+        log::error!("{message}");
+        let _ = port_tx.send(Err(message));
         return;
     }
     let listener = match TcpListener::from_std(std_listener) {
         Ok(l) => l,
         Err(e) => {
-            log::error!("HTTPS TcpListener conversion failed: {e}");
+            let message = format!("failed to initialize HTTPS listener on {bind_socket}: {e}");
+            log::error!("{message}");
+            let _ = port_tx.send(Err(message));
             return;
         }
     };
@@ -384,7 +411,7 @@ pub async fn run_https(
         s.tls_running = true;
         s.tls_port = Some(port);
     }
-    let _ = port_tx.send(port);
+    let _ = port_tx.send(Ok(port));
     log::info!("HTTPS server listening on {bind_addr}:{port}");
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
@@ -441,6 +468,7 @@ pub async fn run_https(
                         let met = Arc::clone(&metrics);
                         let state = Arc::clone(&ctx.state);
                         let csp = Arc::clone(&ctx.csp_header);
+                        let favicon = Arc::clone(&ctx.favicon);
                         let flags = handler::FeatureFlags {
                             dir_listing: ctx.dir_list,
                             expose_dotfiles: ctx.expose_dots,
@@ -516,6 +544,7 @@ pub async fn run_https(
                             let handler_config = handler::HandlerConfig {
                                 peer_addr: peer,
                                 canonical_root: site,
+                                favicon,
                                 index_file: idx,
                                 flags,
                                 state,
@@ -581,22 +610,34 @@ pub async fn run_tor_ingress(
     metrics: SharedMetrics,
     data_dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
-    port_tx: oneshot::Sender<u16>,
+    port_tx: oneshot::Sender<std::result::Result<u16, String>>,
     shared_semaphore: Arc<Semaphore>,
     root_watch: watch::Receiver<Arc<Path>>,
 ) {
     let bind_addr = tor_loopback_addr(config.server.bind);
-    let listener = match TcpListener::bind(std::net::SocketAddr::new(bind_addr, 0)).await {
+    let bind_socket = std::net::SocketAddr::new(bind_addr, 0);
+    let listener = match TcpListener::bind(bind_socket).await {
         Ok(listener) => listener,
         Err(e) => {
-            log::error!("Tor ingress server failed to bind {bind_addr}:0: {e}");
+            let message = AppError::ServerBind {
+                listener: "Tor ingress listener",
+                addr: bind_socket,
+                source: e,
+            }
+            .to_string();
+            log::error!("{message}");
+            let _ = port_tx.send(Err(message));
             return;
         }
     };
     let bound_port = match listener.local_addr() {
         Ok(addr) => addr.port(),
         Err(e) => {
-            log::error!("Tor ingress server could not read bound port: {e}");
+            let message = format!(
+                "Tor ingress listener bound on {bind_socket} but could not read its port: {e}"
+            );
+            log::error!("{message}");
+            let _ = port_tx.send(Err(message));
             return;
         }
     };
@@ -611,7 +652,7 @@ pub async fn run_tor_ingress(
     ) else {
         return;
     };
-    let _ = port_tx.send(bound_port);
+    let _ = port_tx.send(Ok(bound_port));
     log::info!("Tor ingress server listening on {bind_addr}:{bound_port}");
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut root_watch = root_watch;
@@ -671,7 +712,12 @@ pub async fn run_tor_ingress(
 // ─── Port binding ─────────────────────────────────────────────────────────────
 /// Try to bind to `addr:port`. When `fallback` is true, increments the port
 /// up to 10 times before giving up.
-fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpListener, u16)> {
+fn bind_with_fallback(
+    listener: &'static str,
+    addr: IpAddr,
+    port: u16,
+    fallback: bool,
+) -> Result<(TcpListener, u16)> {
     let max_attempts: u16 = if fallback { 10 } else { 1 };
     for attempt in 0..max_attempts {
         let try_port = port.saturating_add(attempt);
@@ -687,14 +733,16 @@ fn bind_with_fallback(addr: IpAddr, port: u16, fallback: bool) -> Result<(TcpLis
             }
             Err(source) => {
                 return Err(AppError::ServerBind {
-                    port: try_port,
+                    listener,
+                    addr: socket_addr,
                     source,
                 });
             }
         }
     }
     Err(AppError::ServerBind {
-        port,
+        listener,
+        addr: std::net::SocketAddr::new(addr, port),
         source: std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             format!(

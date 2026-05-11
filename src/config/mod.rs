@@ -359,6 +359,13 @@ pub struct SiteConfig {
     #[serde(default = "default_index_file")]
     pub index_file: String,
 
+    /// Optional custom favicon path, relative to the data directory.
+    ///
+    /// When unset, `RustHost` looks in `./rusthost-data/favicon/` for common
+    /// files such as `favicon.ico`, `favicon.png`, and `favicon.svg`.
+    #[serde(default)]
+    pub favicon: Option<String>,
+
     #[serde(default)]
     pub enable_directory_listing: bool,
 
@@ -462,6 +469,7 @@ impl Default for Config {
             site: SiteConfig {
                 directory: default_site_directory(),
                 index_file: default_index_file(),
+                favicon: None,
                 enable_directory_listing: false,
                 expose_dotfiles: false,
                 spa_routing: false,
@@ -489,5 +497,15 @@ impl Default for Config {
             redirects: Vec::new(),
             tls: TlsConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn default_config_keeps_tor_enabled() {
+        assert!(Config::default().tor.enabled);
     }
 }

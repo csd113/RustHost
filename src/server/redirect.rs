@@ -9,6 +9,7 @@
 //! it never allocates a hyper connection or reads the full request body.
 
 use std::{
+    fmt::Write as _,
     net::IpAddr,
     sync::{atomic::AtomicU32, Arc},
     time::Duration,
@@ -25,15 +26,22 @@ use tokio::{
 
 use crate::runtime::state::SharedState;
 
-const MAX_HEADER_BYTES: usize = 8 * 1024;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct RedirectServerConfig {
     pub bind_addr: IpAddr,
     pub plain_port: u16,
     pub tls_port: u16,
+    pub allowed_hosts: Vec<String>,
     pub max_per_ip: u32,
     pub drain_timeout: Duration,
+}
+
+enum ReadOutcome {
+    Ready { path: String, host: Option<String> },
+    HeaderTooLarge,
+    Malformed,
 }
 
 /// Bind a plain-HTTP listener on `bind_addr:http_port` and redirect every
@@ -53,11 +61,15 @@ pub struct RedirectServerConfig {
 ///
 /// This avoids pulling the request body, keep-alive handling, or any response
 /// body into what is effectively a TCP-level redirect pump.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Redirect listener keeps bind, admission, and shutdown wiring together."
+)]
 pub async fn run_redirect_server(
     config: RedirectServerConfig,
     state: SharedState,
     mut shutdown: watch::Receiver<bool>,
-    port_tx: oneshot::Sender<u16>,
+    port_tx: oneshot::Sender<std::result::Result<u16, String>>,
     semaphore: Arc<Semaphore>,
     per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
 ) {
@@ -65,18 +77,27 @@ pub async fn run_redirect_server(
         bind_addr,
         plain_port,
         tls_port,
+        allowed_hosts,
         max_per_ip,
         drain_timeout,
     } = config;
+    let allowed_hosts = Arc::new(allowed_hosts);
     let bind_socket = std::net::SocketAddr::new(bind_addr, plain_port);
     let listener = match TcpListener::bind(bind_socket).await {
         Ok(l) => l,
         Err(e) => {
-            log::error!("HTTP-redirect server failed to bind {bind_addr}:{plain_port}: {e}");
+            let message = crate::AppError::ServerBind {
+                listener: "HTTP redirect listener",
+                addr: bind_socket,
+                source: e,
+            }
+            .to_string();
+            log::error!("{message}");
+            let _ = port_tx.send(Err(message));
             return;
         }
     };
-    let _ = port_tx.send(plain_port);
+    let _ = port_tx.send(Ok(plain_port));
     {
         let mut s = state.write().await;
         s.actual_port = plain_port;
@@ -119,9 +140,17 @@ pub async fn run_redirect_server(
                                 continue;
                             }
                         };
+                        let allowed_hosts = Arc::clone(&allowed_hosts);
                         join_set.spawn(async move {
                             let _admission = admission;
-                            handle_redirect(&mut stream, bind_addr, tls_port).await;
+                            handle_redirect_connection(
+                                &mut stream,
+                                peer_ip,
+                                bind_addr,
+                                tls_port,
+                                allowed_hosts.as_slice(),
+                            )
+                            .await;
                         });
                     }
                     Err(e) => {
@@ -152,34 +181,41 @@ pub async fn run_redirect_server(
 ///
 /// The function is best-effort: if the client sends a malformed request or
 /// the write fails we simply drop the connection — there is no retry.
-async fn handle_redirect(stream: &mut tokio::net::TcpStream, bind_addr: IpAddr, https_port: u16) {
+async fn handle_redirect_connection(
+    stream: &mut tokio::net::TcpStream,
+    peer_ip: IpAddr,
+    bind_addr: IpAddr,
+    https_port: u16,
+    allowed_hosts: &[String],
+) {
     use tokio::io::AsyncBufReadExt as _;
     use tokio::io::BufReader;
-
-    let mut path = String::from("/");
-    let mut host: Option<String> = None;
 
     let read_result = tokio::time::timeout(HEADER_READ_TIMEOUT, async {
         // Scope the BufReader so the &mut borrow of stream is released before
         // the write below. Rust's borrow checker requires this.
         let mut reader = BufReader::new(&mut *stream);
         let mut total = 0usize;
+        let mut host: Option<String> = None;
 
         let mut request_line = String::new();
         match reader.read_line(&mut request_line).await {
             Ok(n) if n > 0 => {
                 total = total.saturating_add(n);
                 if total > MAX_HEADER_BYTES {
-                    return None;
+                    return ReadOutcome::HeaderTooLarge;
                 }
-                let mut parts = request_line.split_whitespace();
-                let _ = parts.next();
-                if let Some(p) = parts.next() {
-                    path = sanitize_path(p);
+                if request_line.split_whitespace().nth(1).is_none() {
+                    return ReadOutcome::Malformed;
                 }
             }
-            _ => return None,
+            _ => return ReadOutcome::Malformed,
         }
+
+        let path = request_line
+            .split_whitespace()
+            .nth(1)
+            .map_or_else(|| "/".to_owned(), sanitize_path);
 
         loop {
             let mut line = String::new();
@@ -188,7 +224,7 @@ async fn handle_redirect(stream: &mut tokio::net::TcpStream, bind_addr: IpAddr, 
                 Ok(n) => {
                     total = total.saturating_add(n);
                     if total > MAX_HEADER_BYTES {
-                        return None;
+                        return ReadOutcome::HeaderTooLarge;
                     }
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -196,39 +232,44 @@ async fn handle_redirect(stream: &mut tokio::net::TcpStream, bind_addr: IpAddr, 
                     }
                     if let Some((name, value)) = trimmed.split_once(':') {
                         if name.eq_ignore_ascii_case("host") {
-                            host = sanitize_host_header(value);
+                            host = parse_host_header(value);
                         }
                     }
                 }
             }
         }
 
-        Some(())
+        ReadOutcome::Ready { path, host }
     })
     .await;
 
-    if !matches!(read_result, Ok(Some(()))) {
-        return;
-    }
+    let (path, host) = match read_result {
+        Ok(ReadOutcome::Ready { path, host }) => (path, host),
+        Ok(ReadOutcome::HeaderTooLarge) => {
+            log::warn!(
+                "Rejected redirect request with oversized headers from {peer_ip} \
+                 (limit: {MAX_HEADER_BYTES} bytes)"
+            );
+            let _ =
+                write_status_response(stream, 431, "Request Header Fields Too Large", None).await;
+            return;
+        }
+        Ok(ReadOutcome::Malformed) | Err(_) => return,
+    };
 
-    // Build the target URL.
-    let host = host.unwrap_or_else(|| redirect_host_for(bind_addr));
+    let Ok(host) = validated_redirect_host(host, bind_addr, allowed_hosts) else {
+        log::warn!("Rejected redirect request with invalid Host header from {peer_ip}");
+        let _ = write_status_response(stream, 400, "Bad Request", None).await;
+        return;
+    };
+
     let location = if https_port == 443 {
         format!("https://{host}{path}")
     } else {
         format!("https://{host}:{https_port}{path}")
     };
 
-    let response = format!(
-        "HTTP/1.1 301 Moved Permanently\r\n\
-         Location: {location}\r\n\
-         Content-Length: 0\r\n\
-         Connection: close\r\n\
-         \r\n"
-    );
-
-    let _ = stream.write_all(response.as_bytes()).await;
-    let _ = stream.flush().await;
+    let _ = write_status_response(stream, 301, "Moved Permanently", Some(&location)).await;
 }
 
 fn redirect_host_for(bind_addr: IpAddr) -> String {
@@ -256,7 +297,7 @@ fn sanitize_path(raw: &str) -> String {
     }
 }
 
-fn sanitize_host_header(raw: &str) -> Option<String> {
+fn parse_host_header(raw: &str) -> Option<String> {
     let host = raw.trim();
     if host.is_empty()
         || !host.is_ascii()
@@ -269,7 +310,7 @@ fn sanitize_host_header(raw: &str) -> Option<String> {
 
     if host.starts_with('[') {
         let end = host.find(']')?;
-        let core = &host[..=end];
+        let core = &host[1..end];
         let remainder = &host[end.saturating_add(1)..];
         if !(remainder.is_empty()
             || remainder.starts_with(':')
@@ -279,7 +320,8 @@ fn sanitize_host_header(raw: &str) -> Option<String> {
         {
             return None;
         }
-        return Some(core.to_owned());
+        let ip = core.parse::<std::net::Ipv6Addr>().ok()?;
+        return Some(format!("[{ip}]"));
     }
 
     let name = match host.rsplit_once(':') {
@@ -301,14 +343,51 @@ fn sanitize_host_header(raw: &str) -> Option<String> {
         return None;
     }
 
-    Some(name.to_owned())
+    if let Ok(ip) = name.parse::<std::net::Ipv4Addr>() {
+        return Some(ip.to_string());
+    }
+
+    Some(name.trim_end_matches('.').to_ascii_lowercase())
+}
+
+fn validated_redirect_host(
+    host: Option<String>,
+    bind_addr: IpAddr,
+    allowed_hosts: &[String],
+) -> Result<String, ()> {
+    let candidate = host.unwrap_or_else(|| redirect_host_for(bind_addr));
+    if allowed_hosts.iter().any(|allowed| allowed == &candidate) {
+        Ok(candidate)
+    } else {
+        Err(())
+    }
+}
+
+async fn write_status_response(
+    stream: &mut tokio::net::TcpStream,
+    status: u16,
+    reason: &str,
+    location: Option<&str>,
+) -> std::io::Result<()> {
+    let mut response = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Length: 0\r\n\
+         Connection: close\r\n"
+    );
+    if let Some(location) = location {
+        let _ = write!(response, "Location: {location}\r\n");
+    }
+    response.push_str("\r\n");
+
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;
 
-    use super::{redirect_host_for, sanitize_host_header, sanitize_path};
+    use super::{parse_host_header, redirect_host_for, sanitize_path, validated_redirect_host};
 
     #[test]
     fn redirect_host_for_unspecified_ipv4_uses_loopback() {
@@ -336,13 +415,44 @@ mod tests {
     #[test]
     fn sanitize_host_header_strips_default_port() {
         assert_eq!(
-            sanitize_host_header("example.com:80"),
+            parse_host_header("example.com:80"),
             Some("example.com".to_owned())
         );
     }
 
     #[test]
     fn sanitize_host_header_rejects_path_injection() {
-        assert_eq!(sanitize_host_header("example.com/path"), None);
+        assert_eq!(parse_host_header("example.com/path"), None);
+    }
+
+    #[test]
+    fn sanitize_host_header_rejects_userinfo() {
+        assert_eq!(parse_host_header("evil.com@legit.com"), None);
+    }
+
+    #[test]
+    fn validated_redirect_host_allows_configured_domain() {
+        let allowed = vec!["example.com".to_owned()];
+        assert_eq!(
+            validated_redirect_host(
+                Some("example.com".into()),
+                IpAddr::from([127, 0, 0, 1]),
+                &allowed
+            ),
+            Ok("example.com".into())
+        );
+    }
+
+    #[test]
+    fn validated_redirect_host_rejects_unknown_domain() {
+        let allowed = vec!["localhost".to_owned()];
+        assert_eq!(
+            validated_redirect_host(
+                Some("attacker.example".into()),
+                IpAddr::from([127, 0, 0, 1]),
+                &allowed
+            ),
+            Err(())
+        );
     }
 }

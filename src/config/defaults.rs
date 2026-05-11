@@ -44,6 +44,10 @@ directory = "site"
 # File served for directory requests.
 index_file = "index.html"
 
+# Optional custom favicon path relative to ./rusthost-data/.
+# If unset, RustHost serves files from ./rusthost-data/favicon/ when present.
+# favicon = "favicon/favicon.png"
+
 # Show directory listing instead of index_file.
 enable_directory_listing = false
 

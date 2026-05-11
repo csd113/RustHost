@@ -48,11 +48,13 @@ pub enum AppError {
     #[error("Log init error: {0}")]
     LogInit(String),
 
-    /// TCP bind failed for a specific port.
-    #[error("Could not bind port {port}: {source}")]
+    /// TCP bind failed for a specific listener address.
+    #[error("failed to bind {listener} on {addr}: {source}")]
     ServerBind {
-        /// The port that could not be bound.
-        port: u16,
+        /// Human-readable listener name, for example "HTTP listener".
+        listener: &'static str,
+        /// The full socket address that could not be bound.
+        addr: std::net::SocketAddr,
         /// The underlying I/O error.
         ///
         /// The explicit `#[source]` attribute (rather than relying on the
@@ -63,8 +65,7 @@ pub enum AppError {
         source: std::io::Error,
     },
 
-    /// The HTTP server task exited before signalling its bound port, or the
-    /// bind-port handshake timed out.
+    /// A background listener failed during startup after spawning.
     #[error("Server startup error: {0}")]
     ServerStartup(String),
 
