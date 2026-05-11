@@ -281,8 +281,8 @@ fn spawn_linux(exe: &std::path::Path, cli_args: &[String]) -> Result<(), BoxErro
 /// | `gnome-terminal` | `gnome-terminal -- <cmd> [args]` |
 /// | everything else  | `<terminal> -e <cmd> [args]`     |
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn build_terminal_command(term: &str, exec_argv: &[String]) -> process::Command {
-    let mut cmd = process::Command::new(term);
+fn build_terminal_command(term: &str, exec_argv: &[String]) -> std::process::Command {
+    let mut cmd = std::process::Command::new(term);
 
     if term == "gnome-terminal" {
         cmd.arg("--");
