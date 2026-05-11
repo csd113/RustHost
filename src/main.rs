@@ -24,6 +24,7 @@
     clippy::todo,
     clippy::unimplemented
 )]
+#![allow(renamed_and_removed_lints)]
 #![warn(clippy::nursery)]
 
 use std::io::Write as _;
@@ -232,7 +233,7 @@ fn parse_port(raw: &str) -> Result<u16, ArgError> {
 
     let port = raw
         .parse::<u16>()
-        .map_err(|_| ArgError::InvalidValue(PORT_ERR.to_owned()))?;
+        .map_err(|_parse_error| ArgError::InvalidValue(PORT_ERR.to_owned()))?;
 
     if port == 0 {
         return Err(ArgError::InvalidValue(PORT_ERR.to_owned()));
@@ -285,7 +286,7 @@ enum ParseOutcome {
     /// A flag like `--help` or `--version` was handled; the caller should
     /// exit with the given code. Any required output has already been written
     /// to stdout.
-    EarlyExit(i32),
+    EarlyExit(std::process::ExitCode),
 }
 
 /// Parse an iterator of raw argument strings into a [`ParseOutcome`].
@@ -298,7 +299,6 @@ enum ParseOutcome {
 ///
 /// Returns an [`ArgError`] for unrecognised flags, missing values, duplicate
 /// flags, invalid values, or unsupported flag combinations.
-#[allow(clippy::too_many_lines)]
 fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<ParseOutcome, ArgError> {
     let mut config_path: Option<PathBuf> = None;
     let mut data_dir: Option<PathBuf> = None;
@@ -341,13 +341,13 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<ParseOutcom
                 // Print to stdout and signal the caller to exit 0.
                 // We intentionally do NOT call process::exit here so that
                 // parse_args_from remains fully testable.
-                println!("rusthost {VERSION}");
-                return Ok(ParseOutcome::EarlyExit(0));
+                let _ = writeln!(std::io::stdout(), "rusthost {VERSION}");
+                return Ok(ParseOutcome::EarlyExit(std::process::ExitCode::SUCCESS));
             }
             "--help" | "-h" => {
                 reject_inline_value(inline_value.as_deref(), &flag)?;
                 print_help();
-                return Ok(ParseOutcome::EarlyExit(0));
+                return Ok(ParseOutcome::EarlyExit(std::process::ExitCode::SUCCESS));
             }
             "--config" => {
                 check_duplicate(config_path.is_some(), "--config")?;
@@ -425,17 +425,16 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<ParseOutcom
 ///
 /// Argument errors exit with code `2` (POSIX convention for command-line
 /// syntax errors); early-exit flags exit with code `0`.
-#[must_use]
-fn parse_args() -> CliArgs {
+fn parse_args() -> std::result::Result<CliArgs, std::process::ExitCode> {
     match parse_args_from(std::env::args().skip(1)) {
-        Ok(ParseOutcome::Args(args)) => args,
-        Ok(ParseOutcome::EarlyExit(code)) => std::process::exit(code),
+        Ok(ParseOutcome::Args(args)) => Ok(args),
+        Ok(ParseOutcome::EarlyExit(code)) => Err(code),
         Err(err) => {
             // Use writeln! on raw stderr: same rationale as in main() —
             // reduces secondary-panic risk vs eprintln! when stderr is in a
             // broken state.
             let _ = writeln!(std::io::stderr(), "{err}");
-            std::process::exit(2);
+            Err(std::process::ExitCode::from(2))
         }
     }
 }
@@ -447,7 +446,8 @@ fn print_help() {
         .next()
         .unwrap_or_else(|| "rusthost-cli".to_owned());
 
-    println!(
+    let _ = write!(
+        std::io::stdout(),
         "rusthost {ver}
 {desc}
 
@@ -477,12 +477,14 @@ Use -- to signal the end of options.",
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
-fn main() {
+fn main() -> std::process::ExitCode {
     // ── Terminal auto-launcher ────────────────────────────────────────────────
     // Must be the very first thing: if stdout is not a TTY (e.g. the binary
     // was double-clicked), relaunch inside a terminal emulator and exit.
     // The sentinel env var `RUSTHOST_SPAWNED=1` prevents an infinite loop.
-    rusthost::terminal::maybe_relaunch();
+    if rusthost::terminal::maybe_relaunch() {
+        return std::process::ExitCode::SUCCESS;
+    }
 
     // Install ring as the process-level rustls CryptoProvider.
     //
@@ -500,7 +502,10 @@ fn main() {
 
     // Parse arguments before starting the async runtime so that --help and
     // --version never pay the runtime-construction cost.
-    let args = parse_args();
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(code) => return code,
+    };
 
     // Register a panic hook so the terminal is always restored even when a
     // panic fires on an executor thread. `safe_cleanup` uses `Once` and is
@@ -551,7 +556,7 @@ fn main() {
                 std::io::stderr(),
                 "Fatal error: failed to create Tokio runtime: {err}"
             );
-            std::process::exit(1);
+            return std::process::ExitCode::from(1);
         }
     };
 
@@ -576,6 +581,8 @@ fn main() {
         // already ran it.
         safe_cleanup();
         let _ = writeln!(std::io::stderr(), "\nFatal error: {err}");
-        std::process::exit(1);
+        return std::process::ExitCode::from(1);
     }
+
+    std::process::ExitCode::SUCCESS
 }

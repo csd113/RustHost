@@ -21,7 +21,7 @@ pub mod dashboard;
 pub mod input;
 
 use std::{
-    io::{stdout, Write},
+    io::{stdout, Write as _},
     sync::Arc,
 };
 
@@ -171,6 +171,6 @@ pub fn cleanup() {
     if RAW_MODE_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
         let _ = execute!(stdout(), cursor::Show, terminal::LeaveAlternateScreen);
         let _ = terminal::disable_raw_mode();
-        println!();
+        let _ = writeln!(stdout());
     }
 }

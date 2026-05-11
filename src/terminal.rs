@@ -45,8 +45,8 @@
 
 use std::env;
 use std::io::IsTerminal as _;
+use std::io::Write as _;
 use std::path::PathBuf;
-use std::process;
 
 /// Sentinel environment variable used to prevent re-spawn loops.
 const SPAWNED_VAR: &str = "RUSTHOST_SPAWNED";
@@ -59,7 +59,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
-/// Check whether a relaunch is necessary and, if so, perform it then exit.
+/// Check whether a relaunch is necessary and, if so, perform it.
 ///
 /// The function is a no-op when:
 /// - the process is already attached to a TTY, **or**
@@ -67,10 +67,14 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// If a relaunch is needed but fails, a short message is printed to stderr and
 /// the process continues (it may produce garbled output but does not crash).
-pub fn maybe_relaunch() {
+///
+/// Returns `true` when the current process should stop immediately because a
+/// child terminal process was spawned successfully.
+#[must_use]
+pub fn maybe_relaunch() -> bool {
     // Already inside a terminal spawned by us – do nothing.
     if env::var(SPAWNED_VAR).is_ok() {
-        return;
+        return false;
     }
 
     // Already attached to a TTY – no relaunch required.
@@ -79,19 +83,19 @@ pub fn maybe_relaunch() {
     // unmaintained `atty` crate, which carried a known memory-safety
     // vulnerability on Windows (RUSTSEC-2021-0145).
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        return;
+        return false;
     }
 
     // Not a TTY and env-var not set → try to relaunch inside a terminal.
     match spawn_in_terminal() {
-        Ok(()) => {
-            // The child terminal was successfully launched; exit this headless
-            // instance so only the terminal window remains.
-            process::exit(0);
-        }
+        Ok(()) => true,
         Err(e) => {
-            eprintln!("[rusthost] terminal relaunch failed: {e}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "[rusthost] terminal relaunch failed: {e}"
+            );
             // Fall through and run headlessly – better than a silent crash.
+            false
         }
     }
 }
@@ -255,12 +259,18 @@ fn spawn_linux(exe: &std::path::Path, cli_args: &[String]) -> Result<(), BoxErro
             // `Ok(())`, at which point the OS reaps all children.
             Ok(_child) => return Ok(()),
             Err(e) => {
-                eprintln!("[rusthost] could not launch `{term}`: {e}");
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[rusthost] could not launch `{term}`: {e}"
+                );
             }
         }
     }
 
-    eprintln!("Please run this application from a terminal.");
+    let _ = writeln!(
+        std::io::stderr(),
+        "Please run this application from a terminal."
+    );
     Err("no suitable terminal emulator found on PATH".into())
 }
 

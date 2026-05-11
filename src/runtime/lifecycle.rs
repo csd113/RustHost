@@ -14,6 +14,7 @@
 mod support;
 
 use std::{
+    io::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -186,7 +187,8 @@ fn default_data_dir() -> PathBuf {
             |p| p.join("rusthost-data"),
         ),
         Err(e) => {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "Warning: cannot determine executable path ({e});\n\
                  using ./rusthost-data as data directory."
             );
@@ -208,19 +210,38 @@ fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
         std::fs::write(&placeholder, PLACEHOLDER_HTML)?;
     }
 
-    println!();
-    println!("  RustHost — fresh install detected");
-    println!("  ─────────────────────────────────────────");
-    println!("  Data directories and a default config have been created.");
-    println!("  You can drop your site files into:  ./rusthost-data/site/");
-    println!("  Runtime-managed files live under:    ./rusthost-data/runtime/");
-    println!();
-    println!("  Tor onion service is built-in — no external install required.");
-    println!("  On first run, Arti will download ~2 MB of directory data (~30 s).");
-    println!("  Your .onion address will be shown in the dashboard once ready.");
-    println!();
-    println!("  Starting server now…");
-    println!();
+    let mut stdout = std::io::stdout();
+    writeln!(stdout)?;
+    writeln!(stdout, "  RustHost — fresh install detected")?;
+    writeln!(stdout, "  ─────────────────────────────────────────")?;
+    writeln!(
+        stdout,
+        "  Data directories and a default config have been created."
+    )?;
+    writeln!(
+        stdout,
+        "  You can drop your site files into:  ./rusthost-data/site/"
+    )?;
+    writeln!(
+        stdout,
+        "  Runtime-managed files live under:    ./rusthost-data/runtime/"
+    )?;
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "  Tor onion service is built-in — no external install required."
+    )?;
+    writeln!(
+        stdout,
+        "  On first run, Arti will download ~2 MB of directory data (~30 s)."
+    )?;
+    writeln!(
+        stdout,
+        "  Your .onion address will be shown in the dashboard once ready."
+    )?;
+    writeln!(stdout)?;
+    writeln!(stdout, "  Starting server now…")?;
+    writeln!(stdout)?;
 
     Ok(())
 }
@@ -269,7 +290,10 @@ fn schedule_initial_site_scan(config: &Arc<Config>, state: &SharedState, data_di
 /// Core server startup given an already-built `Config`.
 ///
 /// Shared by the standard settings.toml path and the `--serve` one-shot mode.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Startup wiring intentionally centralizes subsystem initialization."
+)]
 async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Result<()> {
     // 2. Initialise logging.
     logging::init(&config.logging, &data_dir)?;
@@ -297,7 +321,6 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     // 5. Shutdown channels.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    #[allow(clippy::cast_possible_truncation)]
     let budget = SharedConnectionBudget {
         semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
             config.server.max_connections as usize,
@@ -395,7 +418,6 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
                     return Err(err);
                 }
             };
-        #[allow(clippy::cast_possible_truncation)]
         let max_tor = config.server.max_connections as usize;
         Some(tor::init(
             data_dir.clone(),
@@ -439,7 +461,10 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
 ///
 /// Returns the `JoinHandle` and the `watch::Sender` used to push a new
 /// `canonical_root` to the accept loop when the operator presses `[R]`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Background server task needs the shared startup context explicitly."
+)]
 fn spawn_server(
     config: &Arc<Config>,
     state: &SharedState,
@@ -506,21 +531,25 @@ async fn start_console(
         Ok(Some(rx))
     } else {
         let snapshot = state.read().await.clone();
-        println!("RustHost running");
-        println!(
+        let mut stdout = std::io::stdout();
+        let _ = writeln!(stdout, "RustHost running");
+        let _ = writeln!(
+            stdout,
             " HTTP : http://{}:{}",
             config.server.bind, snapshot.actual_port
         );
         if snapshot.tls_running {
             if let Some(tls_port) = snapshot.tls_port {
-                println!(" HTTPS: https://{}:{tls_port}", config.server.bind);
+                let _ = writeln!(stdout, " HTTPS: https://{}:{tls_port}", config.server.bind);
             }
         }
-        println!(
+        let _ = writeln!(
+            stdout,
             " Site : {}",
             data_dir.join(&config.site.directory).display()
         );
-        println!(
+        let _ = writeln!(
+            stdout,
             " Tor  : {}",
             if config.tor.enabled {
                 "enabled"

@@ -15,6 +15,7 @@
     clippy::todo,
     clippy::unimplemented
 )]
+#![allow(renamed_and_removed_lints)]
 
 // Public modules used by the CLI, integration tests, and library callers.
 pub mod config;

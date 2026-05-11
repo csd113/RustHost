@@ -41,17 +41,6 @@ pub fn header_value(raw: &[u8], name: &str) -> Result<Option<String>, Box<dyn st
         }))
 }
 
-#[allow(dead_code)]
-pub fn body_bytes(raw: &[u8]) -> Result<&[u8], Box<dyn std::error::Error>> {
-    let text = response_to_str(raw)?;
-    let sep = text
-        .find("\r\n\r\n")
-        .ok_or("response missing header terminator")?;
-    Ok(raw
-        .get(sep + 4..)
-        .ok_or("response body slice out of bounds")?)
-}
-
 pub fn build_test_config(
     site_root: &Path,
     bind_addr: IpAddr,

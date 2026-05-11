@@ -7,6 +7,8 @@
 //! - HTML, CSS, JS, SVG, directory listing, and percent-encoded paths
 //! - a generated large HTML page with range requests
 
+#![allow(renamed_and_removed_lints)]
+
 mod support;
 
 use std::{
@@ -21,14 +23,24 @@ use std::{
 use dashmap::DashMap;
 use rusthost::runtime::state::{AppState, Metrics};
 use support::{
-    body_bytes, build_test_config, header_value, read_headers_only, read_one_response,
-    reserve_port, response_to_str, status_code,
+    build_test_config, header_value, read_headers_only, read_one_response, reserve_port,
+    response_to_str, status_code,
 };
 use tokio::{
-    io::AsyncWriteExt,
+    io::AsyncWriteExt as _,
     net::TcpStream,
     sync::{watch, RwLock, Semaphore},
 };
+
+fn body_bytes(raw: &[u8]) -> Result<&[u8], Box<dyn std::error::Error>> {
+    let text = response_to_str(raw)?;
+    let sep = text
+        .find("\r\n\r\n")
+        .ok_or("response missing header terminator")?;
+    Ok(raw
+        .get(sep + 4..)
+        .ok_or("response body slice out of bounds")?)
+}
 
 fn fixture_site_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -134,8 +146,8 @@ impl TestServer {
 
         let bound_port = tokio::time::timeout(Duration::from_secs(5), port_rx)
             .await
-            .map_err(|_| "timed out waiting for server to report its bound port")?
-            .map_err(|_| "server port channel closed before sending")?;
+            .map_err(|_elapsed| "timed out waiting for server to report its bound port")?
+            .map_err(|_closed| "server port channel closed before sending")?;
 
         Ok(Self {
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound_port),
@@ -183,43 +195,68 @@ async fn request_paths_over_connection(
         let status = status_code(&response)?;
         match request.as_slice() {
             req if req.starts_with(b"GET / HTTP/1.1") => {
-                assert_eq!(status, 200);
-                assert!(response_to_str(&response)?.contains("RustHost Stress Suite"));
+                assert_eq!(status, 200, "root document should return 200");
+                assert!(
+                    response_to_str(&response)?.contains("RustHost Stress Suite"),
+                    "root document should contain the fixture heading"
+                );
             }
             req if req.starts_with(b"HEAD ") => {
-                assert_eq!(status, 200);
-                assert!(body_bytes(&response)?.is_empty());
+                assert_eq!(status, 200, "HEAD request should return 200");
+                assert!(
+                    body_bytes(&response)?.is_empty(),
+                    "HEAD response body should be empty"
+                );
             }
             req if req.starts_with(b"GET /gallery/ ") => {
-                assert_eq!(status, 200);
-                assert!(response_to_str(&response)?.contains("thumb-a.txt"));
+                assert_eq!(status, 200, "gallery index should return 200");
+                assert!(
+                    response_to_str(&response)?.contains("thumb-a.txt"),
+                    "gallery listing should mention thumb-a.txt"
+                );
             }
             req if req.starts_with(b"GET /pages/space%20name.html ") => {
-                assert_eq!(status, 200);
-                assert!(response_to_str(&response)?.contains("Filename with a space"));
+                assert_eq!(status, 200, "space-containing path should return 200");
+                assert!(
+                    response_to_str(&response)?.contains("Filename with a space"),
+                    "space-containing page should render its heading"
+                );
             }
             req if req.starts_with(b"GET /assets/logo.svg ") => {
-                assert_eq!(status, 200);
+                assert_eq!(status, 200, "SVG asset should return 200");
                 assert_eq!(
                     header_value(&response, "content-type")?.as_deref(),
-                    Some("image/svg+xml")
+                    Some("image/svg+xml"),
+                    "SVG asset should expose the SVG content type"
                 );
             }
             req if req.starts_with(b"GET /styles/app.css ") => {
-                assert_eq!(status, 200);
-                assert!(response_to_str(&response)?.contains("--accent"));
+                assert_eq!(status, 200, "CSS asset should return 200");
+                assert!(
+                    response_to_str(&response)?.contains("--accent"),
+                    "CSS asset should contain the accent variable"
+                );
             }
             req if req.starts_with(b"GET /scripts/app.js ") => {
-                assert_eq!(status, 200);
-                assert!(response_to_str(&response)?.contains("__rusthostStressSuite"));
+                assert_eq!(status, 200, "JS asset should return 200");
+                assert!(
+                    response_to_str(&response)?.contains("__rusthostStressSuite"),
+                    "JS asset should contain the stress-suite marker"
+                );
             }
             req if req.starts_with(b"GET /pages/about.html ") => {
-                assert_eq!(status, 200);
-                assert!(response_to_str(&response)?.contains("About this fixture"));
+                assert_eq!(status, 200, "about page should return 200");
+                assert!(
+                    response_to_str(&response)?.contains("About this fixture"),
+                    "about page should contain its heading"
+                );
             }
             req if req.starts_with(b"GET /pages/nested/index.html ") => {
-                assert_eq!(status, 200);
-                assert!(response_to_str(&response)?.contains("Nested index page"));
+                assert_eq!(status, 200, "nested index should return 200");
+                assert!(
+                    response_to_str(&response)?.contains("Nested index page"),
+                    "nested index should contain its heading"
+                );
             }
             _ => {
                 return Err(format!("unexpected request pattern: {request:?}").into());
@@ -240,16 +277,30 @@ async fn html_fixture_survives_bursty_keep_alive_load() -> Result<(), Box<dyn st
         b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
     )
     .await?;
-    assert_eq!(status_code(&root_response)?, 200);
-    assert!(response_to_str(&root_response)?.contains("RustHost Stress Suite"));
+    assert_eq!(
+        status_code(&root_response)?,
+        200,
+        "root page should return 200"
+    );
+    assert!(
+        response_to_str(&root_response)?.contains("RustHost Stress Suite"),
+        "root page should contain the stress-suite heading"
+    );
 
     let mut head_stream = TcpStream::connect(server.addr).await?;
     head_stream
         .write_all(b"HEAD /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await?;
     let head_response = read_headers_only(&mut head_stream).await?;
-    assert_eq!(status_code(&head_response)?, 200);
-    assert!(body_bytes(&head_response)?.is_empty());
+    assert_eq!(
+        status_code(&head_response)?,
+        200,
+        "HEAD request should return 200"
+    );
+    assert!(
+        body_bytes(&head_response)?.is_empty(),
+        "HEAD response body should be empty"
+    );
 
     let mut range_stream = TcpStream::connect(server.addr).await?;
     let huge_range = read_response(
@@ -257,7 +308,11 @@ async fn html_fixture_survives_bursty_keep_alive_load() -> Result<(), Box<dyn st
         b"GET /pages/huge.html HTTP/1.1\r\nHost: localhost\r\nRange: bytes=0-255\r\n\r\n",
     )
     .await?;
-    assert_eq!(status_code(&huge_range)?, 206);
+    assert_eq!(
+        status_code(&huge_range)?,
+        206,
+        "range request should return partial content"
+    );
     assert!(
         header_value(&huge_range, "content-range")?
             .as_deref()

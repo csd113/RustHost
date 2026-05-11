@@ -18,8 +18,11 @@
 //! pre-bound listener.  On the loopback interface this window is on the order
 //! of microseconds and is acceptable in practice.
 
+#![allow(renamed_and_removed_lints)]
+
 mod support;
 
+use std::io::Write as _;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
@@ -37,7 +40,7 @@ use support::{
     reserve_port_for, response_to_str, status_code,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpStream,
     sync::{watch, RwLock, Semaphore},
 };
@@ -131,8 +134,8 @@ impl TestServer {
         // server is listening.
         let bound_port = tokio::time::timeout(Duration::from_secs(5), port_rx)
             .await
-            .map_err(|_| "timed out waiting for server to report its bound port")?
-            .map_err(|_| "server port channel closed before sending")?;
+            .map_err(|_elapsed| "timed out waiting for server to report its bound port")?
+            .map_err(|_closed| "server port channel closed before sending")?;
 
         let addr = SocketAddr::new(bind_addr, bound_port);
 
@@ -161,7 +164,7 @@ impl TestServer {
 
         tokio::time::timeout(Duration::from_secs(5), read_one_response(&mut stream))
             .await
-            .map_err(|_| "read_one_response timed out after 5 s")?
+            .map_err(|_elapsed| "read_one_response timed out after 5 s")?
     }
 
     /// Like [`send`] but does not attempt to read a response body.
@@ -175,7 +178,7 @@ impl TestServer {
 
         tokio::time::timeout(Duration::from_secs(5), read_headers_only(&mut stream))
             .await
-            .map_err(|_| "read_headers_only timed out after 5 s")?
+            .map_err(|_elapsed| "read_headers_only timed out after 5 s")?
     }
 
     /// Gracefully shut the server down and await task exit.
@@ -184,8 +187,15 @@ impl TestServer {
         if let Some(handle) = self.handle.take() {
             match tokio::time::timeout(Duration::from_secs(5), handle).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("[TestServer] server task panicked: {e}"),
-                Err(_) => eprintln!("[TestServer] server shutdown timed out after 5 s"),
+                Ok(Err(e)) => {
+                    let _ = writeln!(std::io::stderr(), "[TestServer] server task panicked: {e}");
+                }
+                Err(_) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[TestServer] server shutdown timed out after 5 s"
+                    );
+                }
             }
         }
     }
@@ -212,7 +222,8 @@ async fn start_server_with_bind_or_skip(
                 )
             }) =>
         {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "[http_integration] skipping test: loopback sockets are blocked or unavailable in this environment"
             );
             Ok(None)
@@ -234,7 +245,8 @@ async fn start_https_server_or_skip(
                 )
             }) =>
         {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "[http_integration] skipping test: loopback sockets are blocked or unavailable in this environment"
             );
             Ok(None)
@@ -369,14 +381,14 @@ impl HttpsTestServer {
 
         let stream = TcpStream::connect(self.addr).await?;
         let server_name = rustls::pki_types::ServerName::try_from("localhost")
-            .map_err(|_| "invalid localhost server name")?
+            .map_err(|_invalid_name| "invalid localhost server name")?
             .to_owned();
         let mut tls_stream = connector.connect(server_name, stream).await?;
         tls_stream.write_all(request).await?;
 
         tokio::time::timeout(Duration::from_secs(5), read_one_response(&mut tls_stream))
             .await
-            .map_err(|_| "HTTPS read_one_response timed out after 5 s")?
+            .map_err(|_elapsed| "HTTPS read_one_response timed out after 5 s")?
     }
 
     async fn stop(mut self) {
@@ -384,8 +396,18 @@ impl HttpsTestServer {
         if let Some(handle) = self.handle.take() {
             match tokio::time::timeout(Duration::from_secs(5), handle).await {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => eprintln!("[HttpsTestServer] server task panicked: {e}"),
-                Err(_) => eprintln!("[HttpsTestServer] server shutdown timed out after 5 s"),
+                Ok(Err(e)) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[HttpsTestServer] server task panicked: {e}"
+                    );
+                }
+                Err(_) => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[HttpsTestServer] server shutdown timed out after 5 s"
+                    );
+                }
             }
         }
     }
@@ -411,7 +433,10 @@ async fn start_server_with_config_or_skip(
                 .downcast_ref::<std::io::Error>()
                 .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied) =>
         {
-            eprintln!("[http_integration] skipping test: loopback sockets are blocked in this environment");
+            let _ = writeln!(
+                std::io::stderr(),
+                "[http_integration] skipping test: loopback sockets are blocked in this environment"
+            );
             Ok(None)
         }
         Err(err) => Err(err),
@@ -556,7 +581,8 @@ async fn https_response_includes_onion_location_when_onion_is_ready(
                 )
             }) =>
         {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "[http_integration] skipping test: loopback sockets are blocked or unavailable in this environment"
             );
             return Ok(());
@@ -1117,7 +1143,10 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
     let plain_port = match reserve_port() {
         Ok(port) => port,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!("[http_integration] skipping test: loopback sockets are blocked in this environment");
+            let _ = writeln!(
+                std::io::stderr(),
+                "[http_integration] skipping test: loopback sockets are blocked in this environment"
+            );
             return Ok(());
         }
         Err(err) => return Err(err.into()),
@@ -1146,14 +1175,17 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
 
     let bound_port = tokio::time::timeout(Duration::from_secs(5), port_rx)
         .await
-        .map_err(|_| "redirect server did not signal readiness within 5 s")??;
+        .map_err(|_elapsed| "redirect server did not signal readiness within 5 s")??;
     let addr: SocketAddr = format!("127.0.0.1:{bound_port}").parse()?;
     let mut stream = match TcpStream::connect(addr).await {
         Ok(stream) => stream,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
             let _ = shutdown_tx.send(true);
             let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-            eprintln!("[http_integration] skipping test: loopback sockets are blocked in this environment");
+            let _ = writeln!(
+                std::io::stderr(),
+                "[http_integration] skipping test: loopback sockets are blocked in this environment"
+            );
             return Ok(());
         }
         Err(err) => return Err(err.into()),

@@ -132,7 +132,7 @@ pub async fn handle(
         }
 
         KeyEvent::Reload => {
-            reload_site(config, state.clone(), data_dir.clone(), root_tx).await?;
+            reload_site(config, Arc::clone(&state), data_dir.clone(), root_tx).await?;
         }
 
         KeyEvent::Open => {

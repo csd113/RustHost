@@ -56,7 +56,7 @@ pub(super) fn admit_connection(
 
     let permit = Arc::clone(semaphore)
         .try_acquire_owned()
-        .map_err(|_| AdmissionRejection::GlobalLimit)?;
+        .map_err(|_closed| AdmissionRejection::GlobalLimit)?;
 
     Ok(AdmissionGuard {
         _permit: permit,
@@ -118,7 +118,7 @@ mod tests {
         let addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
         let guard = admit_connection(&semaphore, &map, addr, Some(1))
-            .map_err(|_| "admission should succeed")?;
+            .map_err(|_rejection| "admission should succeed")?;
 
         assert_eq!(
             map.get(&addr).map(|count| count.load(Ordering::Acquire)),
@@ -139,7 +139,7 @@ mod tests {
         let map = Arc::new(DashMap::new());
         let addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let first = admit_connection(&semaphore, &map, addr, Some(1))
-            .map_err(|_| "first admission should succeed")?;
+            .map_err(|_rejection| "first admission should succeed")?;
 
         assert!(matches!(
             admit_connection(&semaphore, &map, addr, Some(1)),

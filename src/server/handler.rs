@@ -81,7 +81,10 @@ where
 ///
 /// Grouped into a struct to avoid tripping `clippy::fn_params_excessive_bools`
 /// and `clippy::struct_excessive_bools`.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "These request-handling toggles are a closed set carried together."
+)]
 #[derive(Clone, Copy, Debug)]
 pub struct FeatureFlags {
     pub dir_listing: bool,
@@ -285,7 +288,10 @@ struct RouteConfig {
     trusted_proxies: Arc<Vec<std::net::IpAddr>>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Routing intentionally keeps request classification in one place."
+)]
 async fn route(
     req: Request<Incoming>,
     cfg: &RouteConfig,
@@ -540,7 +546,7 @@ fn external_redirect_response(
     csp: &str,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
     let body = format!("Redirecting to {location}");
-    let data: Bytes = Bytes::copy_from_slice(body.as_bytes());
+    let data = Bytes::copy_from_slice(body.as_bytes());
     let sc = StatusCode::from_u16(status).unwrap_or(StatusCode::MOVED_PERMANENTLY);
     let mut builder = Response::builder()
         .status(sc)
@@ -555,7 +561,10 @@ fn external_redirect_response(
 // ─── File serving ─────────────────────────────────────────────────────────────
 
 /// Serve a file, honoring conditional requests, ranges, and compression.
-#[allow(clippy::too_many_lines)] // file serving intentionally centralizes validators and sidecar selection
+#[expect(
+    clippy::too_many_lines,
+    reason = "File serving intentionally centralizes validators and sidecar selection."
+)]
 async fn serve_file(
     abs_path: &std::path::Path,
     ctx: &RequestContext<'_>,
@@ -1224,7 +1233,7 @@ fn html_response(
     url_path: &str,
 ) -> Response<BoxBody> {
     const CT: &str = "text/html; charset=utf-8";
-    let data: Bytes = Bytes::copy_from_slice(body.as_bytes());
+    let data = Bytes::copy_from_slice(body.as_bytes());
     let mut builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, CT)
@@ -1243,7 +1252,7 @@ fn redirect_response(location: &str, csp: &str) -> Response<BoxBody> {
     // Emit security headers on 301 so the .onion address does not leak via
     // Referer when the browser follows the redirect.
     let body = format!("Redirecting to {location}");
-    let data: Bytes = Bytes::copy_from_slice(body.as_bytes());
+    let data = Bytes::copy_from_slice(body.as_bytes());
     let mut builder = Response::builder()
         .status(StatusCode::MOVED_PERMANENTLY)
         .header(header::LOCATION, location)

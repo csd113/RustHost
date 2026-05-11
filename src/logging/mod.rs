@@ -14,7 +14,7 @@
 use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
-    io::Write,
+    io::Write as _,
     path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -117,7 +117,7 @@ pub fn init_access_log(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
     if let Some(existing) = ACCESS_LOG.get() {
         let guard = existing
             .lock()
-            .map_err(|_| AppError::LogInit("access log mutex is poisoned".into()))?;
+            .map_err(|_poisoned| AppError::LogInit("access log mutex is poisoned".into()))?;
         if guard
             .as_ref()
             .is_some_and(|current| current.path == log_path)
@@ -130,14 +130,14 @@ pub fn init_access_log(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::PermissionsExt as _;
             let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
         }
     }
 
     #[cfg(unix)]
     let f = {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt as _;
         OpenOptions::new()
             .create(true)
             .append(true)
@@ -173,7 +173,7 @@ pub fn init_access_log(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
     if let Some(existing) = ACCESS_LOG.get() {
         let mut guard = existing
             .lock()
-            .map_err(|_| AppError::LogInit("access log mutex is poisoned".into()))?;
+            .map_err(|_poisoned| AppError::LogInit("access log mutex is poisoned".into()))?;
         let old_state = guard.replace(new_state);
         drop(guard);
         if let Some(old_state) = old_state {
@@ -184,7 +184,7 @@ pub fn init_access_log(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
 
     ACCESS_LOG
         .set(Mutex::new(Some(new_state)))
-        .map_err(|_| AppError::LogInit("access log already initialized".into()))?;
+        .map_err(|_already_set| AppError::LogInit("access log already initialized".into()))?;
     Ok(())
 }
 
@@ -359,7 +359,7 @@ impl LogFile {
         // Re-open a fresh file with the same restrictive permissions.
         #[cfg(unix)]
         let new_file = {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::OpenOptionsExt as _;
             OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -486,7 +486,11 @@ impl Log for RustHostLogger {
         if let Some(file_mutex) = &self.file {
             if let Ok(mut lf) = file_mutex.lock() {
                 if let Err(e) = lf.file.flush() {
-                    eprintln!("warn: failed to flush log file {}: {e}", lf.path.display());
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "warn: failed to flush log file {}: {e}",
+                        lf.path.display()
+                    );
                 }
             }
         }
@@ -531,7 +535,7 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
             std::fs::create_dir_all(parent)?;
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
+                use std::os::unix::fs::PermissionsExt as _;
                 let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
             // Use env-var lookup rather than spawning `whoami`.
@@ -596,7 +600,7 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
         // readable 0o644 file.
         #[cfg(unix)]
         let f = {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::OpenOptionsExt as _;
             OpenOptions::new()
                 .create(true)
                 .append(true)

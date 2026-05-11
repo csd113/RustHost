@@ -168,7 +168,10 @@ impl Default for Metrics {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Human-readable byte formatting intentionally converts to f64 for decimal units."
+)]
 #[must_use]
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1_024;

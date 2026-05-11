@@ -39,7 +39,10 @@ use tokio::{
 /// Extracting these into a struct keeps [`run`] under the 100-line limit
 /// imposed by `clippy::nursery::too_many_lines` while grouping the values
 /// that every spawned handler task needs.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Listener state groups related booleans used by every connection handler."
+)]
 struct ServerContext {
     canonical_root: Arc<Path>,
     index_file: Arc<str>,
@@ -87,7 +90,6 @@ impl ServerContext {
                 return None;
             }
         };
-        #[allow(clippy::cast_possible_truncation)]
         let max_conns = config.server.max_connections as usize;
         let site_dir = data_dir.join(&config.site.directory);
         let error_404_page = config.site.error_404.as_deref().and_then(|p| {
@@ -201,7 +203,10 @@ impl ServerContext {
 ///   these require operator intervention.
 /// - **Transient errors** (`ECONNRESET`, `ECONNABORTED`, etc.) → logged at
 ///   `debug`; they are expected under normal traffic and resolve automatically.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Server startup requires these explicit shared resources and channels."
+)]
 pub async fn run(
     config: Arc<Config>,
     state: SharedState,
@@ -322,8 +327,14 @@ pub async fn run(
 /// - `root_watch`: Watch receiver for site-root updates pushed by the [R] reload
 ///   handler. Mirrors the same channel used by `run()` so both listeners always
 ///   serve from the same directory after a reload.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "HTTPS startup needs explicit listener, TLS, and shared budget state."
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "HTTPS accept loop keeps handshake and admission logic together."
+)]
 pub async fn run_https(
     config: Arc<Config>,
     state: SharedState,
@@ -444,7 +455,7 @@ pub async fn run_https(
                         join_set.spawn(async move {
                             // Items must appear before any statements (clippy::items_after_statements).
                             use tokio_util::compat::{
-                                FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt,
+                                FuturesAsyncReadCompatExt as _, TokioAsyncReadCompatExt as _,
                             };
                             trait TlsStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
                             impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TlsStream for T {}
@@ -560,7 +571,10 @@ pub async fn run_https(
 /// once Arti proxies it into the local process. It still shares the global
 /// connection semaphore so Tor traffic participates in the overall capacity
 /// budget instead of becoming an unbounded side channel.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tor ingress shares the same explicit runtime wiring as the main listeners."
+)]
 pub async fn run_tor_ingress(
     config: Arc<Config>,
     state: SharedState,
@@ -801,7 +815,7 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
             } else if link_meta.is_dir() {
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::MetadataExt;
+                    use std::os::unix::fs::MetadataExt as _;
                     let ino = link_meta.ino();
                     if !visited_inodes.insert(ino) {
                         log::warn!(

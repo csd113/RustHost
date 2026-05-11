@@ -87,7 +87,7 @@ fn ensure_real_directory(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn create_single_directory(path: &std::path::Path) -> std::io::Result<()> {
     use std::fs::DirBuilder;
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::DirBuilderExt as _;
 
     match DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
@@ -108,7 +108,7 @@ fn create_single_directory(path: &std::path::Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn create_private_dir_unix(path: &std::path::Path) -> std::io::Result<()> {
     use std::fs::DirBuilder;
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::DirBuilderExt as _;
 
     match DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => Ok(()),
@@ -119,7 +119,7 @@ fn create_private_dir_unix(path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn harden_unix_permissions(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
 
     let meta = std::fs::symlink_metadata(path)?;
     let ft = meta.file_type();

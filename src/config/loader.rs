@@ -81,7 +81,10 @@ fn validate_redirects(cfg: &Config, errors: &mut Vec<String>) {
     }
 }
 
-#[allow(clippy::too_many_lines)] // Centralizes config validation in one place.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Centralizes config validation in one place."
+)]
 fn validate(cfg: &Config) -> Result<()> {
     let mut errors: Vec<String> = Vec::new();
 
