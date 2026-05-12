@@ -130,6 +130,7 @@ The generated `settings.toml` is the main control surface. The most important de
 - Tor is enabled in generated configs.
 - The interactive dashboard is enabled.
 - The site directory is `site`, relative to the data directory.
+- `/favicon.ico` serves `rusthost-data/site/favicon.ico` by default.
 - Logging writes under `runtime/logs/` when enabled.
 
 Common sections:
@@ -137,7 +138,7 @@ Common sections:
 | Section | Purpose |
 |---------|---------|
 | `[server]` | bind address, port, connection limits, CSP preset, trusted proxies, browser opening |
-| `[site]` | site directory, index file, directory listing, dotfile exposure, SPA fallback, custom error pages |
+| `[site]` | site directory, index file, favicon, directory listing, dotfile exposure, SPA fallback, custom error pages |
 | `[tls]` | HTTPS listener, redirect behavior, ACME, manual certificates |
 | `[tor]` | onion service enablement and Tor shutdown grace period |
 | `[logging]` | application log level, log file, dependency log filtering |

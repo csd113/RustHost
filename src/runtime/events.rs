@@ -41,22 +41,30 @@ pub async fn reload_site(
 ) -> Result<()> {
     let site_root = data_dir.join(&config.site.directory);
     let scan_root = site_root.clone();
-    let (count, bytes) =
-        match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                log::warn!("Site rescan failed: {e}");
-                return Ok(());
-            }
-            Err(e) => {
-                log::warn!("Site rescan task panicked: {e}");
-                return Ok(());
-            }
-        };
+    let (count, bytes) = match tokio::task::spawn_blocking(move || server::scan_site(&scan_root))
+        .await
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            log::warn!("Site rescan failed: {e}");
+            state.write().await.status_message = Some(format!("Reload failed: {e}"));
+            return Ok(());
+        }
+        Err(e) => {
+            log::warn!("Site rescan task panicked: {e}");
+            state.write().await.status_message = Some("Reload failed: scan task stopped".into());
+            return Ok(());
+        }
+    };
     {
         let mut s = state.write().await;
         s.site_file_count = count;
         s.site_total_bytes = bytes;
+        s.status_message = Some(format!(
+            "Reload complete: {} files, {}",
+            count,
+            crate::runtime::state::format_bytes(bytes)
+        ));
     }
     if let Ok(new_root) = site_root.canonicalize() {
         let _ = root_tx.send(Arc::from(new_root.as_path()));
@@ -100,7 +108,18 @@ pub async fn handle(
         }
 
         KeyEvent::Confirm => {
-            if state.read().await.console_mode == ConsoleMode::ConfirmQuit {
+            let confirming_quit = {
+                let s = state.read().await;
+                s.console_mode == ConsoleMode::ConfirmQuit
+            };
+            if confirming_quit {
+                let mut s = state.write().await;
+                s.console_mode = ConsoleMode::ShuttingDown;
+                s.status_message = Some(
+                    "Shutdown requested — stopping web server and Tor background services..."
+                        .into(),
+                );
+                drop(s);
                 return Ok(true);
             }
         }
@@ -127,7 +146,7 @@ pub async fn handle(
                 ConsoleMode::Dashboard | ConsoleMode::Help | ConsoleMode::ConfirmQuit => {
                     ConsoleMode::LogView
                 }
-                ConsoleMode::LogView => ConsoleMode::Dashboard,
+                ConsoleMode::LogView | ConsoleMode::ShuttingDown => ConsoleMode::Dashboard,
             };
         }
 
@@ -160,4 +179,83 @@ pub async fn handle(
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::{handle, KeyEvent};
+    use crate::{
+        config::Config,
+        runtime::state::{ConsoleMode, Metrics, SharedState},
+    };
+    use std::sync::Arc;
+    use tokio::sync::{watch, RwLock};
+
+    #[tokio::test]
+    async fn reload_sets_visible_status_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(data_dir.join("site")).expect("create site");
+        std::fs::write(data_dir.join("site/index.html"), b"hello").expect("write file");
+        let config = Config::default();
+        let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
+        let metrics = Arc::new(Metrics::new());
+        let (root_tx, _root_rx) = watch::channel(Arc::from(data_dir.join("site").as_path()));
+
+        let quit = handle(
+            KeyEvent::Reload,
+            &config,
+            Arc::clone(&state),
+            metrics,
+            data_dir,
+            &root_tx,
+        )
+        .await
+        .expect("reload");
+
+        let status_message = {
+            let snapshot = state.read().await;
+            snapshot.status_message.clone()
+        };
+        assert!(!quit);
+        assert!(status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Reload complete")));
+    }
+
+    #[tokio::test]
+    async fn confirmed_quit_sets_shutdown_state() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = Config::default();
+        let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
+        state.write().await.console_mode = ConsoleMode::ConfirmQuit;
+        let metrics = Arc::new(Metrics::new());
+        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+
+        let quit = handle(
+            KeyEvent::Confirm,
+            &config,
+            Arc::clone(&state),
+            metrics,
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await
+        .expect("confirm");
+
+        let (console_mode, status_message) = {
+            let snapshot = state.read().await;
+            (
+                snapshot.console_mode.clone(),
+                snapshot.status_message.clone(),
+            )
+        };
+        assert!(quit);
+        assert_eq!(console_mode, ConsoleMode::ShuttingDown);
+        assert!(status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Shutdown requested")));
+    }
 }

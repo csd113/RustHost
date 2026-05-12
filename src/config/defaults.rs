@@ -31,8 +31,10 @@ max_connections = 256
 # Grace period for active HTTP/HTTPS requests during shutdown.
 shutdown_grace_secs = 30
 
-# Content-Security-Policy preset: "off" | "relaxed" | "strict"
-# (see full explanation below)
+# Content-Security-Policy preset:
+# "off"     = no CSP header; best compatibility while setting up.
+# "relaxed" = allows any origin, inline scripts/styles, eval, data:, and blob:.
+# "strict"  = same-origin assets; inline scripts/styles allowed for simple static sites.
 csp_level = "off"
 
 # ─── [site] ───────────────────────────────────────────────────────────────────
@@ -44,9 +46,12 @@ directory = "site"
 # File served for directory requests.
 index_file = "index.html"
 
-# Optional custom favicon path relative to ./rusthost-data/.
-# If unset, RustHost serves files from ./rusthost-data/favicon/ when present.
-# favicon = "favicon/favicon.png"
+# Favicon file under ./rusthost-data/site/.
+# /favicon.ico serves this file by default.
+favicon = "favicon.ico"
+
+# Enable /favicon.png support. Leave false unless you set favicon to a .png file.
+enable_png_favicon = false
 
 # Show directory listing instead of index_file.
 enable_directory_listing = false

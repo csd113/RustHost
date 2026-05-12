@@ -296,7 +296,14 @@ pub(super) async fn graceful_shutdown(
     tor_handle: Option<tokio::task::JoinHandle<()>>,
     mut background_tasks: BackgroundTasks,
 ) {
-    log::info!("Shutting down…");
+    log::info!("Shutdown requested — stopping web server and background services...");
+    if config.tor.enabled {
+        log::info!(
+            "Tor cleanup may take up to {} s while active streams close.",
+            config.tor.shutdown_grace_secs
+        );
+    }
+    console::show_shutdown_message(config.tor.enabled);
     let _ = shutdown_tx.send(true);
 
     let http_budget = Duration::from_secs(config.server.shutdown_grace_secs);

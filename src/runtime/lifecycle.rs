@@ -98,7 +98,8 @@ pub async fn run(args: CliArgs) -> Result<()> {
         .unwrap_or_else(|| data_dir.join("settings.toml"));
 
     if !settings_path.exists() {
-        first_run_setup(&data_dir, &settings_path)?;
+        let install_kind = detect_install_kind(&data_dir);
+        first_run_setup(&data_dir, &settings_path, install_kind)?;
     }
     normal_run(data_dir, &settings_path).await?;
     Ok(())
@@ -145,7 +146,8 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
         site: SiteConfig {
             directory: site_dir,
             index_file: "index.html".into(),
-            favicon: None,
+            favicon: "favicon.ico".into(),
+            enable_png_favicon: false,
             enable_directory_listing: true,
             expose_dotfiles: false,
             spa_routing: false,
@@ -201,9 +203,22 @@ fn default_data_dir() -> PathBuf {
 
 // ─── First Run ───────────────────────────────────────────────────────────────
 
-fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallKind {
+    Fresh,
+    RegeneratedSettings,
+}
+
+fn detect_install_kind(data_dir: &Path) -> InstallKind {
+    if data_dir.join("site").exists() || runtime_root(data_dir).exists() {
+        InstallKind::RegeneratedSettings
+    } else {
+        InstallKind::Fresh
+    }
+}
+
+fn first_run_setup(data_dir: &Path, settings_path: &Path, install_kind: InstallKind) -> Result<()> {
     std::fs::create_dir_all(data_dir.join("site"))?;
-    std::fs::create_dir_all(data_dir.join("favicon"))?;
     std::fs::create_dir_all(runtime_root(data_dir))?;
 
     config::defaults::write_default_config(settings_path)?;
@@ -215,12 +230,24 @@ fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
 
     let mut stdout = std::io::stdout();
     writeln!(stdout)?;
-    writeln!(stdout, "  RustHost — fresh install detected")?;
-    writeln!(stdout, "  ─────────────────────────────────────────")?;
-    writeln!(
-        stdout,
-        "  Data directories and a default config have been created."
-    )?;
+    match install_kind {
+        InstallKind::Fresh => {
+            writeln!(stdout, "  RustHost — fresh install detected")?;
+            writeln!(stdout, "  ─────────────────────────────────────────")?;
+            writeln!(
+                stdout,
+                "  Data directories and a default config have been created."
+            )?;
+        }
+        InstallKind::RegeneratedSettings => {
+            writeln!(stdout, "  settings.toml missing; regenerated from defaults")?;
+            writeln!(stdout, "  ─────────────────────────────────────────")?;
+            writeln!(
+                stdout,
+                "  Existing site/runtime data was kept; review the new config before production use."
+            )?;
+        }
+    }
     writeln!(
         stdout,
         "  You can drop your site files into:  ./rusthost-data/site/"
@@ -460,7 +487,6 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
 }
 
 fn ensure_data_directories(data_dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(data_dir.join("favicon"))?;
     std::fs::create_dir_all(runtime_root(data_dir))?;
     Ok(())
 }
@@ -783,7 +809,10 @@ const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_data_directories, first_run_setup, uses_redirect_public_http};
+    use super::{
+        detect_install_kind, ensure_data_directories, first_run_setup, uses_redirect_public_http,
+        InstallKind,
+    };
     use crate::config::Config;
 
     #[test]
@@ -797,27 +826,49 @@ mod tests {
     }
 
     #[test]
-    fn first_run_setup_creates_favicon_directory() -> crate::Result<()> {
+    fn first_run_setup_creates_site_and_runtime_directories() -> crate::Result<()> {
         let tmp = tempfile::tempdir()?;
         let data_dir = tmp.path().join("rusthost-data");
         let settings = data_dir.join("settings.toml");
 
-        first_run_setup(&data_dir, &settings)?;
+        first_run_setup(&data_dir, &settings, InstallKind::Fresh)?;
 
-        assert!(data_dir.join("favicon").is_dir());
+        assert!(data_dir.join("site").is_dir());
+        assert!(data_dir.join("runtime").is_dir());
         assert!(settings.is_file());
         Ok(())
     }
 
     #[test]
-    fn ensure_data_directories_creates_favicon_directory() -> crate::Result<()> {
+    fn ensure_data_directories_creates_runtime_directory() -> crate::Result<()> {
         let tmp = tempfile::tempdir()?;
         let data_dir = tmp.path().join("rusthost-data");
 
         ensure_data_directories(&data_dir)?;
 
-        assert!(data_dir.join("favicon").is_dir());
         assert!(data_dir.join("runtime").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_settings_with_existing_site_is_regeneration() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("rusthost-data");
+        std::fs::create_dir_all(data_dir.join("site"))?;
+
+        assert_eq!(
+            detect_install_kind(&data_dir),
+            InstallKind::RegeneratedSettings
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_settings_without_site_or_runtime_is_fresh_install() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("rusthost-data");
+
+        assert_eq!(detect_install_kind(&data_dir), InstallKind::Fresh);
         Ok(())
     }
 }

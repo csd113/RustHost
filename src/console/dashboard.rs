@@ -120,6 +120,9 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
         TorStatus::Failed(reason) => red(&format!("FAILED ({reason}) — see log for details")),
     };
     let _ = writeln!(out, " Tor : {tor_str}\r");
+    if let Some(message) = state.status_message.as_deref() {
+        let _ = writeln!(out, " Status : {}\r", yellow(message));
+    }
     out.push_str("\r\n");
     // ── Endpoints ────────────────────────────────────────────────────────────
     let _ = writeln!(out, "{}\r", bold("Endpoints"));
@@ -192,7 +195,7 @@ pub fn render_log_view(show_timestamps: bool) -> String {
         } else {
             strip_timestamp(line)
         };
-        let _ = writeln!(out, "{display}\r");
+        let _ = writeln!(out, "{}\r", clean_log_line(display));
     }
     out.push_str("\r\n");
     let _ = writeln!(out, "{RULE}\r");
@@ -234,10 +237,32 @@ pub fn render_confirm_quit() -> String {
     let _ = writeln!(out, " {}\r", bold("Quit RustHost?"));
     let _ = writeln!(out, "{RULE}\r");
     out.push_str("\r\n");
-    let _ = writeln!(out, " The server will stop accepting connections.\r");
+    let _ = writeln!(
+        out,
+        " The server will stop accepting connections and background services.\r"
+    );
     out.push_str("\r\n");
     let _ = writeln!(out, " {} Quit {} Cancel\r", bold("[Y]"), bold("[N]"));
     out.push_str("\r\n");
+    let _ = writeln!(out, "{RULE}\r");
+    out
+}
+#[must_use]
+pub fn render_shutdown(tor_enabled: bool) -> String {
+    let mut out = String::with_capacity(512);
+    let _ = writeln!(out, "{RULE}\r");
+    let _ = writeln!(out, " {}\r", bold("Shutdown requested"));
+    let _ = writeln!(out, "{RULE}\r");
+    out.push_str("\r\n");
+    let _ = writeln!(out, " Stopping web server and background services...\r");
+    if tor_enabled {
+        let _ = writeln!(
+            out,
+            " Tor cleanup may take a few seconds while active streams close.\r"
+        );
+    }
+    out.push_str("\r\n");
+    let _ = writeln!(out, " RustHost will exit when cleanup is complete.\r");
     let _ = writeln!(out, "{RULE}\r");
     out
 }
@@ -248,10 +273,19 @@ fn strip_timestamp(line: &str) -> &str {
     parts.next();
     parts.next().map_or(line, str::trim_start)
 }
+
+fn clean_log_line(line: &str) -> String {
+    line.replace("╔═══════════════════════════════════════════════════╗", "")
+        .replace("╠═══════════════════════════════════════════════════╣", "")
+        .replace("╚═══════════════════════════════════════════════════╝", "")
+        .replace('║', "")
+        .trim()
+        .to_owned()
+}
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
-    use super::strip_timestamp;
+    use super::{clean_log_line, render_shutdown, strip_timestamp};
     #[test]
     fn strip_timestamp_ascii_log_line() {
         let line = "[INFO][2024-01-01 12:00:00] message body";
@@ -272,5 +306,18 @@ mod tests {
     fn strip_timestamp_only_one_bracket_pair_returns_original() {
         let line = "[INFO] single bracket only";
         assert_eq!(strip_timestamp(line), line);
+    }
+
+    #[test]
+    fn clean_log_line_removes_box_drawing_noise() {
+        let line = "║   TOR ONION SERVICE ACTIVE                        ║";
+        assert_eq!(clean_log_line(line), "TOR ONION SERVICE ACTIVE");
+    }
+
+    #[test]
+    fn shutdown_message_mentions_tor_when_enabled() {
+        let message = render_shutdown(true);
+        assert!(message.contains("Shutdown requested"));
+        assert!(message.contains("Tor cleanup may take a few seconds"));
     }
 }

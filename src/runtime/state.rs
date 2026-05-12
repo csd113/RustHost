@@ -60,6 +60,8 @@ pub enum ConsoleMode {
     Help,
     /// Quit confirmation prompt (shown after pressing Q).
     ConfirmQuit,
+    /// Shutdown is underway after the quit prompt was confirmed.
+    ShuttingDown,
 }
 
 // ─── AppState ───────────────────────────────────────────────────────────────
@@ -100,6 +102,9 @@ pub struct AppState {
 
     /// Describes the active certificate type for the dashboard.
     pub tls_cert_status: CertStatus,
+
+    /// Short operator-facing status line shown in the dashboard.
+    pub status_message: Option<String>,
 }
 
 impl AppState {
@@ -116,6 +121,7 @@ impl AppState {
             tls_running: false,
             tls_port: None,
             tls_cert_status: CertStatus::Unknown,
+            status_message: None,
         }
     }
 }

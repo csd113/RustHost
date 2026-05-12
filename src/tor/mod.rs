@@ -269,13 +269,6 @@ fn log_onion_banner(onion_name: &str) {
         .map_or(onion_name, |host| host.get(..12).unwrap_or(host));
 
     log::info!(
-        "\n  ╔═══════════════════════════════════════════════════╗\n  \
-           ║   TOR ONION SERVICE ACTIVE                        ║\n  \
-           ╠═══════════════════════════════════════════════════╣\n  \
-           ║   {display_prefix}….onion (full address in dashboard)  ║\n  \
-           ╚═══════════════════════════════════════════════════╝"
-    );
-    log::info!(
         "Tor onion service active: {display_prefix}….onion (full address visible in dashboard)"
     );
     log::info!("Tor onion service address: {onion_name}");

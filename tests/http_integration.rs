@@ -1250,7 +1250,7 @@ async fn oversized_header_returns_431_without_logging_payload(
     let response = server.send(request.as_bytes()).await?;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let recent_lines = rusthost::logging::recent_lines(50);
+    let recent_lines = rusthost::logging::recent_lines(1_000);
 
     server.stop().await;
     let _ = tmp;
@@ -1270,13 +1270,9 @@ async fn oversized_header_returns_431_without_logging_payload(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn favicon_folder_serves_runtime_ico() -> Result<(), Box<dyn std::error::Error>> {
+async fn site_root_serves_default_ico_favicon() -> Result<(), Box<dyn std::error::Error>> {
     let (tmp, site) = make_site(&[("index.html", b"ok")])?;
-    std::fs::create_dir_all(tmp.path().join("favicon"))?;
-    std::fs::write(
-        tmp.path().join("favicon/favicon.ico"),
-        [0_u8, 0, 1, 0, 1, 0, 16, 16],
-    )?;
+    std::fs::write(site.join("favicon.ico"), [0_u8, 0, 1, 0, 1, 0, 16, 16])?;
 
     let Some(server) = start_server_or_skip(&site).await? else {
         return Ok(());
@@ -1315,14 +1311,13 @@ async fn missing_favicon_returns_404() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn custom_png_favicon_is_served_from_favicon_ico_route(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn png_favicon_is_served_when_enabled() -> Result<(), Box<dyn std::error::Error>> {
     let (tmp, site) = make_site(&[("index.html", b"ok")])?;
-    std::fs::create_dir_all(tmp.path().join("favicon"))?;
-    std::fs::write(tmp.path().join("favicon/custom.png"), [137, 80, 78, 71])?;
+    std::fs::write(site.join("custom.png"), [137, 80, 78, 71])?;
 
     let Some(server) = start_server_with_config_or_skip(&site, |config| {
-        config.site.favicon = Some("favicon/custom.png".into());
+        config.site.favicon = "custom.png".into();
+        config.site.enable_png_favicon = true;
     })
     .await?
     else {
@@ -1330,7 +1325,7 @@ async fn custom_png_favicon_is_served_from_favicon_ico_route(
     };
 
     let response = server
-        .send_no_body(b"HEAD /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .send_no_body(b"HEAD /favicon.png HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await?;
 
     server.stop().await;
@@ -1352,7 +1347,8 @@ async fn custom_favicon_cannot_expose_runtime_private_file(
     std::fs::write(tmp.path().join("runtime/logs/private.png"), [1, 2, 3, 4])?;
 
     let Some(server) = start_server_with_config_or_skip(&site, |config| {
-        config.site.favicon = Some("runtime/logs/private.png".into());
+        config.site.favicon = "../runtime/logs/private.png".into();
+        config.site.enable_png_favicon = true;
     })
     .await?
     else {
@@ -1360,7 +1356,7 @@ async fn custom_favicon_cannot_expose_runtime_private_file(
     };
 
     let response = server
-        .send(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .send(b"GET /favicon.png HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await?;
 
     server.stop().await;
@@ -1376,13 +1372,13 @@ async fn custom_favicon_symlink_escape_is_rejected() -> Result<(), Box<dyn std::
     use std::os::unix::fs::symlink;
 
     let (tmp, site) = make_site(&[("index.html", b"ok")])?;
-    std::fs::create_dir_all(tmp.path().join("favicon"))?;
     let outside = tmp.path().join("outside.png");
     std::fs::write(&outside, [137, 80, 78, 71])?;
-    symlink(&outside, tmp.path().join("favicon/link.png"))?;
+    symlink(&outside, site.join("link.png"))?;
 
     let Some(server) = start_server_with_config_or_skip(&site, |config| {
-        config.site.favicon = Some("favicon/link.png".into());
+        config.site.favicon = "link.png".into();
+        config.site.enable_png_favicon = true;
     })
     .await?
     else {
@@ -1390,7 +1386,7 @@ async fn custom_favicon_symlink_escape_is_rejected() -> Result<(), Box<dyn std::
     };
 
     let response = server
-        .send(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .send(b"GET /favicon.png HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .await?;
 
     server.stop().await;

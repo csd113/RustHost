@@ -116,9 +116,9 @@ pub(crate) struct HandlerConfig {
 
 #[derive(Clone)]
 pub(crate) struct FaviconConfig {
-    pub(crate) custom_path: Option<PathBuf>,
+    pub(crate) path: PathBuf,
     pub(crate) site_root: Arc<Path>,
-    pub(crate) favicon_root: Arc<Path>,
+    pub(crate) enable_png: bool,
 }
 
 enum FaviconResolution {
@@ -811,27 +811,11 @@ fn resolve_favicon_request(path: &str, cfg: &FaviconConfig) -> FaviconResolution
         return FaviconResolution::NotFavicon;
     };
 
-    if let Some(custom_path) = cfg.custom_path.as_deref() {
-        match resolve_favicon_candidate(custom_path, requested_kind, cfg, true) {
-            FaviconResolution::NotFound => {}
-            other => return other,
-        }
+    if requested_kind == FaviconKind::Png && !cfg.enable_png {
+        return FaviconResolution::NotFound;
     }
 
-    let candidates = match requested_kind {
-        FaviconKind::Ico => vec![FaviconKind::Ico, FaviconKind::Png, FaviconKind::Svg],
-        specific => vec![specific],
-    };
-
-    for candidate in candidates {
-        let path = cfg.favicon_root.join(favicon_file_name(candidate));
-        match resolve_favicon_candidate(&path, requested_kind, cfg, false) {
-            FaviconResolution::NotFound => {}
-            other => return other,
-        }
-    }
-
-    FaviconResolution::NotFound
+    resolve_favicon_candidate(&cfg.path, requested_kind, cfg)
 }
 
 fn requested_favicon_kind(path: &str) -> Option<FaviconKind> {
@@ -843,19 +827,10 @@ fn requested_favicon_kind(path: &str) -> Option<FaviconKind> {
     }
 }
 
-const fn favicon_file_name(kind: FaviconKind) -> &'static str {
-    match kind {
-        FaviconKind::Ico => "favicon.ico",
-        FaviconKind::Png => "favicon.png",
-        FaviconKind::Svg => "favicon.svg",
-    }
-}
-
 fn resolve_favicon_candidate(
     candidate: &Path,
     requested_kind: FaviconKind,
     cfg: &FaviconConfig,
-    allow_ico_alias: bool,
 ) -> FaviconResolution {
     let resolved = match candidate.canonicalize() {
         Ok(path) => path,
@@ -879,16 +854,13 @@ fn resolve_favicon_candidate(
         return FaviconResolution::Forbidden;
     };
 
-    if !allow_ico_alias && extension_kind != requested_kind {
+    if requested_kind != extension_kind {
         return FaviconResolution::NotFound;
     }
-    if allow_ico_alias && requested_kind != FaviconKind::Ico && extension_kind != requested_kind {
+    if extension_kind == FaviconKind::Png && !cfg.enable_png {
         return FaviconResolution::NotFound;
     }
-
-    if !resolved.starts_with(cfg.site_root.as_ref())
-        && !resolved.starts_with(cfg.favicon_root.as_ref())
-    {
+    if !resolved.starts_with(cfg.site_root.as_ref()) {
         return FaviconResolution::Forbidden;
     }
 
@@ -1706,7 +1678,10 @@ fn response_size(resp: &Response<BoxBody>) -> Option<u64> {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{percent_decode, resolve_path, CustomErrorPage, Resolved};
+    use super::{
+        percent_decode, resolve_favicon_request, resolve_path, CustomErrorPage, FaviconConfig,
+        FaviconResolution, Resolved,
+    };
     use bytes::Bytes;
     use hyper::StatusCode;
     use std::path::Path;
@@ -1858,6 +1833,45 @@ mod tests {
             error_404_page: Some(Arc::clone(&page)),
         });
         assert_eq!(result, Resolved::CustomError(page));
+    }
+
+    #[test]
+    fn default_favicon_resolves_inside_site_root() {
+        let (_tmp, root) = make_test_tree();
+        let favicon = root.join("favicon.ico");
+        std::fs::write(&favicon, b"ico").expect("write favicon");
+        let cfg = FaviconConfig {
+            path: root.join("favicon.ico"),
+            site_root: Arc::from(root.as_path()),
+            enable_png: false,
+        };
+
+        assert!(matches!(
+            resolve_favicon_request("/favicon.ico", &cfg),
+            FaviconResolution::File(path) if path == favicon
+        ));
+    }
+
+    #[test]
+    fn png_favicon_requires_opt_in() {
+        let (_tmp, root) = make_test_tree();
+        std::fs::write(root.join("favicon.png"), b"png").expect("write favicon");
+        let mut cfg = FaviconConfig {
+            path: root.join("favicon.png"),
+            site_root: Arc::from(root.as_path()),
+            enable_png: false,
+        };
+
+        assert!(matches!(
+            resolve_favicon_request("/favicon.png", &cfg),
+            FaviconResolution::NotFound
+        ));
+
+        cfg.enable_png = true;
+        assert!(matches!(
+            resolve_favicon_request("/favicon.png", &cfg),
+            FaviconResolution::File(_)
+        ));
     }
 
     #[cfg(unix)]

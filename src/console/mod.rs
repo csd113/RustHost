@@ -138,6 +138,7 @@ async fn render(
         ConsoleMode::LogView => dashboard::render_log_view(config.console.show_timestamps),
         ConsoleMode::Help => dashboard::render_help(),
         ConsoleMode::ConfirmQuit => dashboard::render_confirm_quit(),
+        ConsoleMode::ShuttingDown => dashboard::render_shutdown(config.tor.enabled),
     };
 
     // Skip terminal I/O when the frame is unchanged to avoid needless redraws.
@@ -173,4 +174,21 @@ pub fn cleanup() {
         let _ = terminal::disable_raw_mode();
         let _ = writeln!(stdout());
     }
+}
+
+/// Replace the current frame with an explicit shutdown-in-progress message.
+pub fn show_shutdown_message(tor_enabled: bool) {
+    if !RAW_MODE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+
+    let output = dashboard::render_shutdown(tor_enabled);
+    let mut out = stdout();
+    let _ = execute!(
+        out,
+        cursor::MoveTo(0, 0),
+        terminal::Clear(terminal::ClearType::FromCursorDown)
+    );
+    let _ = out.write_all(output.as_bytes());
+    let _ = out.flush();
 }

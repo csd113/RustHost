@@ -161,14 +161,19 @@ fn validate(cfg: &Config) -> Result<()> {
     if let Some(error_503) = &cfg.site.error_503 {
         reject_parent_dir(error_503, "error_503", &mut errors);
     }
-    if let Some(favicon) = &cfg.site.favicon {
-        reject_parent_dir(favicon, "favicon", &mut errors);
-        let ext = std::path::Path::new(favicon)
+    if cfg.site.favicon.is_empty() {
+        errors.push("[site] favicon must not be empty".into());
+    } else {
+        reject_parent_dir(&cfg.site.favicon, "favicon", &mut errors);
+        let ext = std::path::Path::new(&cfg.site.favicon)
             .extension()
             .and_then(|ext| ext.to_str())
             .map(str::to_ascii_lowercase);
         if !matches!(ext.as_deref(), Some("ico" | "png" | "svg")) {
             errors.push("[site] favicon must end in .ico, .png, or .svg".into());
+        }
+        if matches!(ext.as_deref(), Some("png")) && !cfg.site.enable_png_favicon {
+            errors.push("[site] enable_png_favicon must be true when favicon ends in .png".into());
         }
     }
 
@@ -417,7 +422,7 @@ mod tests {
     #[test]
     fn validate_favicon_traversal() {
         let mut cfg = valid();
-        cfg.site.favicon = Some("../settings.toml".into());
+        cfg.site.favicon = "../settings.toml".into();
         let result = validate(&cfg);
         assert!(
             matches!(&result, Err(AppError::ConfigValidation(e))
@@ -429,13 +434,28 @@ mod tests {
     #[test]
     fn validate_favicon_extension() {
         let mut cfg = valid();
-        cfg.site.favicon = Some("favicon/icon.txt".into());
+        cfg.site.favicon = "favicon/icon.txt".into();
         let result = validate(&cfg);
         assert!(
             matches!(&result, Err(AppError::ConfigValidation(e))
                 if e.iter().any(|s| s.contains("favicon must end in"))),
             "expected ConfigValidation error mentioning favicon extension, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn validate_png_favicon_requires_opt_in() {
+        let mut cfg = valid();
+        cfg.site.favicon = "favicon.png".into();
+        let result = validate(&cfg);
+        assert!(
+            matches!(&result, Err(AppError::ConfigValidation(e))
+                if e.iter().any(|s| s.contains("enable_png_favicon"))),
+            "expected ConfigValidation error mentioning enable_png_favicon, got: {result:?}"
+        );
+
+        cfg.site.enable_png_favicon = true;
+        assert!(validate(&cfg).is_ok());
     }
 
     // ── validate — [identity] instance_name ──────────────────────────────────
@@ -523,6 +543,8 @@ csp_level = "off"
 [site]
 directory = "site"
 index_file = "index.html"
+favicon = "favicon.ico"
+enable_png_favicon = false
 enable_directory_listing = false
 
 [tor]

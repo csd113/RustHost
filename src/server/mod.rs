@@ -93,8 +93,6 @@ impl ServerContext {
         };
         let max_conns = config.server.max_connections as usize;
         let site_dir = data_dir.join(&config.site.directory);
-        let favicon_dir = data_dir.join("favicon");
-        let favicon_root = favicon_dir.canonicalize().unwrap_or(favicon_dir);
         let error_404_page = config.site.error_404.as_deref().and_then(|p| {
             handler::load_custom_error_page(
                 canonical_root.as_ref(),
@@ -114,9 +112,9 @@ impl ServerContext {
         Some(Self {
             canonical_root: Arc::clone(&canonical_root),
             favicon: Arc::new(handler::FaviconConfig {
-                custom_path: config.site.favicon.as_ref().map(|path| data_dir.join(path)),
+                path: site_dir.join(&config.site.favicon),
                 site_root: Arc::clone(&canonical_root),
-                favicon_root: Arc::from(favicon_root.as_path()),
+                enable_png: config.site.enable_png_favicon,
             }),
             index_file: Arc::from(config.site.index_file.as_str()),
             csp_header: Arc::from(config.server.csp_level.as_header_value()),
