@@ -39,9 +39,16 @@ pub struct RedirectServerConfig {
 }
 
 enum ReadOutcome {
-    Ready { path: String, host: Option<String> },
+    Ready { path: String, host: HostHeader },
     HeaderTooLarge,
     Malformed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostHeader {
+    Missing,
+    Valid(String),
+    Invalid,
 }
 
 /// Bind a plain-HTTP listener on `bind_addr:http_port` and redirect every
@@ -196,7 +203,7 @@ async fn handle_redirect_connection(
         // the write below. Rust's borrow checker requires this.
         let mut reader = BufReader::new(&mut *stream);
         let mut total = 0usize;
-        let mut host: Option<String> = None;
+        let mut host = HostHeader::Missing;
 
         let mut request_line = String::new();
         match reader.read_line(&mut request_line).await {
@@ -232,7 +239,10 @@ async fn handle_redirect_connection(
                     }
                     if let Some((name, value)) = trimmed.split_once(':') {
                         if name.eq_ignore_ascii_case("host") {
-                            host = parse_host_header(value);
+                            host = match (&host, parse_host_header(value)) {
+                                (HostHeader::Missing, Ok(parsed)) => HostHeader::Valid(parsed),
+                                _ => HostHeader::Invalid,
+                            };
                         }
                     }
                 }
@@ -297,7 +307,7 @@ fn sanitize_path(raw: &str) -> String {
     }
 }
 
-fn parse_host_header(raw: &str) -> Option<String> {
+fn parse_host_header(raw: &str) -> Result<String, ()> {
     let host = raw.trim();
     if host.is_empty()
         || !host.is_ascii()
@@ -305,31 +315,26 @@ fn parse_host_header(raw: &str) -> Option<String> {
             .chars()
             .any(|c| c.is_ascii_control() || matches!(c, '/' | '\\' | '@'))
     {
-        return None;
+        return Err(());
     }
 
     if host.starts_with('[') {
-        let end = host.find(']')?;
+        let end = host.find(']').ok_or(())?;
         let core = &host[1..end];
         let remainder = &host[end.saturating_add(1)..];
-        if !(remainder.is_empty()
-            || remainder.starts_with(':')
-                && remainder.get(1..).is_some_and(|port| {
-                    !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
-                }))
-        {
-            return None;
+        if !remainder.is_empty() {
+            let Some(port) = remainder.strip_prefix(':') else {
+                return Err(());
+            };
+            parse_host_port(port)?;
         }
-        let ip = core.parse::<std::net::Ipv6Addr>().ok()?;
-        return Some(format!("[{ip}]"));
+        let ip = core.parse::<std::net::Ipv6Addr>().map_err(|_| ())?;
+        return Ok(format!("[{ip}]"));
     }
 
     let name = match host.rsplit_once(':') {
-        Some((candidate, port))
-            if !candidate.contains(':')
-                && !port.is_empty()
-                && port.chars().all(|c| c.is_ascii_digit()) =>
-        {
+        Some((candidate, port)) if !candidate.contains(':') => {
+            parse_host_port(port)?;
             candidate
         }
         _ => host,
@@ -340,22 +345,37 @@ fn parse_host_header(raw: &str) -> Option<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
     {
-        return None;
+        return Err(());
     }
 
     if let Ok(ip) = name.parse::<std::net::Ipv4Addr>() {
-        return Some(ip.to_string());
+        return Ok(ip.to_string());
     }
 
-    Some(name.trim_end_matches('.').to_ascii_lowercase())
+    Ok(name.trim_end_matches('.').to_ascii_lowercase())
+}
+
+fn parse_host_port(raw: &str) -> Result<u16, ()> {
+    if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_digit()) {
+        return Err(());
+    }
+    let port = raw.parse::<u16>().map_err(|_| ())?;
+    if port == 0 {
+        return Err(());
+    }
+    Ok(port)
 }
 
 fn validated_redirect_host(
-    host: Option<String>,
+    host: HostHeader,
     bind_addr: IpAddr,
     allowed_hosts: &[String],
 ) -> Result<String, ()> {
-    let candidate = host.unwrap_or_else(|| redirect_host_for(bind_addr));
+    let candidate = match host {
+        HostHeader::Missing => redirect_host_for(bind_addr),
+        HostHeader::Valid(host) => host,
+        HostHeader::Invalid => return Err(()),
+    };
     if allowed_hosts.iter().any(|allowed| allowed == &candidate) {
         Ok(candidate)
     } else {
@@ -387,7 +407,9 @@ async fn write_status_response(
 mod tests {
     use std::net::IpAddr;
 
-    use super::{parse_host_header, redirect_host_for, sanitize_path, validated_redirect_host};
+    use super::{
+        parse_host_header, redirect_host_for, sanitize_path, validated_redirect_host, HostHeader,
+    };
 
     #[test]
     fn redirect_host_for_unspecified_ipv4_uses_loopback() {
@@ -416,18 +438,39 @@ mod tests {
     fn sanitize_host_header_strips_default_port() {
         assert_eq!(
             parse_host_header("example.com:80"),
-            Some("example.com".to_owned())
+            Ok("example.com".to_owned())
         );
     }
 
     #[test]
     fn sanitize_host_header_rejects_path_injection() {
-        assert_eq!(parse_host_header("example.com/path"), None);
+        assert_eq!(parse_host_header("example.com/path"), Err(()));
     }
 
     #[test]
     fn sanitize_host_header_rejects_userinfo() {
-        assert_eq!(parse_host_header("evil.com@legit.com"), None);
+        assert_eq!(parse_host_header("evil.com@legit.com"), Err(()));
+    }
+
+    #[test]
+    fn sanitize_host_header_rejects_invalid_ports() {
+        for host in [
+            "example.com:abc",
+            "example.com:65536",
+            "[::1]:bad",
+            "[::1]:0",
+        ] {
+            assert_eq!(parse_host_header(host), Err(()), "host={host}");
+        }
+    }
+
+    #[test]
+    fn sanitize_host_header_accepts_loopback_with_valid_port() {
+        assert_eq!(
+            parse_host_header("127.0.0.1:8080"),
+            Ok("127.0.0.1".to_owned())
+        );
+        assert_eq!(parse_host_header("[::1]:8080"), Ok("[::1]".to_owned()));
     }
 
     #[test]
@@ -435,7 +478,7 @@ mod tests {
         let allowed = vec!["example.com".to_owned()];
         assert_eq!(
             validated_redirect_host(
-                Some("example.com".into()),
+                HostHeader::Valid("example.com".into()),
                 IpAddr::from([127, 0, 0, 1]),
                 &allowed
             ),
@@ -448,10 +491,20 @@ mod tests {
         let allowed = vec!["localhost".to_owned()];
         assert_eq!(
             validated_redirect_host(
-                Some("attacker.example".into()),
+                HostHeader::Valid("attacker.example".into()),
                 IpAddr::from([127, 0, 0, 1]),
                 &allowed
             ),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn invalid_host_header_never_falls_back_to_loopback() {
+        let allowed = vec!["127.0.0.1".to_owned()];
+
+        assert_eq!(
+            validated_redirect_host(HostHeader::Invalid, IpAddr::from([127, 0, 0, 1]), &allowed),
             Err(())
         );
     }

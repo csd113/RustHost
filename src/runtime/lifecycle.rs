@@ -99,9 +99,9 @@ pub async fn run(args: CliArgs) -> Result<()> {
 
     if !settings_path.exists() {
         let install_kind = detect_install_kind(&data_dir);
-        first_run_setup(&data_dir, &settings_path, install_kind)?;
+        first_run_setup(&data_dir, &settings_path, install_kind, args.headless)?;
     }
-    normal_run(data_dir, &settings_path).await?;
+    normal_run(data_dir, &settings_path, args.headless).await?;
     Ok(())
 }
 
@@ -217,7 +217,12 @@ fn detect_install_kind(data_dir: &Path) -> InstallKind {
     }
 }
 
-fn first_run_setup(data_dir: &Path, settings_path: &Path, install_kind: InstallKind) -> Result<()> {
+fn first_run_setup(
+    data_dir: &Path,
+    settings_path: &Path,
+    install_kind: InstallKind,
+    headless: bool,
+) -> Result<()> {
     std::fs::create_dir_all(data_dir.join("site"))?;
     std::fs::create_dir_all(runtime_root(data_dir))?;
 
@@ -226,6 +231,36 @@ fn first_run_setup(data_dir: &Path, settings_path: &Path, install_kind: InstallK
     let placeholder = data_dir.join("site/index.html");
     if !placeholder.exists() {
         std::fs::write(&placeholder, PLACEHOLDER_HTML)?;
+    }
+
+    if headless {
+        let mut stdout = std::io::stdout();
+        match install_kind {
+            InstallKind::Fresh => {
+                writeln!(stdout, "RustHost initialized data directory")?;
+                writeln!(
+                    stdout,
+                    "Created default config: {}",
+                    settings_path.display()
+                )?;
+            }
+            InstallKind::RegeneratedSettings => {
+                writeln!(stdout, "RustHost regenerated missing settings.toml")?;
+                writeln!(stdout, "Regenerated config: {}", settings_path.display())?;
+            }
+        }
+        writeln!(
+            stdout,
+            "Site directory: {}",
+            data_dir.join("site").display()
+        )?;
+        writeln!(
+            stdout,
+            "Runtime directory: {}",
+            runtime_root(data_dir).display()
+        )?;
+        writeln!(stdout, "Starting server now...")?;
+        return Ok(());
     }
 
     let mut stdout = std::io::stdout();
@@ -278,9 +313,30 @@ fn first_run_setup(data_dir: &Path, settings_path: &Path, install_kind: InstallK
 
 // ─── Normal Run ──────────────────────────────────────────────────────────────
 
-async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
-    let config = Arc::new(config::loader::load(settings_path)?);
+async fn normal_run(data_dir: PathBuf, settings_path: &Path, headless: bool) -> Result<()> {
+    let mut config = config::loader::load(settings_path)?;
+    let mode = managed_runner_mode(headless, &config);
+    apply_managed_runtime_mode(&mut config, mode);
+    let config = Arc::new(config);
     normal_run_with_config(data_dir, config).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedRunnerMode {
+    Interactive,
+    Headless,
+}
+
+const fn managed_runner_mode(headless: bool, config: &Config) -> ManagedRunnerMode {
+    if headless || !config.console.interactive {
+        ManagedRunnerMode::Headless
+    } else {
+        ManagedRunnerMode::Interactive
+    }
+}
+
+const fn apply_managed_runtime_mode(config: &mut Config, mode: ManagedRunnerMode) {
+    config.console.interactive = matches!(mode, ManagedRunnerMode::Interactive);
 }
 
 // ─── Extracted helpers for normal_run_with_config ─────────────────────────────
@@ -810,10 +866,53 @@ const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
 #[cfg(test)]
 mod tests {
     use super::{
-        detect_install_kind, ensure_data_directories, first_run_setup, uses_redirect_public_http,
-        InstallKind,
+        apply_managed_runtime_mode, detect_install_kind, ensure_data_directories, first_run_setup,
+        managed_runner_mode, uses_redirect_public_http, InstallKind, ManagedRunnerMode,
     };
     use crate::config::Config;
+
+    #[test]
+    fn headless_cli_selects_headless_managed_runner() {
+        let mut config = Config::default();
+        config.console.interactive = true;
+
+        assert_eq!(
+            managed_runner_mode(true, &config),
+            ManagedRunnerMode::Headless
+        );
+    }
+
+    #[test]
+    fn default_interactive_config_selects_interactive_managed_runner() {
+        let mut config = Config::default();
+        config.console.interactive = true;
+
+        assert_eq!(
+            managed_runner_mode(false, &config),
+            ManagedRunnerMode::Interactive
+        );
+    }
+
+    #[test]
+    fn config_can_disable_interactive_managed_runner_without_cli_flag() {
+        let mut config = Config::default();
+        config.console.interactive = false;
+
+        assert_eq!(
+            managed_runner_mode(false, &config),
+            ManagedRunnerMode::Headless
+        );
+    }
+
+    #[test]
+    fn applying_headless_managed_runner_disables_console_interactivity() {
+        let mut config = Config::default();
+        config.console.interactive = true;
+
+        apply_managed_runtime_mode(&mut config, ManagedRunnerMode::Headless);
+
+        assert!(!config.console.interactive);
+    }
 
     #[test]
     fn redirect_http_replaces_public_plain_http_only_when_tls_is_enabled() {
@@ -831,7 +930,7 @@ mod tests {
         let data_dir = tmp.path().join("rusthost-data");
         let settings = data_dir.join("settings.toml");
 
-        first_run_setup(&data_dir, &settings, InstallKind::Fresh)?;
+        first_run_setup(&data_dir, &settings, InstallKind::Fresh, false)?;
 
         assert!(data_dir.join("site").is_dir());
         assert!(data_dir.join("runtime").is_dir());

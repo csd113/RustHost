@@ -1563,12 +1563,32 @@ async fn redirect_server_rejects_malformed_host_forms() -> Result<(), Box<dyn st
     let (shutdown_tx, handle, addr) =
         start_redirect_server(plain_port, 8443, vec!["localhost".into(), "[::1]".into()]).await?;
 
-    for host in ["evil.com@legit.com", "[::1:8443"] {
+    for host in [
+        "evil.com@legit.com",
+        "example.com:abc",
+        "[::1]:bad",
+        "[::1:8443",
+        "http://localhost",
+        "localhost/path",
+        "localhost\\path",
+        "localhost:65536",
+        "localhost:0",
+    ] {
         let mut stream = TcpStream::connect(addr).await?;
         let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
         stream.write_all(request.as_bytes()).await?;
         let response = read_headers_only(&mut stream).await?;
+        let response_text = response_to_str(&response)?;
         assert_eq!(status_code(&response)?, 400, "host={host}");
+        assert_eq!(header_value(&response, "location")?, None, "host={host}");
+        assert!(
+            !response_text.contains("https://127.0.0.1:8443/"),
+            "host={host}; response={response_text}"
+        );
+        assert!(
+            !response_text.contains("https://localhost:8443/"),
+            "host={host}; response={response_text}"
+        );
     }
 
     let _ = shutdown_tx.send(true);
