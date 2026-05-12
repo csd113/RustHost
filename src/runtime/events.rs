@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::{
     config::Config,
     console::menu::MenuOpenTarget,
+    console::menu::{self, DoctorContext, DoctorLiveState, Page},
     runtime::state::{AppState, ConsoleMode, SharedMetrics, SharedState, StatusMessage},
     server, Result,
 };
@@ -18,6 +19,7 @@ pub enum KeyEvent {
     Help,
     Menu,
     Reload,
+    RunDoctorDeep,
     Open,
     ToggleLogs,
     NavigateUp,
@@ -132,17 +134,7 @@ fn handle_console_state(event: KeyEvent, state: &mut AppState) -> bool {
         }
         KeyEvent::OpenSelected => {
             if state.console_mode == ConsoleMode::Menu {
-                match state.menu.open_selected() {
-                    MenuOpenTarget::Dashboard => {
-                        state.menu.leave();
-                        state.console_mode = ConsoleMode::Dashboard;
-                    }
-                    MenuOpenTarget::LogView => {
-                        state.menu.leave();
-                        state.console_mode = ConsoleMode::LogView;
-                    }
-                    MenuOpenTarget::Page(_page) => {}
-                }
+                handle_menu_open_selected(state);
             }
         }
         KeyEvent::Confirm => {
@@ -188,10 +180,119 @@ fn handle_console_state(event: KeyEvent, state: &mut AppState) -> bool {
                 state.console_mode = ConsoleMode::Dashboard;
             }
         }
-        KeyEvent::ForceQuit | KeyEvent::Reload | KeyEvent::Open => {}
+        KeyEvent::ForceQuit | KeyEvent::Reload | KeyEvent::RunDoctorDeep | KeyEvent::Open => {}
     }
 
     false
+}
+
+fn handle_menu_open_selected(state: &mut AppState) {
+    if state.menu.active_page() == Some(Page::Doctor) {
+        state.menu.toggle_doctor_section();
+        return;
+    }
+    match state.menu.open_selected() {
+        MenuOpenTarget::Dashboard => {
+            state.menu.leave();
+            state.console_mode = ConsoleMode::Dashboard;
+        }
+        MenuOpenTarget::LogView => {
+            state.menu.leave();
+            state.console_mode = ConsoleMode::LogView;
+        }
+        MenuOpenTarget::Page(_page) => {}
+    }
+}
+
+const fn live_doctor_state(state: &AppState) -> DoctorLiveState {
+    DoctorLiveState {
+        server_running: state.server_running,
+        actual_port: state.actual_port,
+        tls_running: state.tls_running,
+        tls_port: state.tls_port,
+    }
+}
+
+fn run_tui_fast_doctor(
+    config: &Config,
+    data_dir: &std::path::Path,
+    settings_path: Option<&std::path::Path>,
+    live: DoctorLiveState,
+) -> menu::DoctorReport {
+    let mut report = settings_path.map_or_else(
+        || {
+            menu::doctor::run_fast_doctor_for_loaded_config(
+                data_dir,
+                None,
+                config,
+                DoctorContext::TuiLive(live),
+            )
+        },
+        |settings_path| {
+            menu::doctor::run_fast_doctor(data_dir, settings_path, DoctorContext::TuiLive(live))
+        },
+    );
+    menu::doctor::append_deep_checks(&mut report, menu::doctor::deep_checks_not_run_section());
+    menu::doctor::write_doctor_log(&mut report);
+    report
+}
+
+async fn handle_doctor_page_event(
+    event: KeyEvent,
+    config: &Config,
+    state: SharedState,
+    data_dir: &std::path::Path,
+    settings_path: Option<&std::path::Path>,
+) -> Option<bool> {
+    let live = {
+        let snapshot = state.read().await;
+        if snapshot.console_mode != ConsoleMode::Menu
+            || snapshot.menu.active_page() != Some(Page::Doctor)
+        {
+            return None;
+        }
+        let live = live_doctor_state(&snapshot);
+        drop(snapshot);
+        live
+    };
+
+    match event {
+        KeyEvent::Reload => {
+            let report = run_tui_fast_doctor(config, data_dir, settings_path, live);
+            state.write().await.menu.set_doctor_report(report);
+            Some(false)
+        }
+        KeyEvent::RunDoctorDeep => {
+            let deep = menu::doctor::run_deep_checks(config, data_dir, live);
+            let needs_report = {
+                let snapshot = state.read().await;
+                let needs_report = snapshot.menu.doctor().report().is_none();
+                drop(snapshot);
+                needs_report
+            };
+            let seed_report = if needs_report {
+                Some(run_tui_fast_doctor(config, data_dir, settings_path, live))
+            } else {
+                None
+            };
+            let mut snapshot = state.write().await;
+            if let Some(report) = seed_report {
+                snapshot.menu.set_doctor_report(report);
+            }
+            if let Some(existing) = snapshot.menu.doctor().report().cloned() {
+                let mut report = existing;
+                menu::doctor::append_deep_checks(&mut report, deep);
+                snapshot.menu.set_doctor_report(report);
+            }
+            drop(snapshot);
+            Some(false)
+        }
+        KeyEvent::OpenSelected => {
+            state.write().await.menu.toggle_doctor_section();
+            Some(false)
+        }
+        _ => None,
+    }
 }
 
 /// Dispatch a single key event, mutating shared state as needed.
@@ -214,8 +315,21 @@ pub async fn handle(
     state: SharedState,
     _metrics: SharedMetrics,
     data_dir: PathBuf,
+    settings_path: Option<PathBuf>,
     root_tx: &tokio::sync::watch::Sender<std::sync::Arc<std::path::Path>>,
 ) -> Result<bool> {
+    if let Some(quit) = handle_doctor_page_event(
+        event,
+        config,
+        Arc::clone(&state),
+        &data_dir,
+        settings_path.as_deref(),
+    )
+    .await
+    {
+        return Ok(quit);
+    }
+
     match event {
         KeyEvent::ForceQuit => return Ok(true),
         KeyEvent::Reload => {
@@ -239,7 +353,17 @@ pub async fn handle(
         }
         state_event => {
             let mut snapshot = state.write().await;
-            return Ok(handle_console_state(state_event, &mut snapshot));
+            let quit = handle_console_state(state_event, &mut snapshot);
+            let should_initialize_doctor = snapshot.console_mode == ConsoleMode::Menu
+                && snapshot.menu.active_page() == Some(Page::Doctor)
+                && snapshot.menu.doctor().report().is_none();
+            let live = live_doctor_state(&snapshot);
+            drop(snapshot);
+            if should_initialize_doctor {
+                let report = run_tui_fast_doctor(config, &data_dir, settings_path.as_deref(), live);
+                state.write().await.menu.set_doctor_report(report);
+            }
+            return Ok(quit);
         }
     }
 
@@ -271,6 +395,7 @@ mod tests {
             state,
             Arc::new(Metrics::new()),
             data_dir,
+            None,
             root_tx,
         )
         .await
@@ -294,6 +419,7 @@ mod tests {
             Arc::clone(&state),
             metrics,
             data_dir,
+            None,
             &root_tx,
         )
         .await
@@ -324,6 +450,7 @@ mod tests {
             Arc::clone(&state),
             metrics,
             tmp.path().to_path_buf(),
+            None,
             &root_tx,
         )
         .await

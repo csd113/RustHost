@@ -1,6 +1,11 @@
 use std::fmt::Write as _;
 
-use super::{pages::Page, state::pulse_visible, MenuState};
+use super::{
+    doctor::{status_style_label, DoctorStatus},
+    pages::Page,
+    state::pulse_visible,
+    MenuState,
+};
 
 const RULE: &str = "──────────────────────────────────────────────────────────";
 
@@ -16,10 +21,10 @@ fn bold(s: &str) -> String {
 pub fn render(state: &MenuState) -> String {
     state
         .active_page()
-        .map_or_else(|| render_index(*state), render_page)
+        .map_or_else(|| render_index(state), |page| render_page(page, state))
 }
 
-fn render_index(state: MenuState) -> String {
+fn render_index(state: &MenuState) -> String {
     let selected_page = state.selected_page();
     let mut out = String::with_capacity(512);
     let _ = writeln!(out, "RustHost Menu\r");
@@ -45,7 +50,11 @@ fn render_index(state: MenuState) -> String {
     out
 }
 
-fn render_page(page: Page) -> String {
+fn render_page(page: Page, state: &MenuState) -> String {
+    if page == Page::Doctor {
+        return render_doctor(state);
+    }
+
     let mut out = String::with_capacity(512);
     let _ = writeln!(out, "{RULE}\r");
     let _ = writeln!(out, " {}\r", bold(page.label()));
@@ -61,6 +70,61 @@ fn render_page(page: Page) -> String {
     out.push_str("[Esc] Back\r\n");
     let _ = writeln!(out, "{RULE}\r");
     out
+}
+
+fn render_doctor(state: &MenuState) -> String {
+    let mut out = String::with_capacity(2_048);
+    let _ = writeln!(out, "{RULE}\r");
+    let _ = writeln!(out, " {}\r", bold("Doctor"));
+    let _ = writeln!(out, "{RULE}\r");
+    out.push_str("\r\n");
+
+    let doctor = state.doctor();
+    if let Some(report) = doctor.report() {
+        for (index, section) in report.sections().iter().enumerate() {
+            let marker = if index == doctor.selected_section() {
+                bold(">")
+            } else {
+                " ".to_owned()
+            };
+            let status = color_status(section.summary_status());
+            let _ = writeln!(out, "{marker} {:<12} {status}\r", section.name());
+
+            if doctor.expanded_section() == Some(index) {
+                for check in section.checks() {
+                    let status = color_status(check.status());
+                    let _ = writeln!(out, "    {:<7} {}\r", status, check.message());
+                }
+            }
+        }
+
+        out.push_str("\r\n");
+        let result = if report.has_failures() {
+            color_status(DoctorStatus::Fail)
+        } else {
+            color_status(DoctorStatus::Pass)
+        };
+        let message = if report.has_failures() {
+            "RustHost is not ready to start."
+        } else {
+            "RustHost appears ready to start."
+        };
+        let _ = writeln!(out, "Result: {result} {message}\r");
+    } else {
+        out.push_str("Doctor report has not run yet.\r\n");
+    }
+
+    out.push_str("\r\n");
+    let _ = writeln!(out, "{RULE}\r");
+    out.push_str("[R] Re-run fast checks  [D] Run deep checks  [Enter] Expand/collapse\r\n");
+    out.push_str("[↑↓/jk] Navigate sections  [Esc] Back  [Q] Quit\r\n");
+    let _ = writeln!(out, "{RULE}\r");
+    out
+}
+
+fn color_status(status: DoctorStatus) -> String {
+    let (label, color) = status_style_label(status);
+    format!("{color}{label}\x1b[0m")
 }
 
 #[cfg(test)]
@@ -89,11 +153,8 @@ mod tests {
         let output = render(&state);
 
         assert!(output.contains("Doctor"));
-        assert!(
-            output.contains("Check config, paths, ports, TLS, Tor, favicon, and runtime safety.")
-        );
-        assert!(output.contains("This page is not implemented yet."));
+        assert!(output.contains("Doctor report has not run yet."));
         assert!(output.contains("[Esc] Back"));
-        assert!(!output.contains("[Q] Quit"));
+        assert!(output.contains("[Q] Quit"));
     }
 }

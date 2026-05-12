@@ -38,6 +38,7 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyCode::Char('h' | 'H') => KeyEvent::Help,
         KeyCode::Char('m' | 'M') => KeyEvent::Menu,
         KeyCode::Char('r' | 'R') => KeyEvent::Reload,
+        KeyCode::Char('d' | 'D') => KeyEvent::RunDoctorDeep,
         KeyCode::Char('o' | 'O') => KeyEvent::Open,
         KeyCode::Char('l' | 'L') => KeyEvent::ToggleLogs,
         KeyCode::Up | KeyCode::Char('k' | 'K') => KeyEvent::NavigateUp,

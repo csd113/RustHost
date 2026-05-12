@@ -58,6 +58,18 @@ pub struct CliArgs {
     pub headless: bool,
 }
 
+/// Resolve the data directory and settings path using the same precedence as
+/// production startup.
+#[must_use]
+pub fn resolve_config_paths(args: &CliArgs) -> (PathBuf, PathBuf) {
+    let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
+    let settings_path = args
+        .config_path
+        .clone()
+        .unwrap_or_else(|| data_dir.join("settings.toml"));
+    (data_dir, settings_path)
+}
+
 // ─── Shared connection budget ─────────────────────────────────────────────────
 
 /// Shared connection-budget state passed to both HTTP and HTTPS listeners so
@@ -91,11 +103,7 @@ pub async fn run(args: CliArgs) -> Result<()> {
 
     // data_dir is computed exactly once and threaded everywhere. A CLI
     // override takes precedence; the default is relative to current_exe().
-    let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
-
-    let settings_path = args
-        .config_path
-        .unwrap_or_else(|| data_dir.join("settings.toml"));
+    let (data_dir, settings_path) = resolve_config_paths(&args);
 
     if !settings_path.exists() {
         let install_kind = detect_install_kind(&data_dir);
@@ -176,7 +184,7 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
         tls: crate::config::TlsConfig::default(),
     });
 
-    normal_run_with_config(data_dir, config).await
+    normal_run_with_config(data_dir, None, config).await
 }
 
 /// Compute the default data directory (`<exe-dir>/rusthost-data/`).
@@ -318,7 +326,7 @@ async fn normal_run(data_dir: PathBuf, settings_path: &Path, headless: bool) -> 
     let mode = managed_runner_mode(headless, &config);
     apply_managed_runtime_mode(&mut config, mode);
     let config = Arc::new(config);
-    normal_run_with_config(data_dir, config).await
+    normal_run_with_config(data_dir, Some(settings_path.to_path_buf()), config).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,7 +388,11 @@ fn schedule_initial_site_scan(config: &Arc<Config>, state: &SharedState, data_di
     clippy::too_many_lines,
     reason = "Startup wiring intentionally centralizes subsystem initialization."
 )]
-async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Result<()> {
+async fn normal_run_with_config(
+    data_dir: PathBuf,
+    settings_path: Option<PathBuf>,
+    config: Arc<Config>,
+) -> Result<()> {
     ensure_data_directories(&data_dir)?;
 
     // 2. Initialise logging.
@@ -530,7 +542,16 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     state.write().await.runtime_ready = true;
 
     // 10. Event dispatch loop.
-    event_loop(key_rx, &config, &state, &metrics, data_dir, root_tx).await?;
+    event_loop(
+        key_rx,
+        &config,
+        &state,
+        &metrics,
+        data_dir,
+        settings_path,
+        root_tx,
+    )
+    .await?;
 
     state.write().await.runtime_ready = false;
 
@@ -734,6 +755,7 @@ async fn event_loop(
     state: &SharedState,
     metrics: &SharedMetrics,
     data_dir: PathBuf,
+    settings_path: Option<PathBuf>,
     root_tx: watch::Sender<Arc<std::path::Path>>,
 ) -> Result<()> {
     // 2.8 — mutable so we can set to None when the channel closes.
@@ -801,6 +823,7 @@ async fn event_loop(
                         Arc::clone(state),
                         Arc::clone(metrics),
                         data_dir.clone(),
+                        settings_path.clone(),
                         &root_tx,
                     ).await?;
                     if quit { break; }

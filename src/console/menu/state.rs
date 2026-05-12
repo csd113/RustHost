@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::Page;
+use super::{doctor::DoctorReport, Page};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuOpenTarget {
@@ -9,10 +9,86 @@ pub enum MenuOpenTarget {
     Page(Page),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuState {
     selected: usize,
     active_page: Option<Page>,
+    doctor: DoctorPageState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorPageState {
+    selected_section: usize,
+    expanded_section: Option<usize>,
+    report: Option<DoctorReport>,
+}
+
+impl DoctorPageState {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            selected_section: 0,
+            expanded_section: None,
+            report: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn selected_section(&self) -> usize {
+        self.selected_section
+    }
+
+    #[must_use]
+    pub const fn expanded_section(&self) -> Option<usize> {
+        self.expanded_section
+    }
+
+    #[must_use]
+    pub const fn report(&self) -> Option<&DoctorReport> {
+        self.report.as_ref()
+    }
+
+    pub fn set_report(&mut self, report: DoctorReport) {
+        let section_count = report.sections().len();
+        self.selected_section = clamp_section(self.selected_section, section_count);
+        self.report = Some(report);
+    }
+
+    pub fn move_up(&mut self) {
+        let section_count = self.report.as_ref().map_or(0, |r| r.sections().len());
+        if section_count == 0 {
+            self.selected_section = 0;
+            return;
+        }
+        self.selected_section = if self.selected_section == 0 {
+            section_count - 1
+        } else {
+            self.selected_section - 1
+        };
+    }
+
+    pub fn move_down(&mut self) {
+        let section_count = self.report.as_ref().map_or(0, |r| r.sections().len());
+        if section_count == 0 {
+            self.selected_section = 0;
+            return;
+        }
+        self.selected_section = (self.selected_section + 1) % section_count;
+    }
+
+    pub fn toggle_expanded(&mut self) {
+        self.expanded_section = if self.expanded_section == Some(self.selected_section) {
+            None
+        } else {
+            Some(self.selected_section)
+        };
+    }
+}
+
+impl Default for DoctorPageState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MenuState {
@@ -21,26 +97,27 @@ impl MenuState {
         Self {
             selected: 0,
             active_page: None,
+            doctor: DoctorPageState::new(),
         }
     }
 
     #[must_use]
-    pub const fn selected_index(self) -> usize {
+    pub const fn selected_index(&self) -> usize {
         self.selected
     }
 
     #[must_use]
-    pub fn selected_page(self) -> Page {
+    pub fn selected_page(&self) -> Page {
         Page::ALL.get(self.selected).copied().unwrap_or(Page::Home)
     }
 
     #[must_use]
-    pub const fn active_page(self) -> Option<Page> {
+    pub const fn active_page(&self) -> Option<Page> {
         self.active_page
     }
 
     #[must_use]
-    pub const fn has_active_page(self) -> bool {
+    pub const fn has_active_page(&self) -> bool {
         self.active_page.is_some()
     }
 
@@ -52,7 +129,11 @@ impl MenuState {
         self.active_page = None;
     }
 
-    pub const fn move_up(&mut self) {
+    pub fn move_up(&mut self) {
+        if matches!(self.active_page, Some(Page::Doctor)) {
+            self.doctor.move_up();
+            return;
+        }
         if self.has_active_page() {
             return;
         }
@@ -64,7 +145,11 @@ impl MenuState {
         };
     }
 
-    pub const fn move_down(&mut self) {
+    pub fn move_down(&mut self) {
+        if matches!(self.active_page, Some(Page::Doctor)) {
+            self.doctor.move_down();
+            return;
+        }
         if self.has_active_page() {
             return;
         }
@@ -89,6 +174,21 @@ impl MenuState {
     pub const fn back(&mut self) -> bool {
         self.active_page.take().is_some()
     }
+
+    #[must_use]
+    pub const fn doctor(&self) -> &DoctorPageState {
+        &self.doctor
+    }
+
+    pub fn set_doctor_report(&mut self, report: DoctorReport) {
+        self.doctor.set_report(report);
+    }
+
+    pub fn toggle_doctor_section(&mut self) {
+        if matches!(self.active_page, Some(Page::Doctor)) {
+            self.doctor.toggle_expanded();
+        }
+    }
 }
 
 impl Default for MenuState {
@@ -102,6 +202,14 @@ pub fn pulse_visible() -> bool {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(true, |duration| (duration.as_millis() / 700) % 2 == 0)
+}
+
+const fn clamp_section(selected: usize, section_count: usize) -> usize {
+    if section_count == 0 || selected < section_count {
+        selected
+    } else {
+        section_count - 1
+    }
 }
 
 #[cfg(test)]
