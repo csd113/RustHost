@@ -646,6 +646,7 @@ async fn start_console(
             Arc::clone(state),
             Arc::clone(metrics),
             shutdown,
+            data_dir.to_path_buf(),
         )?;
         Ok(Some(rx))
     } else {

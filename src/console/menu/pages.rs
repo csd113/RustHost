@@ -3,11 +3,11 @@ pub enum Page {
     Home,
     Logs,
     Doctor,
+    Diagnostics,
     Tor,
     Network,
     Site,
     Settings,
-    Diagnostics,
     Help,
 }
 
@@ -16,11 +16,11 @@ impl Page {
         Self::Home,
         Self::Logs,
         Self::Doctor,
+        Self::Diagnostics,
         Self::Tor,
         Self::Network,
         Self::Site,
         Self::Settings,
-        Self::Diagnostics,
         Self::Help,
     ];
 
@@ -30,11 +30,11 @@ impl Page {
             Self::Home => "Home",
             Self::Logs => "Logs",
             Self::Doctor => "Doctor",
+            Self::Diagnostics => "Diagnostics",
             Self::Tor => "Tor",
             Self::Network => "Network",
             Self::Site => "Site",
             Self::Settings => "Settings",
-            Self::Diagnostics => "Diagnostics",
             Self::Help => "Help",
         }
     }
@@ -45,11 +45,13 @@ impl Page {
             Self::Home => "Return to the main RustHost dashboard.",
             Self::Logs => "Inspect recent RustHost log output.",
             Self::Doctor => "Check config, paths, ports, TLS, Tor, favicon, and runtime safety.",
-            Self::Tor => "Inspect Tor onion service status and connectivity.",
+            Self::Diagnostics => "Collect operator diagnostics for troubleshooting.",
+            Self::Tor => {
+                "Inspect Tor onion service status, connectivity, controls, and detailed status."
+            }
             Self::Network => "Inspect bind addresses, ports, HTTPS, and network reachability.",
             Self::Site => "Inspect the configured site directory and served content.",
             Self::Settings => "Review runtime settings and configuration choices.",
-            Self::Diagnostics => "Collect operator diagnostics for troubleshooting.",
             Self::Help => "Find RustHost console help and command guidance.",
         }
     }

@@ -1,6 +1,15 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{diagnostics::DiagnosticsReport, doctor::DoctorReport, Page};
+use super::{
+    diagnostics::DiagnosticsReport,
+    doctor::DoctorReport,
+    help::HelpPageState,
+    network::{NetworkPageState, NetworkReport},
+    settings::SettingsPageState,
+    site::{SitePageState, SiteReport},
+    tor::TorPageState,
+    Page,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuOpenTarget {
@@ -15,6 +24,11 @@ pub struct MenuState {
     active_page: Option<Page>,
     doctor: DoctorPageState,
     diagnostics: DiagnosticsPageState,
+    tor: TorPageState,
+    network: NetworkPageState,
+    site: SitePageState,
+    settings: SettingsPageState,
+    help: HelpPageState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +158,11 @@ impl MenuState {
             active_page: None,
             doctor: DoctorPageState::new(),
             diagnostics: DiagnosticsPageState::new(),
+            tor: TorPageState::new(),
+            network: NetworkPageState::new(),
+            site: SitePageState::new(),
+            settings: SettingsPageState::new(),
+            help: HelpPageState::new(),
         }
     }
 
@@ -176,12 +195,29 @@ impl MenuState {
     }
 
     pub fn move_up(&mut self) {
-        if matches!(self.active_page, Some(Page::Doctor)) {
-            self.doctor.move_up();
-            return;
-        }
-        if self.has_active_page() {
-            return;
+        match self.active_page {
+            Some(Page::Doctor) => {
+                self.doctor.move_up();
+                return;
+            }
+            Some(Page::Tor) => {
+                self.tor.move_up();
+                return;
+            }
+            Some(Page::Site) => {
+                self.site.scroll_up();
+                return;
+            }
+            Some(Page::Settings) => {
+                self.settings.scroll_up();
+                return;
+            }
+            Some(Page::Help) => {
+                self.help.move_up();
+                return;
+            }
+            Some(_) => return,
+            None => {}
         }
 
         self.selected = if self.selected == 0 {
@@ -192,12 +228,29 @@ impl MenuState {
     }
 
     pub fn move_down(&mut self) {
-        if matches!(self.active_page, Some(Page::Doctor)) {
-            self.doctor.move_down();
-            return;
-        }
-        if self.has_active_page() {
-            return;
+        match self.active_page {
+            Some(Page::Doctor) => {
+                self.doctor.move_down();
+                return;
+            }
+            Some(Page::Tor) => {
+                self.tor.move_down();
+                return;
+            }
+            Some(Page::Site) => {
+                self.site.scroll_down();
+                return;
+            }
+            Some(Page::Settings) => {
+                self.settings.scroll_down();
+                return;
+            }
+            Some(Page::Help) => {
+                self.help.move_down();
+                return;
+            }
+            Some(_) => return,
+            None => {}
         }
 
         self.selected = (self.selected + 1) % Page::ALL.len();
@@ -221,6 +274,10 @@ impl MenuState {
         self.active_page.take().is_some()
     }
 
+    pub const fn open_page(&mut self, page: Page) {
+        self.active_page = Some(page);
+    }
+
     #[must_use]
     pub const fn doctor(&self) -> &DoctorPageState {
         &self.doctor
@@ -231,12 +288,53 @@ impl MenuState {
         &self.diagnostics
     }
 
+    #[must_use]
+    pub const fn tor(&self) -> &TorPageState {
+        &self.tor
+    }
+
+    #[must_use]
+    pub const fn network(&self) -> &NetworkPageState {
+        &self.network
+    }
+
+    #[must_use]
+    pub const fn site(&self) -> &SitePageState {
+        &self.site
+    }
+
+    #[must_use]
+    pub const fn settings(&self) -> &SettingsPageState {
+        &self.settings
+    }
+
+    #[must_use]
+    pub const fn help(&self) -> &HelpPageState {
+        &self.help
+    }
+
+    pub const fn tor_mut(&mut self) -> &mut TorPageState {
+        &mut self.tor
+    }
+
+    pub const fn settings_mut(&mut self) -> &mut SettingsPageState {
+        &mut self.settings
+    }
+
     pub fn set_doctor_report(&mut self, report: DoctorReport) {
         self.doctor.set_report(report);
     }
 
     pub fn set_diagnostics_report(&mut self, report: DiagnosticsReport) {
         self.diagnostics.set_report(report);
+    }
+
+    pub fn set_network_report(&mut self, report: NetworkReport) {
+        self.network.set_report(report);
+    }
+
+    pub fn set_site_report(&mut self, report: SiteReport) {
+        self.site.set_report(report);
     }
 
     pub fn set_diagnostics_status(&mut self, status: impl Into<String>) {
@@ -250,6 +348,12 @@ impl MenuState {
     pub fn toggle_doctor_section(&mut self) {
         if matches!(self.active_page, Some(Page::Doctor)) {
             self.doctor.toggle_expanded();
+        }
+    }
+
+    pub const fn open_help_topic(&mut self) {
+        if matches!(self.active_page, Some(Page::Help)) {
+            self.help.open_selected();
         }
     }
 }

@@ -24,6 +24,7 @@ pub mod ui;
 
 use std::{
     io::{stdout, Write as _},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -63,6 +64,7 @@ pub fn start(
     state: SharedState,
     metrics: SharedMetrics,
     mut shutdown: watch::Receiver<bool>,
+    data_dir: PathBuf,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<KeyEvent>> {
     // crossterm 0.27+ enables Windows VT (Virtual Terminal) processing
     // automatically — no manual call needed.
@@ -99,7 +101,7 @@ pub fn start(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(e) = render(&config, &state, &metrics, &mut last_rendered).await {
+                    if let Err(e) = render(&config, &state, &metrics, &data_dir, &mut last_rendered).await {
                         log::debug!("Render error: {e}");
                     }
                 }
@@ -119,6 +121,7 @@ async fn render(
     config: &Config,
     state: &SharedState,
     metrics: &SharedMetrics,
+    data_dir: &std::path::Path,
     last_rendered: &mut String,
 ) -> Result<()> {
     // Acquire the lock ONCE and extract everything needed for this frame.
@@ -137,7 +140,7 @@ async fn render(
             let metrics = metrics.snapshot();
             dashboard::render_dashboard(&state_snapshot, metrics, config)
         }
-        ConsoleMode::Menu => menu::render(&state_snapshot.menu),
+        ConsoleMode::Menu => menu::render(&state_snapshot.menu, config, &state_snapshot, data_dir),
         ConsoleMode::LogView => dashboard::render_log_view(config.console.show_timestamps),
         ConsoleMode::Help => dashboard::render_help(),
         ConsoleMode::ConfirmQuit => dashboard::render_confirm_quit(),

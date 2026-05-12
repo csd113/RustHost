@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::{
     config::Config,
     console::menu::MenuOpenTarget,
-    console::menu::{self, DoctorContext, DoctorLiveState, Page},
+    console::menu::{self, tor::TorAction, DoctorContext, DoctorLiveState, Page},
     runtime::state::{AppState, ConsoleMode, SharedMetrics, SharedState, StatusMessage},
     server, Result,
 };
@@ -202,6 +202,10 @@ fn handle_menu_open_selected(state: &mut AppState) {
         state.menu.toggle_doctor_section();
         return;
     }
+    if state.menu.active_page() == Some(Page::Help) {
+        state.menu.open_help_topic();
+        return;
+    }
     match state.menu.open_selected() {
         MenuOpenTarget::Dashboard => {
             state.menu.leave();
@@ -212,6 +216,54 @@ fn handle_menu_open_selected(state: &mut AppState) {
             state.console_mode = ConsoleMode::LogView;
         }
         MenuOpenTarget::Page(_page) => {}
+    }
+}
+
+fn initialize_menu_page(
+    config: &Config,
+    snapshot: &AppState,
+    data_dir: &std::path::Path,
+    settings_path: Option<&std::path::Path>,
+) -> Option<PageInitialization> {
+    let page = snapshot.menu.active_page()?;
+    match page {
+        Page::Doctor if snapshot.menu.doctor().report().is_none() => {
+            let live = live_doctor_state(snapshot);
+            Some(PageInitialization::Doctor(run_tui_fast_doctor(
+                config,
+                data_dir,
+                settings_path,
+                live,
+            )))
+        }
+        Page::Diagnostics if snapshot.menu.diagnostics().report().is_none() => {
+            Some(PageInitialization::Diagnostics(
+                menu::diagnostics::build_report(config, snapshot, data_dir, settings_path),
+            ))
+        }
+        Page::Network if snapshot.menu.network().report().is_none() => Some(
+            PageInitialization::Network(menu::network::collect_report(config, snapshot, data_dir)),
+        ),
+        Page::Site if snapshot.menu.site().report().is_none() => Some(PageInitialization::Site(
+            menu::site::collect_report(data_dir, config),
+        )),
+        _ => None,
+    }
+}
+
+enum PageInitialization {
+    Doctor(menu::DoctorReport),
+    Diagnostics(menu::diagnostics::DiagnosticsReport),
+    Network(menu::network::NetworkReport),
+    Site(menu::site::SiteReport),
+}
+
+fn apply_page_initialization(state: &mut AppState, initialization: PageInitialization) {
+    match initialization {
+        PageInitialization::Doctor(report) => state.menu.set_doctor_report(report),
+        PageInitialization::Diagnostics(report) => state.menu.set_diagnostics_report(report),
+        PageInitialization::Network(report) => state.menu.set_network_report(report),
+        PageInitialization::Site(report) => state.menu.set_site_report(report),
     }
 }
 
@@ -343,6 +395,147 @@ async fn handle_diagnostics_page_event(
     }
 }
 
+async fn handle_extra_menu_page_event(
+    event: KeyEvent,
+    config: &Config,
+    state: SharedState,
+    data_dir: &std::path::Path,
+    settings_path: Option<&std::path::Path>,
+) -> Option<bool> {
+    let snapshot = {
+        let snapshot = state.read().await;
+        if snapshot.console_mode != ConsoleMode::Menu {
+            return None;
+        }
+        snapshot.clone()
+    };
+
+    match snapshot.menu.active_page()? {
+        Page::Tor => {
+            handle_tor_page_event(event, config, state, &snapshot, data_dir, settings_path).await
+        }
+        Page::Network => handle_network_page_event(event, config, state, &snapshot, data_dir).await,
+        Page::Site => handle_site_page_event(event, config, state, data_dir).await,
+        Page::Settings => {
+            handle_settings_page_event(event, config, state, &snapshot, data_dir, settings_path)
+                .await
+        }
+        Page::Help => handle_help_page_event(event, state).await,
+        Page::Home | Page::Logs | Page::Doctor | Page::Diagnostics => None,
+    }
+}
+
+async fn handle_tor_page_event(
+    event: KeyEvent,
+    config: &Config,
+    state: SharedState,
+    snapshot: &AppState,
+    data_dir: &std::path::Path,
+    settings_path: Option<&std::path::Path>,
+) -> Option<bool> {
+    if event == KeyEvent::Reload {
+        return Some(false);
+    }
+    if event != KeyEvent::OpenSelected {
+        return None;
+    }
+
+    let action = snapshot.menu.tor().selected_action();
+    match action {
+        TorAction::Restart => {
+            state
+                .write()
+                .await
+                .menu
+                .tor_mut()
+                .set_status("Restart Tor: not supported yet");
+        }
+        TorAction::CopyOnion => {
+            let status = menu::tor::copy_onion_status(snapshot);
+            state.write().await.menu.tor_mut().set_status(status);
+        }
+        TorAction::Diagnostics => {
+            let report = menu::diagnostics::build_report(config, snapshot, data_dir, settings_path);
+            let mut snapshot = state.write().await;
+            snapshot.menu.set_diagnostics_report(report);
+            snapshot.menu.open_page(Page::Diagnostics);
+        }
+        TorAction::BootstrapLog => {
+            state.write().await.menu.tor_mut().show_bootstrap_log();
+        }
+        TorAction::Back => {
+            let _ = state.write().await.menu.back();
+        }
+    }
+    Some(false)
+}
+
+async fn handle_network_page_event(
+    event: KeyEvent,
+    config: &Config,
+    state: SharedState,
+    snapshot: &AppState,
+    data_dir: &std::path::Path,
+) -> Option<bool> {
+    if event != KeyEvent::Reload {
+        return None;
+    }
+    let report = menu::network::collect_report(config, snapshot, data_dir);
+    state.write().await.menu.set_network_report(report);
+    Some(false)
+}
+
+async fn handle_site_page_event(
+    event: KeyEvent,
+    config: &Config,
+    state: SharedState,
+    data_dir: &std::path::Path,
+) -> Option<bool> {
+    if event != KeyEvent::Reload {
+        return None;
+    }
+    let report = menu::site::collect_report(data_dir, config);
+    state.write().await.menu.set_site_report(report);
+    Some(false)
+}
+
+async fn handle_settings_page_event(
+    event: KeyEvent,
+    config: &Config,
+    state: SharedState,
+    snapshot: &AppState,
+    data_dir: &std::path::Path,
+    settings_path: Option<&std::path::Path>,
+) -> Option<bool> {
+    if event == KeyEvent::Reload {
+        return Some(false);
+    }
+    if event != KeyEvent::CopyDiagnostics {
+        return None;
+    }
+    let mut snapshot_for_write = state.write().await;
+    menu::settings::copy_diagnostics(
+        snapshot_for_write.menu.settings_mut(),
+        config,
+        snapshot,
+        data_dir,
+        settings_path,
+    );
+    drop(snapshot_for_write);
+    Some(false)
+}
+
+async fn handle_help_page_event(event: KeyEvent, state: SharedState) -> Option<bool> {
+    if event == KeyEvent::Reload {
+        return Some(false);
+    }
+    if event != KeyEvent::OpenSelected {
+        return None;
+    }
+    state.write().await.menu.open_help_topic();
+    Some(false)
+}
+
 /// Dispatch a single key event, mutating shared state as needed.
 ///
 /// Returns `true` when the event is [`KeyEvent::Quit`] (the caller should
@@ -367,6 +560,18 @@ pub async fn handle(
     root_tx: &tokio::sync::watch::Sender<std::sync::Arc<std::path::Path>>,
 ) -> Result<bool> {
     if let Some(quit) = handle_diagnostics_page_event(
+        event,
+        config,
+        Arc::clone(&state),
+        &data_dir,
+        settings_path.as_deref(),
+    )
+    .await
+    {
+        return Ok(quit);
+    }
+
+    if let Some(quit) = handle_extra_menu_page_event(
         event,
         config,
         Arc::clone(&state),
@@ -414,31 +619,15 @@ pub async fn handle(
         state_event => {
             let mut snapshot = state.write().await;
             let quit = handle_console_state(state_event, &mut snapshot);
-            let should_initialize_doctor = snapshot.console_mode == ConsoleMode::Menu
-                && snapshot.menu.active_page() == Some(Page::Doctor)
-                && snapshot.menu.doctor().report().is_none();
-            let should_initialize_diagnostics = snapshot.console_mode == ConsoleMode::Menu
-                && snapshot.menu.active_page() == Some(Page::Diagnostics)
-                && snapshot.menu.diagnostics().report().is_none();
-            let live = live_doctor_state(&snapshot);
-            let diagnostics_snapshot = if should_initialize_diagnostics {
-                Some(snapshot.clone())
+            let initialization = if snapshot.console_mode == ConsoleMode::Menu {
+                initialize_menu_page(config, &snapshot, &data_dir, settings_path.as_deref())
             } else {
                 None
             };
             drop(snapshot);
-            if should_initialize_doctor {
-                let report = run_tui_fast_doctor(config, &data_dir, settings_path.as_deref(), live);
-                state.write().await.menu.set_doctor_report(report);
-            }
-            if let Some(snapshot) = diagnostics_snapshot {
-                let report = menu::diagnostics::build_report(
-                    config,
-                    &snapshot,
-                    &data_dir,
-                    settings_path.as_deref(),
-                );
-                state.write().await.menu.set_diagnostics_report(report);
+            if let Some(initialization) = initialization {
+                let mut snapshot = state.write().await;
+                apply_page_initialization(&mut snapshot, initialization);
             }
             return Ok(quit);
         }
@@ -477,6 +666,24 @@ mod tests {
         )
         .await
         .expect("handle key")
+    }
+
+    async fn open_menu_page(
+        page: Page,
+        state: SharedState,
+        data_dir: std::path::PathBuf,
+        root_tx: &watch::Sender<Arc<std::path::Path>>,
+    ) {
+        {
+            let mut snapshot = state.write().await;
+            snapshot.console_mode = ConsoleMode::Menu;
+            snapshot.menu.enter();
+            while snapshot.menu.selected_page() != page {
+                snapshot.menu.move_down();
+            }
+            drop(snapshot);
+        }
+        handle_key(KeyEvent::OpenSelected, state, data_dir, root_tx).await;
     }
 
     #[tokio::test]
@@ -850,5 +1057,82 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn new_nested_menu_pages_escape_back_and_do_not_quit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
+        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+
+        for page in [
+            Page::Tor,
+            Page::Network,
+            Page::Site,
+            Page::Settings,
+            Page::Help,
+        ] {
+            open_menu_page(page, Arc::clone(&state), tmp.path().to_path_buf(), &root_tx).await;
+            assert_eq!(state.read().await.menu.active_page(), Some(page));
+
+            let quit = handle_key(
+                KeyEvent::Quit,
+                Arc::clone(&state),
+                tmp.path().to_path_buf(),
+                &root_tx,
+            )
+            .await;
+            assert!(!quit);
+            assert_eq!(state.read().await.menu.active_page(), Some(page));
+
+            handle_key(
+                KeyEvent::Back,
+                Arc::clone(&state),
+                tmp.path().to_path_buf(),
+                &root_tx,
+            )
+            .await;
+            let snapshot = state.read().await;
+            assert_eq!(snapshot.console_mode, ConsoleMode::Menu);
+            assert_eq!(snapshot.menu.active_page(), None);
+            drop(snapshot);
+        }
+    }
+
+    #[tokio::test]
+    async fn tor_restart_action_is_non_mutating() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
+        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+
+        {
+            let mut snapshot = state.write().await;
+            snapshot.tor_status = crate::runtime::state::TorStatus::Ready;
+            snapshot.onion_address = Some("abcdefghijklmnop.onion".to_owned());
+        }
+
+        open_menu_page(
+            Page::Tor,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        handle_key(
+            KeyEvent::OpenSelected,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+
+        let snapshot = state.read().await;
+        assert_eq!(snapshot.tor_status, crate::runtime::state::TorStatus::Ready);
+        assert_eq!(
+            snapshot.onion_address.as_deref(),
+            Some("abcdefghijklmnop.onion")
+        );
+        assert_eq!(snapshot.menu.active_page(), Some(Page::Tor));
+        drop(snapshot);
     }
 }

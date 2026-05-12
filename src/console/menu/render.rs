@@ -1,6 +1,8 @@
 use std::fmt::Write as _;
 
-use crate::console::ui;
+use std::path::Path;
+
+use crate::{config::Config, console::ui, runtime::state::AppState};
 
 use super::{
     doctor::{status_style_label, DoctorStatus},
@@ -10,10 +12,11 @@ use super::{
 };
 
 #[must_use]
-pub fn render(state: &MenuState) -> String {
-    state
-        .active_page()
-        .map_or_else(|| render_index(state), |page| render_page(page, state))
+pub fn render(menu: &MenuState, config: &Config, state: &AppState, data_dir: &Path) -> String {
+    menu.active_page().map_or_else(
+        || render_index(menu),
+        |page| render_page(page, menu, config, state, data_dir),
+    )
 }
 
 fn render_index(state: &MenuState) -> String {
@@ -42,27 +45,27 @@ fn render_index(state: &MenuState) -> String {
     out
 }
 
-fn render_page(page: Page, state: &MenuState) -> String {
+fn render_page(
+    page: Page,
+    menu: &MenuState,
+    config: &Config,
+    state: &AppState,
+    data_dir: &Path,
+) -> String {
     if page == Page::Doctor {
-        return render_doctor(state);
+        return render_doctor(menu);
     }
     if page == Page::Diagnostics {
-        return render_diagnostics(state);
+        return render_diagnostics(menu);
     }
-
-    let mut out = String::with_capacity(512);
-    ui::push_header(&mut out, page.label());
-    out.push_str("\r\n");
-    let _ = writeln!(out, "{}\r", page.description());
-    out.push_str("\r\n");
-    let _ = writeln!(out, "{}\r", page.placeholder_text());
-    out.push_str("\r\n");
-    out.push_str("This page is not implemented yet.\r\n");
-    out.push_str("\r\n");
-    let _ = writeln!(out, "{}\r", ui::RULE);
-    out.push_str("[Esc] Back\r\n");
-    let _ = writeln!(out, "{}\r", ui::RULE);
-    out
+    match page {
+        Page::Tor => super::tor::render(menu.tor(), config, state),
+        Page::Network => super::network::render(menu.network()),
+        Page::Site => super::site::render(menu.site()),
+        Page::Settings => super::settings::render(menu.settings(), config, state, data_dir),
+        Page::Help => super::help::render(menu.help()),
+        Page::Home | Page::Logs | Page::Doctor | Page::Diagnostics => render_index(menu),
+    }
 }
 
 fn render_diagnostics(state: &MenuState) -> String {
@@ -147,15 +150,25 @@ fn color_status(status: DoctorStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::render;
-    use crate::console::menu::MenuState;
+    use crate::{config::Config, console::menu::MenuState, runtime::state::AppState};
+
+    fn render_test(state: &MenuState) -> String {
+        render(
+            state,
+            &Config::default(),
+            &AppState::new(),
+            std::path::Path::new("."),
+        )
+    }
 
     #[test]
     fn menu_renders_selected_marker_and_selected_description() {
-        let output = render(&MenuState::new());
+        let output = render_test(&MenuState::new());
 
         assert!(output.contains("Home"));
         assert!(output.contains("Logs"));
         assert!(output.contains("Doctor"));
+        assert!(output.contains("Diagnostics"));
         assert!(output.contains("Return to the main RustHost dashboard."));
         assert!(output.contains("[↑↓] Navigate  [Enter] Open  [Esc] Back  [Q] Quit"));
     }
@@ -167,7 +180,7 @@ mod tests {
         state.move_down();
         let _ = state.open_selected();
 
-        let output = render(&state);
+        let output = render_test(&state);
 
         assert!(output.contains("Doctor"));
         assert!(output.contains("Doctor report has not run yet."));
