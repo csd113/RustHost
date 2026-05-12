@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use crate::{
     config::Config,
-    runtime::state::{AppState, ConsoleMode, Page, SharedMetrics, SharedState, StatusMessage},
+    console::menu::MenuOpenTarget,
+    runtime::state::{AppState, ConsoleMode, SharedMetrics, SharedState, StatusMessage},
     server, Result,
 };
 
@@ -32,25 +33,6 @@ pub enum KeyEvent {
     /// Ctrl+C — immediate quit, no prompt.
     ForceQuit,
     Other,
-}
-
-const fn select_previous(selected: usize) -> usize {
-    if selected == 0 {
-        Page::MENU_ITEMS.len() - 1
-    } else {
-        selected - 1
-    }
-}
-
-const fn select_next(selected: usize) -> usize {
-    (selected + 1) % Page::MENU_ITEMS.len()
-}
-
-fn selected_page(selected: usize) -> Page {
-    Page::MENU_ITEMS
-        .get(selected)
-        .copied()
-        .unwrap_or(Page::Doctor)
 }
 
 /// Reload site stats and refresh the canonical site root used by listeners.
@@ -112,37 +94,55 @@ pub async fn reload_site(
 fn handle_console_state(event: KeyEvent, state: &mut AppState) -> bool {
     match event {
         KeyEvent::Quit => {
+            state.menu.leave();
             state.console_mode = ConsoleMode::ConfirmQuit;
         }
         KeyEvent::Back => {
             state.console_mode = match state.console_mode {
-                ConsoleMode::Menu | ConsoleMode::Help | ConsoleMode::LogView => {
+                ConsoleMode::Menu => {
+                    if state.menu.back() {
+                        ConsoleMode::Menu
+                    } else {
+                        state.menu.leave();
+                        ConsoleMode::Dashboard
+                    }
+                }
+                ConsoleMode::Help | ConsoleMode::LogView | ConsoleMode::ConfirmQuit => {
                     ConsoleMode::Dashboard
                 }
-                ConsoleMode::Placeholder(_) => ConsoleMode::Menu,
-                ConsoleMode::ConfirmQuit => ConsoleMode::Dashboard,
                 ConsoleMode::Dashboard => ConsoleMode::ConfirmQuit,
                 ConsoleMode::ShuttingDown => ConsoleMode::ShuttingDown,
             };
         }
         KeyEvent::Menu => {
             if state.console_mode == ConsoleMode::Dashboard {
+                state.menu.enter();
                 state.console_mode = ConsoleMode::Menu;
             }
         }
         KeyEvent::NavigateUp => {
             if state.console_mode == ConsoleMode::Menu {
-                state.menu_selected = select_previous(state.menu_selected);
+                state.menu.move_up();
             }
         }
         KeyEvent::NavigateDown => {
             if state.console_mode == ConsoleMode::Menu {
-                state.menu_selected = select_next(state.menu_selected);
+                state.menu.move_down();
             }
         }
         KeyEvent::OpenSelected => {
             if state.console_mode == ConsoleMode::Menu {
-                state.console_mode = ConsoleMode::Placeholder(selected_page(state.menu_selected));
+                match state.menu.open_selected() {
+                    MenuOpenTarget::Dashboard => {
+                        state.menu.leave();
+                        state.console_mode = ConsoleMode::Dashboard;
+                    }
+                    MenuOpenTarget::LogView => {
+                        state.menu.leave();
+                        state.console_mode = ConsoleMode::LogView;
+                    }
+                    MenuOpenTarget::Page(_page) => {}
+                }
             }
         }
         KeyEvent::Confirm => {
@@ -160,6 +160,9 @@ fn handle_console_state(event: KeyEvent, state: &mut AppState) -> bool {
             }
         }
         KeyEvent::Help => {
+            if state.console_mode == ConsoleMode::Menu {
+                state.menu.leave();
+            }
             state.console_mode = if state.console_mode == ConsoleMode::Help {
                 ConsoleMode::Dashboard
             } else {
@@ -167,10 +170,12 @@ fn handle_console_state(event: KeyEvent, state: &mut AppState) -> bool {
             };
         }
         KeyEvent::ToggleLogs => {
+            if state.console_mode == ConsoleMode::Menu {
+                state.menu.leave();
+            }
             state.console_mode = match state.console_mode {
                 ConsoleMode::Dashboard
                 | ConsoleMode::Menu
-                | ConsoleMode::Placeholder(_)
                 | ConsoleMode::Help
                 | ConsoleMode::ConfirmQuit => ConsoleMode::LogView,
                 ConsoleMode::LogView | ConsoleMode::ShuttingDown => ConsoleMode::Dashboard,
@@ -248,7 +253,8 @@ mod tests {
     use super::{handle, KeyEvent};
     use crate::{
         config::Config,
-        runtime::state::{ConsoleMode, Metrics, Page, SharedState},
+        console::menu::Page,
+        runtime::state::{ConsoleMode, Metrics, SharedState},
     };
     use std::sync::Arc;
     use tokio::sync::{watch, RwLock};
@@ -360,7 +366,7 @@ mod tests {
             &root_tx,
         )
         .await;
-        assert_eq!(state.read().await.menu_selected, 1);
+        assert_eq!(state.read().await.menu.selected_index(), 1);
 
         handle_key(
             KeyEvent::NavigateUp,
@@ -369,7 +375,7 @@ mod tests {
             &root_tx,
         )
         .await;
-        assert_eq!(state.read().await.menu_selected, 0);
+        assert_eq!(state.read().await.menu.selected_index(), 0);
     }
 
     #[tokio::test]
@@ -386,16 +392,28 @@ mod tests {
         )
         .await;
         handle_key(
+            KeyEvent::NavigateDown,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        handle_key(
+            KeyEvent::NavigateDown,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        handle_key(
             KeyEvent::OpenSelected,
             Arc::clone(&state),
             tmp.path().to_path_buf(),
             &root_tx,
         )
         .await;
-        assert_eq!(
-            state.read().await.console_mode,
-            ConsoleMode::Placeholder(Page::Doctor)
-        );
+        assert_eq!(state.read().await.menu.active_page(), Some(Page::Doctor));
+        assert_eq!(state.read().await.console_mode, ConsoleMode::Menu);
 
         handle_key(
             KeyEvent::Back,
@@ -404,7 +422,10 @@ mod tests {
             &root_tx,
         )
         .await;
-        assert_eq!(state.read().await.console_mode, ConsoleMode::Menu);
+        let snapshot = state.read().await;
+        assert_eq!(snapshot.console_mode, ConsoleMode::Menu);
+        assert_eq!(snapshot.menu.active_page(), None);
+        drop(snapshot);
 
         handle_key(
             KeyEvent::Back,
@@ -438,11 +459,15 @@ mod tests {
         let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
         let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
 
-        for (selected, page) in Page::MENU_ITEMS.iter().copied().enumerate() {
+        for (selected, page) in Page::ALL.iter().copied().enumerate() {
             {
                 let mut snapshot = state.write().await;
                 snapshot.console_mode = ConsoleMode::Menu;
-                snapshot.menu_selected = selected;
+                snapshot.menu.enter();
+                while snapshot.menu.selected_index() != selected {
+                    snapshot.menu.move_down();
+                }
+                drop(snapshot);
             }
             handle_key(
                 KeyEvent::OpenSelected,
@@ -451,10 +476,24 @@ mod tests {
                 &root_tx,
             )
             .await;
-            assert_eq!(
-                state.read().await.console_mode,
-                ConsoleMode::Placeholder(page)
-            );
+            let (console_mode, active_page) = {
+                let snapshot = state.read().await;
+                (snapshot.console_mode.clone(), snapshot.menu.active_page())
+            };
+            match page {
+                Page::Home => {
+                    assert_eq!(console_mode, ConsoleMode::Dashboard);
+                    assert_eq!(active_page, None);
+                }
+                Page::Logs => {
+                    assert_eq!(console_mode, ConsoleMode::LogView);
+                    assert_eq!(active_page, None);
+                }
+                _ => {
+                    assert_eq!(console_mode, ConsoleMode::Menu);
+                    assert_eq!(active_page, Some(page));
+                }
+            }
         }
     }
 }
