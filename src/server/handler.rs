@@ -19,10 +19,15 @@ mod encoding;
 mod pathing;
 
 use std::{
+    fs::OpenOptions,
     io::Cursor,
+    io::Write as _,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::UNIX_EPOCH,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -54,6 +59,7 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 const MAX_REQUEST_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_CUSTOM_ERROR_PAGE_BYTES: u64 = 64 * 1024;
 const IDENTITY_STREAM_CHUNK_BYTES: usize = 128 * 1024;
+static READINESS_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn full_body(data: impl Into<Bytes>) -> BoxBody {
     Full::new(data.into()).map_err(|e| match e {}).boxed()
 }
@@ -114,12 +120,19 @@ pub(crate) struct HandlerConfig {
     pub(crate) index_file: Arc<str>,
     pub(crate) flags: FeatureFlags,
     pub(crate) state: SharedState,
+    pub(crate) readiness: ReadinessConfig,
     pub(crate) csp: Arc<str>,
     pub(crate) error_404_page: Option<Arc<CustomErrorPage>>,
     pub(crate) error_503_page: Option<Arc<CustomErrorPage>>,
     pub(crate) redirects: Arc<Vec<crate::config::RedirectRule>>,
     pub(crate) trusted_proxies: Arc<Vec<std::net::IpAddr>>,
     pub(crate) ingress: RequestIngress,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReadinessConfig {
+    pub(crate) data_dir: Arc<Path>,
+    pub(crate) log_dir: Arc<Path>,
 }
 
 #[derive(Clone)]
@@ -258,6 +271,7 @@ where
         csp: config.csp,
         flags: config.flags,
         state: config.state,
+        readiness: config.readiness,
         error_404_page: config.error_404_page,
         error_503_page: config.error_503_page,
         redirects: config.redirects,
@@ -471,6 +485,7 @@ struct RouteConfig {
     csp: Arc<str>,
     flags: FeatureFlags,
     state: SharedState,
+    readiness: ReadinessConfig,
     error_404_page: Option<Arc<CustomErrorPage>>,
     error_503_page: Option<Arc<CustomErrorPage>>,
     /// Operator redirect or rewrite rules checked before filesystem resolution.
@@ -502,6 +517,20 @@ async fn route(
         cfg.ingress,
         metrics,
     );
+
+    if let Some(endpoint) = OperationalEndpoint::from_path(req.uri().path()) {
+        let resp = route_operational_endpoint(&req, cfg, metrics, endpoint).await?;
+        log_request(
+            &req,
+            resp.status().as_u16(),
+            response_size(&resp),
+            cfg.peer_addr,
+            &cfg.trusted_proxies,
+        );
+        return Ok(
+            inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await,
+        );
+    }
 
     match req.method() {
         &Method::OPTIONS => {
@@ -684,6 +713,148 @@ async fn route(
     // Inject HSTS and other security headers that depend on transport.
     let resp = inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await;
     Ok(resp)
+}
+
+#[derive(Clone, Copy)]
+enum OperationalEndpoint {
+    Health,
+    Ready,
+}
+
+impl OperationalEndpoint {
+    const fn from_path(path: &str) -> Option<Self> {
+        match path.as_bytes() {
+            b"/health" => Some(Self::Health),
+            b"/ready" => Some(Self::Ready),
+            _ => None,
+        }
+    }
+}
+
+async fn route_operational_endpoint(
+    req: &Request<Incoming>,
+    cfg: &RouteConfig,
+    metrics: &SharedMetrics,
+    endpoint: OperationalEndpoint,
+) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    if req.method() != Method::GET && req.method() != Method::HEAD {
+        metrics.add_error();
+        return Ok(method_not_allowed_with_allow("GET, HEAD"));
+    }
+
+    let is_head = req.method() == Method::HEAD;
+    match endpoint {
+        OperationalEndpoint::Health => {
+            metrics.add_request();
+            Ok(operational_text_response(
+                StatusCode::OK,
+                "OK\n",
+                is_head,
+                &cfg.csp,
+            ))
+        }
+        OperationalEndpoint::Ready => {
+            let readiness = cfg.readiness.clone();
+            let canonical_root = Arc::clone(&cfg.canonical_root);
+            let runtime_ready = cfg.state.read().await.runtime_ready;
+            let status = tokio::task::spawn_blocking(move || {
+                readiness_status(runtime_ready, canonical_root.as_ref(), &readiness)
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("readiness check task panicked: {e}")))?;
+
+            match status {
+                Ok(()) => {
+                    metrics.add_request();
+                    Ok(operational_text_response(
+                        StatusCode::OK,
+                        "READY\n",
+                        is_head,
+                        &cfg.csp,
+                    ))
+                }
+                Err(reason) => {
+                    metrics.add_error();
+                    let body = format!("NOT READY: {}\n", reason.as_str());
+                    Ok(operational_text_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &body,
+                        is_head,
+                        &cfg.csp,
+                    ))
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReadinessFailure {
+    StartupIncomplete,
+    DataDirUnavailable,
+    SiteRootUnavailable,
+    LogDirUnavailable,
+}
+
+impl ReadinessFailure {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StartupIncomplete => "startup incomplete",
+            Self::DataDirUnavailable => "data directory unavailable",
+            Self::SiteRootUnavailable => "site root unavailable",
+            Self::LogDirUnavailable => "log directory unavailable",
+        }
+    }
+}
+
+fn readiness_status(
+    runtime_ready: bool,
+    canonical_root: &Path,
+    readiness: &ReadinessConfig,
+) -> std::result::Result<(), ReadinessFailure> {
+    if !runtime_ready {
+        return Err(ReadinessFailure::StartupIncomplete);
+    }
+    if !is_accessible_dir(readiness.data_dir.as_ref()) {
+        return Err(ReadinessFailure::DataDirUnavailable);
+    }
+    if !is_accessible_dir(canonical_root) {
+        return Err(ReadinessFailure::SiteRootUnavailable);
+    }
+    if !log_dir_is_writable(readiness.log_dir.as_ref()) {
+        return Err(ReadinessFailure::LogDirUnavailable);
+    }
+    Ok(())
+}
+
+fn is_accessible_dir(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        && std::fs::read_dir(path).is_ok()
+}
+
+fn log_dir_is_writable(path: &Path) -> bool {
+    if !is_accessible_dir(path) {
+        return false;
+    }
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let counter = READINESS_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let probe = path.join(format!(
+        ".rusthost-ready-check-{}-{suffix}-{counter}",
+        std::process::id()
+    ));
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut file| file.write_all(b"ready\n"));
+
+    let cleanup = std::fs::remove_file(&probe);
+    let cleanup_ok = cleanup.is_ok()
+        || matches!(cleanup, Err(ref error) if error.kind() == std::io::ErrorKind::NotFound);
+    result.is_ok() && cleanup_ok
 }
 
 fn record_unique_visitor<B>(
@@ -1649,10 +1820,35 @@ fn redirect_response(location: &str, csp: &str) -> Response<BoxBody> {
     builder.body(full_body(data)).unwrap_or_default()
 }
 
+fn operational_text_response(
+    status: StatusCode,
+    body: &str,
+    is_head: bool,
+    csp: &str,
+) -> Response<BoxBody> {
+    let data = Bytes::copy_from_slice(body.as_bytes());
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, data.len())
+        .header("Cache-Control", "no-store, no-cache, max-age=0");
+    builder = security_headers(builder, csp, "text/plain");
+    let body = if is_head {
+        empty_body()
+    } else {
+        full_body(data)
+    };
+    builder.body(body).unwrap_or_default()
+}
+
 fn method_not_allowed() -> Response<BoxBody> {
+    method_not_allowed_with_allow("GET, HEAD, OPTIONS")
+}
+
+fn method_not_allowed_with_allow(allow: &'static str) -> Response<BoxBody> {
     Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
-        .header(header::ALLOW, "GET, HEAD, OPTIONS")
+        .header(header::ALLOW, allow)
         .header(header::CONTENT_LENGTH, "0")
         .body(empty_body())
         .unwrap_or_default()

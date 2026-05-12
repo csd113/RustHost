@@ -45,6 +45,8 @@ use tokio::{
 )]
 struct ServerContext {
     canonical_root: Arc<Path>,
+    data_dir: Arc<Path>,
+    log_dir: Arc<Path>,
     favicon: Arc<handler::FaviconConfig>,
     index_file: Arc<str>,
     csp_header: Arc<str>,
@@ -101,6 +103,10 @@ impl ServerContext {
         };
         let max_conns = config.server.max_connections as usize;
         let site_dir = data_dir.join(&config.site.directory);
+        let log_path = data_dir.join(&config.logging.file);
+        let log_dir = log_path
+            .parent()
+            .map_or_else(|| data_dir.to_path_buf(), Path::to_path_buf);
         let error_404_page = config.site.error_404.as_deref().and_then(|p| {
             handler::load_custom_error_page(
                 canonical_root.as_ref(),
@@ -119,6 +125,8 @@ impl ServerContext {
         });
         Some(Self {
             canonical_root: Arc::clone(&canonical_root),
+            data_dir: Arc::from(data_dir),
+            log_dir: Arc::from(log_dir.as_path()),
             favicon: Arc::new(handler::FaviconConfig {
                 path: site_dir.join(&config.site.favicon),
                 site_root: Arc::clone(&canonical_root),
@@ -188,6 +196,10 @@ impl ServerContext {
                 keep_alive: self.keep_alive,
             },
             state: Arc::clone(&self.state),
+            readiness: handler::ReadinessConfig {
+                data_dir: Arc::clone(&self.data_dir),
+                log_dir: Arc::clone(&self.log_dir),
+            },
             csp: Arc::clone(&self.csp_header),
             error_404_page: self.error_404_page.clone(),
             error_503_page: self.error_503_page.clone(),
@@ -481,6 +493,10 @@ pub async fn run_https(
                         let idx = Arc::clone(&ctx.index_file);
                         let met = Arc::clone(&metrics);
                         let state = Arc::clone(&ctx.state);
+                        let readiness = handler::ReadinessConfig {
+                            data_dir: Arc::clone(&ctx.data_dir),
+                            log_dir: Arc::clone(&ctx.log_dir),
+                        };
                         let csp = Arc::clone(&ctx.csp_header);
                         let favicon = Arc::clone(&ctx.favicon);
                         let flags = handler::FeatureFlags {
@@ -563,6 +579,7 @@ pub async fn run_https(
                                 index_file: idx,
                                 flags,
                                 state,
+                                readiness,
                                 csp,
                                 error_404_page: e404,
                                 error_503_page: e503,

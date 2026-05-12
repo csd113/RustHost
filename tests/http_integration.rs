@@ -50,6 +50,7 @@ use tokio::{
 /// A live server instance scoped to one test.
 struct TestServer {
     addr: SocketAddr,
+    state: Arc<RwLock<AppState>>,
     shutdown_tx: watch::Sender<bool>,
     /// Keeps the root watch channel open for the lifetime of the server.
     /// Dropping this would put the receiver into a "sender gone" state, which
@@ -142,10 +143,15 @@ impl TestServer {
 
         Ok(Self {
             addr,
+            state,
             shutdown_tx,
             _root_tx: root_tx,
             handle: Some(handle),
         })
+    }
+
+    async fn set_runtime_ready(&self, ready: bool) {
+        self.state.write().await.runtime_ready = ready;
     }
 
     /// Send raw `request` bytes and return the complete response as a `Vec<u8>`.
@@ -471,6 +477,12 @@ fn make_site(
     Ok((tmp, site))
 }
 
+fn make_runtime_log_dir(site_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = site_root.parent().unwrap_or(site_root);
+    std::fs::create_dir_all(data_dir.join("runtime/logs"))?;
+    Ok(())
+}
+
 fn init_test_logger() {
     static INIT: Once = Once::new();
 
@@ -591,6 +603,152 @@ async fn get_index_html_returns_200() -> Result<(), Box<dyn std::error::Error>> 
         "GET /index.html must return 200:\n{}",
         response_to_str(&response)?
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_health_returns_200_without_static_file() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert_eq!(
+        header_value(&response, "cache-control")?.as_deref(),
+        Some("no-store, no-cache, max-age=0")
+    );
+    assert!(response_to_str(&response)?.ends_with("\r\n\r\nOK\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn head_health_returns_200_with_no_body() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send_no_body(b"HEAD /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert_eq!(
+        header_value(&response, "content-length")?.as_deref(),
+        Some("3")
+    );
+    assert!(body_is_empty(&response)?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_ready_returns_200_when_runtime_is_ready() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    make_runtime_log_dir(&site)?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+    server.set_runtime_ready(true).await;
+
+    let response = server
+        .send(b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert!(response_to_str(&response)?.ends_with("\r\n\r\nREADY\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_ready_returns_503_when_runtime_is_not_ready() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    make_runtime_log_dir(&site)?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 503);
+    assert!(response_to_str(&response)?.contains("NOT READY: startup incomplete"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_ready_returns_503_when_log_dir_is_unavailable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+    server.set_runtime_ready(true).await;
+
+    let response = server
+        .send(b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 503);
+    assert!(response_to_str(&response)?.contains("NOT READY: log directory unavailable"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn operational_endpoints_reject_unsupported_methods() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (tmp, site) = make_site(&[])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"OPTIONS /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 405);
+    assert_eq!(
+        header_value(&response, "allow")?.as_deref(),
+        Some("GET, HEAD")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn operational_endpoints_are_routed_before_static_files(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("health", b"STATIC")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert!(response_to_str(&response)?.ends_with("\r\n\r\nOK\n"));
+    assert!(!response_to_str(&response)?.contains("STATIC"));
     Ok(())
 }
 

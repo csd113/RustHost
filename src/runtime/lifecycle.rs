@@ -527,8 +527,12 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     // 9. Open browser (if configured).
     maybe_open_browser(&config, &state).await;
 
+    state.write().await.runtime_ready = true;
+
     // 10. Event dispatch loop.
     event_loop(key_rx, &config, &state, &metrics, data_dir, root_tx).await?;
+
+    state.write().await.runtime_ready = false;
 
     // 11. Graceful shutdown.
     graceful_shutdown(

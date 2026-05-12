@@ -155,6 +155,9 @@ pub struct AppState {
     /// Whether the HTTP server is accepting connections.
     pub server_running: bool,
 
+    /// Whether startup completed enough for the process to serve normal traffic.
+    pub runtime_ready: bool,
+
     /// Current phase of the Tor lifecycle.
     pub tor_status: TorStatus,
 
@@ -192,6 +195,7 @@ impl AppState {
         Self {
             actual_port: 0,
             server_running: false,
+            runtime_ready: false,
             tor_status: TorStatus::Starting,
             onion_address: None,
             site_file_count: 0,
