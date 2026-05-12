@@ -20,6 +20,7 @@ mod pathing;
 
 use std::{
     fs::OpenOptions,
+    future::Future as _,
     io::Cursor,
     io::Write as _,
     path::{Path, PathBuf},
@@ -27,7 +28,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -35,8 +36,9 @@ use futures::TryStreamExt as _;
 use http_body_util::{BodyExt as _, Full, StreamBody};
 use httpdate::{fmt_http_date, parse_http_date};
 use hyper::{body::Incoming, header, Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
+use tokio::time::{Instant, Sleep};
 use tokio_util::io::ReaderStream;
 
 use super::{fallback, mime};
@@ -59,6 +61,8 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 const MAX_REQUEST_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_CUSTOM_ERROR_PAGE_BYTES: u64 = 64 * 1024;
 const IDENTITY_STREAM_CHUNK_BYTES: usize = 128 * 1024;
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 static READINESS_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn full_body(data: impl Into<Bytes>) -> BoxBody {
     Full::new(data.into()).map_err(|e| match e {}).boxed()
@@ -280,10 +284,15 @@ where
         ingress: config.ingress,
     });
 
-    let io = TokioIo::new(PrefixedStream::new(prefetched, stream));
+    let io = TokioIo::new(IdleTimeoutStream::new(
+        PrefixedStream::new(prefetched, stream),
+        KEEP_ALIVE_IDLE_TIMEOUT,
+    ));
 
     let result = hyper::server::conn::http1::Builder::new()
         .keep_alive(cfg.flags.keep_alive)
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .timer(TokioTimer::new())
         .max_buf_size(MAX_REQUEST_BUFFER_BYTES)
         .serve_connection(
             io,
@@ -377,7 +386,108 @@ where
     }
 }
 
+struct IdleTimeoutStream<S> {
+    inner: S,
+    timeout: Duration,
+    read_deadline: std::pin::Pin<Box<Sleep>>,
+}
+
+impl<S> IdleTimeoutStream<S> {
+    fn new(inner: S, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            read_deadline: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+
+    fn reset_deadline(&mut self) {
+        self.read_deadline
+            .as_mut()
+            .reset(Instant::now() + self.timeout);
+    }
+}
+
+impl<S> AsyncRead for IdleTimeoutStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                if buf.filled().len() > before {
+                    self.reset_deadline();
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
+            std::task::Poll::Pending => {
+                if self.read_deadline.as_mut().poll(cx).is_ready() {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "connection idle timeout",
+                    )));
+                }
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl<S> AsyncWrite for IdleTimeoutStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 async fn preflight_initial_headers<S>(
+    stream: &mut S,
+    peer_addr: std::net::SocketAddr,
+) -> std::io::Result<Option<Vec<u8>>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Ok(result) = tokio::time::timeout(
+        HEADER_READ_TIMEOUT,
+        preflight_initial_headers_inner(stream, peer_addr),
+    )
+    .await
+    {
+        result
+    } else {
+        log::warn!("Timed out reading initial request headers from {peer_addr}");
+        write_simple_response(stream, StatusCode::REQUEST_TIMEOUT, "Request Timeout").await?;
+        Ok(None)
+    }
+}
+
+async fn preflight_initial_headers_inner<S>(
     stream: &mut S,
     peer_addr: std::net::SocketAddr,
 ) -> std::io::Result<Option<Vec<u8>>>
@@ -1729,7 +1839,7 @@ async fn onion_location_header_value(
         .uri()
         .path_and_query()
         .map_or("/", hyper::http::uri::PathAndQuery::as_str);
-    let location = format!("https://{onion_address}{path_and_query}");
+    let location = format!("http://{onion_address}{path_and_query}");
     let safe_location = sanitize_header_value(&location);
     header::HeaderValue::from_str(safe_location.as_ref()).ok()
 }

@@ -230,18 +230,11 @@ fn run_tui_fast_doctor(
     settings_path: Option<&std::path::Path>,
     live: DoctorLiveState,
 ) -> menu::DoctorReport {
-    let mut report = settings_path.map_or_else(
-        || {
-            menu::doctor::run_fast_doctor_for_loaded_config(
-                data_dir,
-                None,
-                config,
-                DoctorContext::TuiLive(live),
-            )
-        },
-        |settings_path| {
-            menu::doctor::run_fast_doctor(data_dir, settings_path, DoctorContext::TuiLive(live))
-        },
+    let mut report = menu::doctor::run_fast_doctor_for_loaded_config(
+        data_dir,
+        settings_path,
+        config,
+        DoctorContext::TuiLive(live),
     );
     menu::doctor::append_deep_checks(&mut report, menu::doctor::deep_checks_not_run_section());
     menu::doctor::write_doctor_log(&mut report);

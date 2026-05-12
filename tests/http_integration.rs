@@ -795,7 +795,7 @@ async fn https_self_signed_server_returns_200() -> Result<(), Box<dyn std::error
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn https_response_includes_onion_location_when_onion_is_ready(
+async fn https_response_includes_http_onion_location_when_onion_is_ready(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (tmp, site) = make_site(&[("index.html", b"<h1>secure hello</h1>")])?;
     let server = match HttpsTestServer::start_with_state(&site, |state| {
@@ -830,7 +830,9 @@ async fn https_response_includes_onion_location_when_onion_is_ready(
 
     assert_eq!(
         header_value(&response, "onion-location")?.as_deref(),
-        Some("https://exampleexampleexampleexampleexampleexampleexampleexample.onion/docs/app.js?q=1")
+        Some(
+            "http://exampleexampleexampleexampleexampleexampleexampleexample.onion/docs/app.js?q=1"
+        )
     );
     Ok(())
 }
@@ -1424,6 +1426,77 @@ async fn oversized_header_returns_431_without_logging_payload(
         recent_lines.iter().all(|line| !line.contains(marker)),
         "oversized header payload leaked into logs: {recent_lines:?}"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partial_initial_headers_time_out() -> Result<(), Box<dyn std::error::Error>> {
+    init_test_logger();
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let mut stream = TcpStream::connect(server.addr).await?;
+    stream
+        .write_all(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n")
+        .await?;
+
+    let mut buf = [0_u8; 256];
+    let read = tokio::time::timeout(Duration::from_secs(7), stream.read(&mut buf))
+        .await
+        .map_err(|_elapsed| "partial-header timeout did not close the connection")??;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert!(read > 0, "expected timeout response before close");
+    assert_eq!(status_code(&buf[..read])?, 408);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn idle_keep_alive_connection_releases_capacity() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let Some(server) = start_server_with_config_or_skip(&site, |config| {
+        config.server.max_connections = 1;
+        config.server.max_connections_per_ip = 4;
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let mut first = TcpStream::connect(server.addr).await?;
+    first
+        .write_all(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let response = tokio::time::timeout(Duration::from_secs(5), read_one_response(&mut first))
+        .await
+        .map_err(|_elapsed| "first response timed out")??;
+    assert_eq!(status_code(&response)?, 200);
+
+    let mut idle_buf = [0_u8; 1];
+    let idle_read = tokio::time::timeout(Duration::from_secs(7), first.read(&mut idle_buf))
+        .await
+        .map_err(|_elapsed| "idle keep-alive timeout did not close the first connection")??;
+    assert_eq!(idle_read, 0, "idle keep-alive connection should close");
+
+    let mut second = TcpStream::connect(server.addr).await?;
+    second
+        .write_all(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let second_response =
+        tokio::time::timeout(Duration::from_secs(5), read_one_response(&mut second))
+            .await
+            .map_err(|_elapsed| "second response timed out after idle connection expiry")??;
+
+    drop(first);
+    drop(second);
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&second_response)?, 200);
     Ok(())
 }
 

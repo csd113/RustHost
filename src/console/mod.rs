@@ -20,6 +20,7 @@
 pub mod dashboard;
 pub mod input;
 pub mod menu;
+pub mod ui;
 
 use std::{
     io::{stdout, Write as _},

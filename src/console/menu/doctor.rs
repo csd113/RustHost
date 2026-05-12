@@ -112,6 +112,8 @@ impl DoctorSection {
 pub struct DoctorReport {
     data_dir: PathBuf,
     settings_path: Option<PathBuf>,
+    doctor_log_path: Option<PathBuf>,
+    doctor_log_required: bool,
     generated_at: Option<String>,
     sections: Vec<DoctorSection>,
 }
@@ -122,9 +124,18 @@ impl DoctorReport {
         Self {
             data_dir,
             settings_path,
+            doctor_log_path: None,
+            doctor_log_required: false,
             generated_at: None,
             sections: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_doctor_log_path(mut self, path: PathBuf, required: bool) -> Self {
+        self.doctor_log_path = Some(path);
+        self.doctor_log_required = required;
+        self
     }
 
     pub fn stamp_now(&mut self) {
@@ -215,6 +226,8 @@ pub fn run_fast_doctor(
     report.push_section(config_section);
 
     if let Some(config) = config {
+        report =
+            report.with_doctor_log_path(doctor_log_path(data_dir, &config), config.logging.enabled);
         report.push_section(check_paths(data_dir, &config));
         report.push_section(check_network(&config, context));
         report.push_section(check_tls(data_dir, &config, context));
@@ -259,7 +272,8 @@ pub fn run_fast_doctor_for_loaded_config(
     context: DoctorContext,
 ) -> DoctorReport {
     let mut report =
-        DoctorReport::new(data_dir.to_path_buf(), settings_path.map(Path::to_path_buf));
+        DoctorReport::new(data_dir.to_path_buf(), settings_path.map(Path::to_path_buf))
+            .with_doctor_log_path(doctor_log_path(data_dir, config), config.logging.enabled);
     report.stamp_now();
     let mut config_section = DoctorSection::new("Config");
     if let Some(settings_path) = settings_path {
@@ -384,16 +398,22 @@ pub fn deep_checks_not_run_section() -> DoctorSection {
 }
 
 pub fn write_doctor_log(report: &mut DoctorReport) {
-    let Some(config) = load_config_for_log(report) else {
+    let Some(log_path) = report.doctor_log_path.clone() else {
         return;
     };
-    let log_path = doctor_log_path(&report.data_dir, &config);
-    set_log_write_status(report, DoctorStatus::Pass, "doctor.log can be written");
+    set_log_write_status(
+        report,
+        DoctorStatus::Pass,
+        format!(
+            "doctor.log is intentionally written at {}",
+            log_path.display()
+        ),
+    );
     let text = report.render_text();
     match write_log_file(&log_path, &text) {
         Ok(()) => {}
         Err(err) => {
-            let status = if config.logging.enabled {
+            let status = if report.doctor_log_required {
                 DoctorStatus::Fail
             } else {
                 DoctorStatus::Warn
@@ -646,7 +666,7 @@ fn check_logs(data_dir: &Path, config: &Config) -> DoctorSection {
     check_directory_usable(&mut section, "logs directory", &dir, config.logging.enabled);
     section.push(
         DoctorStatus::NotRun,
-        "doctor.log write result is recorded after report rendering",
+        "doctor.log is the only intentional Doctor write and is recorded after report rendering",
     );
     section
 }
@@ -673,29 +693,43 @@ fn doctor_log_path(data_dir: &Path, config: &Config) -> PathBuf {
 }
 
 fn check_directory_usable(section: &mut DoctorSection, label: &str, path: &Path, required: bool) {
-    match std::fs::create_dir_all(path) {
-        Ok(()) => {
-            if path.is_dir() {
-                section.push(
-                    DoctorStatus::Pass,
-                    format!("{label} exists or can be created"),
-                );
-                if let Err(err) = check_writable(path) {
-                    let status = if required {
-                        DoctorStatus::Fail
-                    } else {
-                        DoctorStatus::Warn
-                    };
-                    section.push(status, format!("{label} is not writable: {err}"));
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            section.push(DoctorStatus::Pass, format!("{label} exists"));
+            if metadata.permissions().readonly() {
+                let status = if required {
+                    DoctorStatus::Fail
                 } else {
-                    section.push(DoctorStatus::Pass, format!("{label} is writable"));
-                }
+                    DoctorStatus::Warn
+                };
+                section.push(
+                    status,
+                    format!("{label} is marked read-only at {}", path.display()),
+                );
             } else {
                 section.push(
-                    DoctorStatus::Fail,
-                    format!("{label} path is not a directory: {}", path.display()),
+                    DoctorStatus::Pass,
+                    format!("{label} is not marked read-only"),
                 );
             }
+        }
+        Ok(_) => section.push(
+            DoctorStatus::Fail,
+            format!("{label} path is not a directory: {}", path.display()),
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let status = if required {
+                DoctorStatus::Fail
+            } else {
+                DoctorStatus::Warn
+            };
+            section.push(
+                status,
+                format!(
+                    "{label} does not exist at {}; Doctor will not create it",
+                    path.display()
+                ),
+            );
         }
         Err(err) => {
             let status = if required {
@@ -705,19 +739,9 @@ fn check_directory_usable(section: &mut DoctorSection, label: &str, path: &Path,
             };
             section.push(
                 status,
-                format!("{label} cannot be created at {}: {err}", path.display()),
+                format!("{label} cannot be inspected at {}: {err}", path.display()),
             );
         }
-    }
-}
-
-fn check_writable(path: &Path) -> std::io::Result<()> {
-    let probe = path.join(".rusthost-doctor-write-test");
-    std::fs::write(&probe, b"doctor")?;
-    match std::fs::remove_file(&probe) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
     }
 }
 
@@ -941,13 +965,6 @@ fn set_log_write_status(
         }
         section.push(status, message);
     }
-}
-
-fn load_config_for_log(report: &DoctorReport) -> Option<Config> {
-    report
-        .settings_path
-        .as_ref()
-        .and_then(|path| config::loader::load(path).ok())
 }
 
 #[must_use]
@@ -1231,5 +1248,130 @@ manual_cert = { cert_path = "missing.crt", key_path = "missing.key" }"#,
             .sections()
             .iter()
             .any(|section| section.name() == "Deep Checks"));
+    }
+
+    #[test]
+    fn loaded_config_doctor_does_not_reload_settings_from_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("site")).expect("site");
+        std::fs::create_dir_all(tmp.path().join("runtime")).expect("runtime");
+        std::fs::write(tmp.path().join("site/index.html"), b"ok").expect("index");
+        std::fs::write(tmp.path().join("settings.toml"), "not valid toml").expect("settings");
+
+        let mut config = Config::default();
+        config.tor.enabled = false;
+        config.logging.enabled = false;
+        config.server.port = NonZeroU16::new(19185).expect("port");
+
+        let report = run_fast_doctor_for_loaded_config(
+            tmp.path(),
+            Some(&tmp.path().join("settings.toml")),
+            &config,
+            DoctorContext::TuiLive(DoctorLiveState {
+                server_running: false,
+                actual_port: 0,
+                tls_running: false,
+                tls_port: None,
+            }),
+        );
+
+        assert!(has_line(
+            &report,
+            DoctorStatus::Pass,
+            "settings.toml loaded from"
+        ));
+        assert!(!has_line(&report, DoctorStatus::Fail, "not valid toml"));
+        assert!(!has_line(
+            &report,
+            DoctorStatus::Fail,
+            "settings.toml parsed"
+        ));
+    }
+
+    #[test]
+    fn doctor_checks_do_not_create_missing_runtime_log_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("site")).expect("site");
+        std::fs::create_dir_all(tmp.path().join("runtime")).expect("runtime");
+        std::fs::write(tmp.path().join("site/index.html"), b"ok").expect("index");
+
+        let mut config = Config::default();
+        config.tor.enabled = false;
+        config.logging.enabled = true;
+        config.logging.file = "runtime/logs/rusthost.log".into();
+        config.server.port = NonZeroU16::new(19186).expect("port");
+
+        let _report = run_fast_doctor_for_loaded_config(
+            tmp.path(),
+            None,
+            &config,
+            DoctorContext::CommandLine,
+        );
+
+        assert!(!tmp.path().join("runtime/logs").exists());
+        assert!(!tmp
+            .path()
+            .join("runtime/logs/.rusthost-doctor-write-test")
+            .exists());
+    }
+
+    #[test]
+    fn doctor_directory_checks_do_not_probe_write_existing_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("site")).expect("site");
+        std::fs::create_dir_all(tmp.path().join("runtime/logs")).expect("logs");
+        std::fs::write(tmp.path().join("site/index.html"), b"ok").expect("index");
+
+        let mut config = Config::default();
+        config.tor.enabled = false;
+        config.logging.enabled = true;
+        config.logging.file = "runtime/logs/rusthost.log".into();
+        config.server.port = NonZeroU16::new(19188).expect("port");
+
+        let report = run_fast_doctor_for_loaded_config(
+            tmp.path(),
+            None,
+            &config,
+            DoctorContext::CommandLine,
+        );
+
+        assert!(!tmp
+            .path()
+            .join("runtime/logs/.rusthost-doctor-write-test")
+            .exists());
+        assert!(has_line(
+            &report,
+            DoctorStatus::Pass,
+            "logs directory is not marked read-only"
+        ));
+    }
+
+    #[test]
+    fn doctor_log_write_is_intentional_side_effect() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("site")).expect("site");
+        std::fs::create_dir_all(tmp.path().join("runtime")).expect("runtime");
+        std::fs::write(tmp.path().join("site/index.html"), b"ok").expect("index");
+
+        let mut config = Config::default();
+        config.tor.enabled = false;
+        config.logging.enabled = true;
+        config.logging.file = "runtime/logs/rusthost.log".into();
+        config.server.port = NonZeroU16::new(19187).expect("port");
+
+        let mut report = run_fast_doctor_for_loaded_config(
+            tmp.path(),
+            None,
+            &config,
+            DoctorContext::CommandLine,
+        );
+        write_doctor_log(&mut report);
+
+        assert!(tmp.path().join("runtime/logs/doctor.log").is_file());
+        assert!(has_line(
+            &report,
+            DoctorStatus::Pass,
+            "doctor.log is intentionally written"
+        ));
     }
 }

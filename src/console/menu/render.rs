@@ -1,21 +1,13 @@
 use std::fmt::Write as _;
 
+use crate::console::ui;
+
 use super::{
     doctor::{status_style_label, DoctorStatus},
     pages::Page,
     state::pulse_visible,
     MenuState,
 };
-
-const RULE: &str = "──────────────────────────────────────────────────────────";
-
-fn dim(s: &str) -> String {
-    format!("\x1b[2m{s}\x1b[0m")
-}
-
-fn bold(s: &str) -> String {
-    format!("\x1b[1m{s}\x1b[0m")
-}
 
 #[must_use]
 pub fn render(state: &MenuState) -> String {
@@ -33,9 +25,9 @@ fn render_index(state: &MenuState) -> String {
     for (index, page) in Page::ALL.iter().enumerate() {
         let marker = if index == state.selected_index() {
             if pulse_visible() {
-                bold(">")
+                ui::bold(">")
             } else {
-                dim(">")
+                ui::dim(">")
             }
         } else {
             " ".to_owned()
@@ -59,9 +51,7 @@ fn render_page(page: Page, state: &MenuState) -> String {
     }
 
     let mut out = String::with_capacity(512);
-    let _ = writeln!(out, "{RULE}\r");
-    let _ = writeln!(out, " {}\r", bold(page.label()));
-    let _ = writeln!(out, "{RULE}\r");
+    ui::push_header(&mut out, page.label());
     out.push_str("\r\n");
     let _ = writeln!(out, "{}\r", page.description());
     out.push_str("\r\n");
@@ -69,17 +59,15 @@ fn render_page(page: Page, state: &MenuState) -> String {
     out.push_str("\r\n");
     out.push_str("This page is not implemented yet.\r\n");
     out.push_str("\r\n");
-    let _ = writeln!(out, "{RULE}\r");
+    let _ = writeln!(out, "{}\r", ui::RULE);
     out.push_str("[Esc] Back\r\n");
-    let _ = writeln!(out, "{RULE}\r");
+    let _ = writeln!(out, "{}\r", ui::RULE);
     out
 }
 
 fn render_diagnostics(state: &MenuState) -> String {
     let mut out = String::with_capacity(1_024);
-    let _ = writeln!(out, "{RULE}\r");
-    let _ = writeln!(out, " {}\r", bold("RustHost Diagnostics"));
-    let _ = writeln!(out, "{RULE}\r");
+    ui::push_header(&mut out, "RustHost Diagnostics");
     out.push_str("\r\n");
 
     let diagnostics = state.diagnostics();
@@ -93,28 +81,26 @@ fn render_diagnostics(state: &MenuState) -> String {
 
     if let Some(status) = diagnostics.status() {
         out.push_str("\r\n");
-        let _ = writeln!(out, "{}\r", dim(status));
+        let _ = writeln!(out, "{}\r", ui::dim(status));
     }
 
     out.push_str("\r\n");
-    let _ = writeln!(out, "{RULE}\r");
+    let _ = writeln!(out, "{}\r", ui::RULE);
     out.push_str("[C] Copy diagnostics  [R] Refresh  [X] Clear status  [Esc] Back\r\n");
-    let _ = writeln!(out, "{RULE}\r");
+    let _ = writeln!(out, "{}\r", ui::RULE);
     out
 }
 
 fn render_doctor(state: &MenuState) -> String {
     let mut out = String::with_capacity(2_048);
-    let _ = writeln!(out, "{RULE}\r");
-    let _ = writeln!(out, " {}\r", bold("Doctor"));
-    let _ = writeln!(out, "{RULE}\r");
+    ui::push_header(&mut out, "Doctor");
     out.push_str("\r\n");
 
     let doctor = state.doctor();
     if let Some(report) = doctor.report() {
         for (index, section) in report.sections().iter().enumerate() {
             let marker = if index == doctor.selected_section() {
-                bold(">")
+                ui::bold(">")
             } else {
                 " ".to_owned()
             };
@@ -146,10 +132,10 @@ fn render_doctor(state: &MenuState) -> String {
     }
 
     out.push_str("\r\n");
-    let _ = writeln!(out, "{RULE}\r");
+    let _ = writeln!(out, "{}\r", ui::RULE);
     out.push_str("[R] Re-run fast checks  [D] Run deep checks  [Enter] Expand/collapse\r\n");
     out.push_str("[↑↓/jk] Navigate sections  [Esc] Back\r\n");
-    let _ = writeln!(out, "{RULE}\r");
+    let _ = writeln!(out, "{}\r", ui::RULE);
     out
 }
 

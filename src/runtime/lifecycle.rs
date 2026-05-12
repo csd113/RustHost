@@ -541,8 +541,9 @@ async fn normal_run_with_config(
 
     state.write().await.runtime_ready = true;
 
-    // 10. Event dispatch loop.
-    event_loop(
+    // 10. Event dispatch loop.  Always continue into the single shutdown path
+    // so listener/background cleanup runs even if event handling fails.
+    let event_result = event_loop(
         key_rx,
         &config,
         &state,
@@ -551,7 +552,7 @@ async fn normal_run_with_config(
         settings_path,
         root_tx,
     )
-    .await?;
+    .await;
 
     state.write().await.runtime_ready = false;
 
@@ -564,7 +565,7 @@ async fn normal_run_with_config(
         background_tasks,
     )
     .await;
-    Ok(())
+    event_result
 }
 
 fn ensure_data_directories(data_dir: &Path) -> Result<()> {
