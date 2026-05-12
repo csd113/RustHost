@@ -81,7 +81,9 @@ pub enum RelaunchIntent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StdioKind {
     Terminal,
+    #[cfg(any(unix, test))]
     NullDevice,
+    #[cfg(any(unix, test))]
     Redirected,
     Other,
 }
@@ -94,6 +96,7 @@ struct StdioSummary {
 }
 
 impl StdioSummary {
+    #[cfg(any(unix, test))]
     const fn all_null_devices(self) -> bool {
         matches!(
             self,
@@ -105,16 +108,29 @@ impl StdioSummary {
         )
     }
 
+    #[cfg(not(any(unix, test)))]
+    const fn all_null_devices(self) -> bool {
+        let _ = self;
+        false
+    }
+
     const fn has_terminal(self) -> bool {
         matches!(self.stdin, StdioKind::Terminal)
             || matches!(self.stdout, StdioKind::Terminal)
             || matches!(self.stderr, StdioKind::Terminal)
     }
 
+    #[cfg(any(unix, test))]
     const fn has_redirected_stream(self) -> bool {
         matches!(self.stdin, StdioKind::Redirected)
             || matches!(self.stdout, StdioKind::Redirected)
             || matches!(self.stderr, StdioKind::Redirected)
+    }
+
+    #[cfg(not(any(unix, test)))]
+    const fn has_redirected_stream(self) -> bool {
+        let _ = self;
+        false
     }
 }
 

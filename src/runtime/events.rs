@@ -2,12 +2,15 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{
     config::Config,
-    runtime::state::{ConsoleMode, SharedMetrics, SharedState},
+    runtime::state::{ConsoleMode, SharedMetrics, SharedState, StatusMessage},
     server, Result,
 };
+
+const RELOAD_STATUS_DURATION: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyEvent {
@@ -41,29 +44,34 @@ pub async fn reload_site(
 ) -> Result<()> {
     let site_root = data_dir.join(&config.site.directory);
     let scan_root = site_root.clone();
-    let (count, bytes) = match tokio::task::spawn_blocking(move || server::scan_site(&scan_root))
-        .await
-    {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            log::warn!("Site rescan failed: {e}");
-            state.write().await.status_message = Some(format!("Reload failed: {e}"));
-            return Ok(());
-        }
-        Err(e) => {
-            log::warn!("Site rescan task panicked: {e}");
-            state.write().await.status_message = Some("Reload failed: scan task stopped".into());
-            return Ok(());
-        }
-    };
+    let (count, bytes) =
+        match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                log::warn!("Site rescan failed: {e}");
+                state.write().await.status_message =
+                    Some(StatusMessage::persistent(format!("Reload failed: {e}")));
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!("Site rescan task panicked: {e}");
+                state.write().await.status_message = Some(StatusMessage::persistent(
+                    "Reload failed: scan task stopped",
+                ));
+                return Ok(());
+            }
+        };
     {
         let mut s = state.write().await;
         s.site_file_count = count;
         s.site_total_bytes = bytes;
-        s.status_message = Some(format!(
-            "Reload complete: {} files, {}",
-            count,
-            crate::runtime::state::format_bytes(bytes)
+        s.status_message = Some(StatusMessage::temporary(
+            format!(
+                "Reload complete: {} files, {}",
+                count,
+                crate::runtime::state::format_bytes(bytes)
+            ),
+            RELOAD_STATUS_DURATION,
         ));
     }
     if let Ok(new_root) = site_root.canonicalize() {
@@ -115,10 +123,9 @@ pub async fn handle(
             if confirming_quit {
                 let mut s = state.write().await;
                 s.console_mode = ConsoleMode::ShuttingDown;
-                s.status_message = Some(
-                    "Shutdown requested — stopping web server and Tor background services..."
-                        .into(),
-                );
+                s.status_message = Some(StatusMessage::persistent(
+                    "Shutdown requested — stopping web server and Tor background services...",
+                ));
                 drop(s);
                 return Ok(true);
             }
@@ -217,7 +224,7 @@ mod tests {
 
         let status_message = {
             let snapshot = state.read().await;
-            snapshot.status_message.clone()
+            snapshot.visible_status_message().map(str::to_owned)
         };
         assert!(!quit);
         assert!(status_message
@@ -249,7 +256,7 @@ mod tests {
             let snapshot = state.read().await;
             (
                 snapshot.console_mode.clone(),
-                snapshot.status_message.clone(),
+                snapshot.visible_status_message().map(str::to_owned),
             )
         };
         assert!(quit);

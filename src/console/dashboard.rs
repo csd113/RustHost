@@ -122,7 +122,7 @@ pub fn render_dashboard(state: &AppState, metrics: MetricsSnapshot, config: &Con
         TorStatus::Failed(reason) => red(&format!("FAILED ({reason}) — see log for details")),
     };
     let _ = writeln!(out, " Tor : {tor_str}\r");
-    if let Some(message) = state.status_message.as_deref() {
+    if let Some(message) = state.visible_status_message() {
         let _ = writeln!(out, " Status : {}\r", yellow(message));
     }
     out.push_str("\r\n");

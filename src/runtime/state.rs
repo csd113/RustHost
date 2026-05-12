@@ -118,7 +118,7 @@ pub struct AppState {
     pub tls_cert_status: CertStatus,
 
     /// Short operator-facing status line shown in the dashboard.
-    pub status_message: Option<String>,
+    pub status_message: Option<StatusMessage>,
 }
 
 impl AppState {
@@ -137,6 +137,14 @@ impl AppState {
             tls_cert_status: CertStatus::Unknown,
             status_message: None,
         }
+    }
+
+    #[must_use]
+    pub fn visible_status_message(&self) -> Option<&str> {
+        self.status_message
+            .as_ref()
+            .filter(|message| !message.is_expired())
+            .map(StatusMessage::text)
     }
 }
 
@@ -207,6 +215,41 @@ impl Default for Metrics {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct StatusMessage {
+    text: String,
+    expires_at: Option<Instant>,
+}
+
+impl StatusMessage {
+    #[must_use]
+    pub fn persistent(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            expires_at: None,
+        }
+    }
+
+    #[must_use]
+    pub fn temporary(text: impl Into<String>, duration: Duration) -> Self {
+        Self {
+            text: text.into(),
+            expires_at: Some(Instant::now() + duration),
+        }
+    }
+
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        self.expires_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 #[expect(
@@ -257,9 +300,10 @@ pub fn format_uptime(duration: Duration) -> String {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{format_uptime, Metrics, VisitorIdentity};
+    use super::{format_uptime, AppState, Metrics, StatusMessage, VisitorIdentity};
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        thread,
         time::Duration,
     };
 
@@ -294,6 +338,24 @@ mod tests {
         metrics.add_unique_visitor(VisitorIdentity::TorAnonymous);
 
         assert_eq!(metrics.snapshot().unique_visitors, 1);
+    }
+
+    #[test]
+    fn temporary_status_message_expires() {
+        let mut state = AppState::new();
+        state.status_message = Some(StatusMessage::temporary(
+            "Reload complete: 1 files, 5 B",
+            Duration::from_millis(10),
+        ));
+
+        assert_eq!(
+            state.visible_status_message(),
+            Some("Reload complete: 1 files, 5 B")
+        );
+
+        thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(state.visible_status_message(), None);
     }
 
     #[test]
