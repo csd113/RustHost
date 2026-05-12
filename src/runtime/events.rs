@@ -6,19 +6,24 @@ use std::time::Duration;
 
 use crate::{
     config::Config,
-    runtime::state::{ConsoleMode, SharedMetrics, SharedState, StatusMessage},
+    runtime::state::{AppState, ConsoleMode, Page, SharedMetrics, SharedState, StatusMessage},
     server, Result,
 };
 
 const RELOAD_STATUS_DURATION: Duration = Duration::from_secs(3);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyEvent {
     Help,
+    Menu,
     Reload,
     Open,
     ToggleLogs,
-    /// Q or Esc — request quit, shows confirm prompt.
+    NavigateUp,
+    NavigateDown,
+    OpenSelected,
+    Back,
+    /// Q — request quit, shows confirm prompt.
     Quit,
     /// Y — confirm the quit prompt.
     Confirm,
@@ -27,6 +32,25 @@ pub enum KeyEvent {
     /// Ctrl+C — immediate quit, no prompt.
     ForceQuit,
     Other,
+}
+
+const fn select_previous(selected: usize) -> usize {
+    if selected == 0 {
+        Page::MENU_ITEMS.len() - 1
+    } else {
+        selected - 1
+    }
+}
+
+const fn select_next(selected: usize) -> usize {
+    (selected + 1) % Page::MENU_ITEMS.len()
+}
+
+fn selected_page(selected: usize) -> Page {
+    Page::MENU_ITEMS
+        .get(selected)
+        .copied()
+        .unwrap_or(Page::Doctor)
 }
 
 /// Reload site stats and refresh the canonical site root used by listeners.
@@ -85,6 +109,86 @@ pub async fn reload_site(
     Ok(())
 }
 
+fn handle_console_state(event: KeyEvent, state: &mut AppState) -> bool {
+    match event {
+        KeyEvent::Quit => {
+            state.console_mode = ConsoleMode::ConfirmQuit;
+        }
+        KeyEvent::Back => {
+            state.console_mode = match state.console_mode {
+                ConsoleMode::Menu | ConsoleMode::Help | ConsoleMode::LogView => {
+                    ConsoleMode::Dashboard
+                }
+                ConsoleMode::Placeholder(_) => ConsoleMode::Menu,
+                ConsoleMode::ConfirmQuit => ConsoleMode::Dashboard,
+                ConsoleMode::Dashboard => ConsoleMode::ConfirmQuit,
+                ConsoleMode::ShuttingDown => ConsoleMode::ShuttingDown,
+            };
+        }
+        KeyEvent::Menu => {
+            if state.console_mode == ConsoleMode::Dashboard {
+                state.console_mode = ConsoleMode::Menu;
+            }
+        }
+        KeyEvent::NavigateUp => {
+            if state.console_mode == ConsoleMode::Menu {
+                state.menu_selected = select_previous(state.menu_selected);
+            }
+        }
+        KeyEvent::NavigateDown => {
+            if state.console_mode == ConsoleMode::Menu {
+                state.menu_selected = select_next(state.menu_selected);
+            }
+        }
+        KeyEvent::OpenSelected => {
+            if state.console_mode == ConsoleMode::Menu {
+                state.console_mode = ConsoleMode::Placeholder(selected_page(state.menu_selected));
+            }
+        }
+        KeyEvent::Confirm => {
+            if state.console_mode == ConsoleMode::ConfirmQuit {
+                state.console_mode = ConsoleMode::ShuttingDown;
+                state.status_message = Some(StatusMessage::persistent(
+                    "Shutdown requested — stopping web server and Tor background services...",
+                ));
+                return true;
+            }
+        }
+        KeyEvent::Cancel => {
+            if state.console_mode == ConsoleMode::ConfirmQuit {
+                state.console_mode = ConsoleMode::Dashboard;
+            }
+        }
+        KeyEvent::Help => {
+            state.console_mode = if state.console_mode == ConsoleMode::Help {
+                ConsoleMode::Dashboard
+            } else {
+                ConsoleMode::Help
+            };
+        }
+        KeyEvent::ToggleLogs => {
+            state.console_mode = match state.console_mode {
+                ConsoleMode::Dashboard
+                | ConsoleMode::Menu
+                | ConsoleMode::Placeholder(_)
+                | ConsoleMode::Help
+                | ConsoleMode::ConfirmQuit => ConsoleMode::LogView,
+                ConsoleMode::LogView | ConsoleMode::ShuttingDown => ConsoleMode::Dashboard,
+            };
+        }
+        KeyEvent::Other => {
+            if state.console_mode == ConsoleMode::Help
+                || state.console_mode == ConsoleMode::ConfirmQuit
+            {
+                state.console_mode = ConsoleMode::Dashboard;
+            }
+        }
+        KeyEvent::ForceQuit | KeyEvent::Reload | KeyEvent::Open => {}
+    }
+
+    false
+}
+
 /// Dispatch a single key event, mutating shared state as needed.
 ///
 /// Returns `true` when the event is [`KeyEvent::Quit`] (the caller should
@@ -109,54 +213,6 @@ pub async fn handle(
 ) -> Result<bool> {
     match event {
         KeyEvent::ForceQuit => return Ok(true),
-
-        KeyEvent::Quit => {
-            let mut s = state.write().await;
-            s.console_mode = ConsoleMode::ConfirmQuit;
-        }
-
-        KeyEvent::Confirm => {
-            let confirming_quit = {
-                let s = state.read().await;
-                s.console_mode == ConsoleMode::ConfirmQuit
-            };
-            if confirming_quit {
-                let mut s = state.write().await;
-                s.console_mode = ConsoleMode::ShuttingDown;
-                s.status_message = Some(StatusMessage::persistent(
-                    "Shutdown requested — stopping web server and Tor background services...",
-                ));
-                drop(s);
-                return Ok(true);
-            }
-        }
-
-        KeyEvent::Cancel => {
-            let mut s = state.write().await;
-            if s.console_mode == ConsoleMode::ConfirmQuit {
-                s.console_mode = ConsoleMode::Dashboard;
-            }
-        }
-
-        KeyEvent::Help => {
-            let mut s = state.write().await;
-            s.console_mode = if s.console_mode == ConsoleMode::Help {
-                ConsoleMode::Dashboard
-            } else {
-                ConsoleMode::Help
-            };
-        }
-
-        KeyEvent::ToggleLogs => {
-            let mut s = state.write().await;
-            s.console_mode = match s.console_mode {
-                ConsoleMode::Dashboard | ConsoleMode::Help | ConsoleMode::ConfirmQuit => {
-                    ConsoleMode::LogView
-                }
-                ConsoleMode::LogView | ConsoleMode::ShuttingDown => ConsoleMode::Dashboard,
-            };
-        }
-
         KeyEvent::Reload => {
             reload_site(config, Arc::clone(&state), data_dir.clone(), root_tx).await?;
         }
@@ -176,12 +232,9 @@ pub async fn handle(
             };
             super::open_browser(&url);
         }
-
-        KeyEvent::Other => {
-            let mut s = state.write().await;
-            if s.console_mode == ConsoleMode::Help || s.console_mode == ConsoleMode::ConfirmQuit {
-                s.console_mode = ConsoleMode::Dashboard;
-            }
+        state_event => {
+            let mut snapshot = state.write().await;
+            return Ok(handle_console_state(state_event, &mut snapshot));
         }
     }
 
@@ -195,10 +248,28 @@ mod tests {
     use super::{handle, KeyEvent};
     use crate::{
         config::Config,
-        runtime::state::{ConsoleMode, Metrics, SharedState},
+        runtime::state::{ConsoleMode, Metrics, Page, SharedState},
     };
     use std::sync::Arc;
     use tokio::sync::{watch, RwLock};
+
+    async fn handle_key(
+        event: KeyEvent,
+        state: SharedState,
+        data_dir: std::path::PathBuf,
+        root_tx: &watch::Sender<Arc<std::path::Path>>,
+    ) -> bool {
+        handle(
+            event,
+            &Config::default(),
+            state,
+            Arc::new(Metrics::new()),
+            data_dir,
+            root_tx,
+        )
+        .await
+        .expect("handle key")
+    }
 
     #[tokio::test]
     async fn reload_sets_visible_status_message() {
@@ -264,5 +335,126 @@ mod tests {
         assert!(status_message
             .as_deref()
             .is_some_and(|message| message.contains("Shutdown requested")));
+    }
+
+    #[tokio::test]
+    async fn menu_opens_from_dashboard_and_navigation_updates_selection() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
+        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+
+        let quit = handle_key(
+            KeyEvent::Menu,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert!(!quit);
+        assert_eq!(state.read().await.console_mode, ConsoleMode::Menu);
+
+        handle_key(
+            KeyEvent::NavigateDown,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert_eq!(state.read().await.menu_selected, 1);
+
+        handle_key(
+            KeyEvent::NavigateUp,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert_eq!(state.read().await.menu_selected, 0);
+    }
+
+    #[tokio::test]
+    async fn enter_opens_selected_menu_page_and_escape_returns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
+        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+
+        handle_key(
+            KeyEvent::Menu,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        handle_key(
+            KeyEvent::OpenSelected,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert_eq!(
+            state.read().await.console_mode,
+            ConsoleMode::Placeholder(Page::Doctor)
+        );
+
+        handle_key(
+            KeyEvent::Back,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert_eq!(state.read().await.console_mode, ConsoleMode::Menu);
+
+        handle_key(
+            KeyEvent::Back,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert_eq!(state.read().await.console_mode, ConsoleMode::Dashboard);
+    }
+
+    #[tokio::test]
+    async fn logs_key_still_opens_existing_log_view() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
+        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+
+        handle_key(
+            KeyEvent::ToggleLogs,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert_eq!(state.read().await.console_mode, ConsoleMode::LogView);
+    }
+
+    #[tokio::test]
+    async fn menu_placeholder_items_open_matching_placeholder_pages() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
+        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+
+        for (selected, page) in Page::MENU_ITEMS.iter().copied().enumerate() {
+            {
+                let mut snapshot = state.write().await;
+                snapshot.console_mode = ConsoleMode::Menu;
+                snapshot.menu_selected = selected;
+            }
+            handle_key(
+                KeyEvent::OpenSelected,
+                Arc::clone(&state),
+                tmp.path().to_path_buf(),
+                &root_tx,
+            )
+            .await;
+            assert_eq!(
+                state.read().await.console_mode,
+                ConsoleMode::Placeholder(page)
+            );
+        }
     }
 }

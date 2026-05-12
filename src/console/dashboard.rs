@@ -3,7 +3,7 @@ use crate::{
     config::Config,
     logging,
     runtime::state::{
-        format_bytes, format_uptime, AppState, CertStatus, MetricsSnapshot, TorStatus,
+        format_bytes, format_uptime, AppState, CertStatus, MetricsSnapshot, Page, TorStatus,
     },
 };
 use std::fmt::Write as _;
@@ -70,7 +70,15 @@ fn local_https_url(bind_addr: std::net::IpAddr, port: u16) -> String {
     }
 }
 
-const RULE: &str = "────────────────────────────────";
+const RULE: &str = "──────────────────────────────────────────────────────────";
+
+fn push_controls_footer(out: &mut String, controls: &str) {
+    let _ = writeln!(out, "{RULE}\r");
+    out.push_str(controls);
+    out.push_str("\r\n");
+    let _ = writeln!(out, "{RULE}\r");
+}
+
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 #[must_use]
 pub fn render_dashboard(state: &AppState, metrics: MetricsSnapshot, config: &Config) -> String {
@@ -180,11 +188,60 @@ pub fn render_dashboard(state: &AppState, metrics: MetricsSnapshot, config: &Con
     let _ = writeln!(out, " Errors : {err_str}\r");
     out.push_str("\r\n");
     // ── Key bar ───────────────────────────────────────────────────────────────
-    let _ = writeln!(out, "{RULE}\r");
-    out.push_str("[H] Help [R] Reload [O] Open [L] Logs [Q] Quit\r\n");
-    let _ = writeln!(out, "{RULE}\r");
+    push_controls_footer(
+        &mut out,
+        "[H] Help [R] Reload [O] Open [L] Logs [M] Menu [Q] Quit",
+    );
     out
 }
+
+// ─── Menu ───────────────────────────────────────────────────────────────────
+#[must_use]
+pub fn render_menu(selected: usize, pulse_visible: bool) -> String {
+    let selected_page = Page::MENU_ITEMS
+        .get(selected)
+        .copied()
+        .unwrap_or(Page::Doctor);
+    let mut out = String::with_capacity(512);
+    let _ = writeln!(out, "RustHost Menu\r");
+    out.push_str("\r\n");
+
+    for (index, page) in Page::MENU_ITEMS.iter().enumerate() {
+        let marker = if index == selected {
+            if pulse_visible {
+                bold(">")
+            } else {
+                dim(">")
+            }
+        } else {
+            " ".to_owned()
+        };
+        let _ = writeln!(out, "{marker} {}\r", page.title());
+    }
+
+    out.push_str("\r\n");
+    let _ = writeln!(out, "{}\r", selected_page.purpose());
+    out.push_str("\r\n");
+    out.push_str("[↑↓] Navigate  [Enter] Open  [Esc] Back  [Q] Quit\r\n");
+    out
+}
+
+// ─── Placeholder Pages ──────────────────────────────────────────────────────
+#[must_use]
+pub fn render_placeholder_page(page: Page) -> String {
+    let mut out = String::with_capacity(512);
+    let _ = writeln!(out, "{RULE}\r");
+    let _ = writeln!(out, " {}\r", bold(page.title()));
+    let _ = writeln!(out, "{RULE}\r");
+    out.push_str("\r\n");
+    let _ = writeln!(out, "{}\r", page.purpose());
+    out.push_str("\r\n");
+    out.push_str("This page is not implemented yet.\r\n");
+    out.push_str("\r\n");
+    push_controls_footer(&mut out, "[Esc] Back");
+    out
+}
+
 // ─── Log view ────────────────────────────────────────────────────────────────
 #[must_use]
 pub fn render_log_view(show_timestamps: bool) -> String {
@@ -202,9 +259,7 @@ pub fn render_log_view(show_timestamps: bool) -> String {
         let _ = writeln!(out, "{}\r", clean_log_line(display));
     }
     out.push_str("\r\n");
-    let _ = writeln!(out, "{RULE}\r");
-    out.push_str("[L] Back to dashboard [Q] Quit\r\n");
-    let _ = writeln!(out, "{RULE}\r");
+    push_controls_footer(&mut out, "[L] Back to dashboard");
     out
 }
 // ─── Help ────────────────────────────────────────────────────────────────────
@@ -223,7 +278,6 @@ pub fn render_help() -> String {
     );
     let _ = writeln!(out, " {} Open local URL in system browser\r", bold("[O]"));
     let _ = writeln!(out, " {} Toggle log view\r", bold("[L]"));
-    let _ = writeln!(out, " {} Graceful shutdown\r", bold("[Q]"));
     out.push_str("\r\n");
     let _ = writeln!(
         out,
@@ -289,10 +343,13 @@ fn clean_log_line(line: &str) -> String {
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
-    use super::{clean_log_line, render_dashboard, render_shutdown, strip_timestamp};
+    use super::{
+        clean_log_line, render_dashboard, render_menu, render_placeholder_page, render_shutdown,
+        strip_timestamp,
+    };
     use crate::{
         config::Config,
-        runtime::state::{AppState, MetricsSnapshot},
+        runtime::state::{AppState, MetricsSnapshot, Page},
     };
     use std::time::Duration;
     #[test]
@@ -343,5 +400,66 @@ mod tests {
         assert!(output.contains("Unique visitors : 1"));
         assert!(output.contains("Uptime : 1m 05s"));
         assert!(!output.contains("203.0.113.10"));
+    }
+
+    #[test]
+    fn dashboard_footer_includes_menu_hint() {
+        let output = render_dashboard(
+            &AppState::new(),
+            MetricsSnapshot {
+                requests: 0,
+                errors: 0,
+                unique_visitors: 0,
+                uptime: Duration::ZERO,
+            },
+            &Config::default(),
+        );
+
+        assert!(output.contains("[M] Menu"));
+    }
+
+    #[test]
+    fn menu_renders_selected_marker_and_selected_description() {
+        let output = render_menu(0, true);
+
+        assert!(output.contains("\x1b[1m>\x1b[0m Doctor"));
+        assert!(!output.contains("  Logs"));
+        assert!(!output.contains("  Home"));
+        assert!(
+            output.contains("Check config, paths, ports, TLS, Tor, favicon, and runtime safety.")
+        );
+        assert!(output.contains("[↑↓] Navigate  [Enter] Open  [Esc] Back  [Q] Quit"));
+    }
+
+    #[test]
+    fn placeholder_page_renders_minimal_not_implemented_state() {
+        let output = render_placeholder_page(Page::Doctor);
+
+        assert!(output.contains("Doctor"));
+        assert!(
+            output.contains("Check config, paths, ports, TLS, Tor, favicon, and runtime safety.")
+        );
+        assert!(output.contains("This page is not implemented yet."));
+        assert!(output.contains("[Esc] Back"));
+        assert!(!output.contains("[Q] Quit"));
+    }
+
+    #[test]
+    fn all_placeholder_pages_render_their_title_and_purpose() {
+        for page in [
+            Page::Doctor,
+            Page::Tor,
+            Page::Network,
+            Page::Site,
+            Page::Settings,
+            Page::Diagnostics,
+            Page::Help,
+        ] {
+            let output = render_placeholder_page(page);
+
+            assert!(output.contains(page.title()));
+            assert!(output.contains(page.purpose()));
+            assert!(output.contains("This page is not implemented yet."));
+        }
     }
 }

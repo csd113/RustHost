@@ -23,6 +23,7 @@ pub mod input;
 use std::{
     io::{stdout, Write as _},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::{cursor, execute, terminal};
@@ -135,7 +136,11 @@ async fn render(
             let metrics = metrics.snapshot();
             dashboard::render_dashboard(&state_snapshot, metrics, config)
         }
+        ConsoleMode::Menu => {
+            dashboard::render_menu(state_snapshot.menu_selected, menu_pulse_visible())
+        }
         ConsoleMode::LogView => dashboard::render_log_view(config.console.show_timestamps),
+        ConsoleMode::Placeholder(page) => dashboard::render_placeholder_page(page),
         ConsoleMode::Help => dashboard::render_help(),
         ConsoleMode::ConfirmQuit => dashboard::render_confirm_quit(),
         ConsoleMode::ShuttingDown => dashboard::render_shutdown(config.tor.enabled),
@@ -160,6 +165,12 @@ async fn render(
         .map_err(|e| AppError::Console(format!("stdout flush error: {e}")))?;
 
     Ok(())
+}
+
+fn menu_pulse_visible() -> bool {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(true, |duration| (duration.as_millis() / 700) % 2 == 0)
 }
 
 // ─── Cleanup ──────────────────────────────────────────────────────────────────

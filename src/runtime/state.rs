@@ -68,14 +68,76 @@ pub enum CertStatus {
 pub enum ConsoleMode {
     /// Main status dashboard (default).
     Dashboard,
+    /// Vertical navigation menu.
+    Menu,
     /// Scrolling log view (toggled by L).
     LogView,
+    /// Minimal page placeholder selected from the menu.
+    Placeholder(Page),
     /// Key-binding help overlay (toggled by H).
     Help,
     /// Quit confirmation prompt (shown after pressing Q).
     ConfirmQuit,
     /// Shutdown is underway after the quit prompt was confirmed.
     ShuttingDown,
+}
+
+/// Top-level destinations exposed in the console menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    /// Configuration and runtime safety checks.
+    Doctor,
+    /// Tor onion service status and controls.
+    Tor,
+    /// Listener, bind address, and connectivity details.
+    Network,
+    /// Site directory and static content details.
+    Site,
+    /// Runtime settings overview.
+    Settings,
+    /// Operator diagnostics and support details.
+    Diagnostics,
+    /// Console help and usage guidance.
+    Help,
+}
+
+impl Page {
+    /// Ordered menu items shown in the TUI.
+    pub const MENU_ITEMS: [Self; 7] = [
+        Self::Doctor,
+        Self::Tor,
+        Self::Network,
+        Self::Site,
+        Self::Settings,
+        Self::Diagnostics,
+        Self::Help,
+    ];
+
+    #[must_use]
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Doctor => "Doctor",
+            Self::Tor => "Tor",
+            Self::Network => "Network",
+            Self::Site => "Site",
+            Self::Settings => "Settings",
+            Self::Diagnostics => "Diagnostics",
+            Self::Help => "Help",
+        }
+    }
+
+    #[must_use]
+    pub const fn purpose(self) -> &'static str {
+        match self {
+            Self::Doctor => "Check config, paths, ports, TLS, Tor, favicon, and runtime safety.",
+            Self::Tor => "Inspect Tor onion service status and connectivity.",
+            Self::Network => "Inspect bind addresses, ports, HTTPS, and network reachability.",
+            Self::Site => "Inspect the configured site directory and served content.",
+            Self::Settings => "Review runtime settings and configuration choices.",
+            Self::Diagnostics => "Collect operator diagnostics for troubleshooting.",
+            Self::Help => "Find RustHost console help and command guidance.",
+        }
+    }
 }
 
 // ─── AppState ───────────────────────────────────────────────────────────────
@@ -108,6 +170,9 @@ pub struct AppState {
     /// Which console screen is active.
     pub console_mode: ConsoleMode,
 
+    /// Selected index in [`Page::MENU_ITEMS`] while the menu is active.
+    pub menu_selected: usize,
+
     /// Whether the HTTPS server is currently accepting connections.
     pub tls_running: bool,
 
@@ -132,6 +197,7 @@ impl AppState {
             site_file_count: 0,
             site_total_bytes: 0,
             console_mode: ConsoleMode::Dashboard,
+            menu_selected: 0,
             tls_running: false,
             tls_port: None,
             tls_cert_status: CertStatus::Unknown,
