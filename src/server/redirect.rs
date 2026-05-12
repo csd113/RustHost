@@ -328,7 +328,7 @@ fn parse_host_header(raw: &str) -> Result<String, ()> {
             };
             parse_host_port(port)?;
         }
-        let ip = core.parse::<std::net::Ipv6Addr>().map_err(|_| ())?;
+        let ip = core.parse::<std::net::Ipv6Addr>().map_err(|_error| ())?;
         return Ok(format!("[{ip}]"));
     }
 
@@ -359,7 +359,7 @@ fn parse_host_port(raw: &str) -> Result<u16, ()> {
     if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_digit()) {
         return Err(());
     }
-    let port = raw.parse::<u16>().map_err(|_| ())?;
+    let port = raw.parse::<u16>().map_err(|_error| ())?;
     if port == 0 {
         return Err(());
     }

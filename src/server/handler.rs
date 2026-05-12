@@ -963,7 +963,7 @@ fn log_dir_is_writable(path: &Path) -> bool {
 
     let cleanup = std::fs::remove_file(&probe);
     let cleanup_ok = cleanup.is_ok()
-        || matches!(cleanup, Err(ref error) if error.kind() == std::io::ErrorKind::NotFound);
+        || matches!(&cleanup, Err(error) if error.kind() == std::io::ErrorKind::NotFound);
     result.is_ok() && cleanup_ok
 }
 
