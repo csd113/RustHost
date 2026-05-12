@@ -2,7 +2,9 @@
 use crate::{
     config::Config,
     logging,
-    runtime::state::{format_bytes, AppState, CertStatus, TorStatus},
+    runtime::state::{
+        format_bytes, format_uptime, AppState, CertStatus, MetricsSnapshot, TorStatus,
+    },
 };
 use std::fmt::Write as _;
 // ─── ANSI helpers ────────────────────────────────────────────────────────────
@@ -71,7 +73,7 @@ fn local_https_url(bind_addr: std::net::IpAddr, port: u16) -> String {
 const RULE: &str = "────────────────────────────────";
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 #[must_use]
-pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &Config) -> String {
+pub fn render_dashboard(state: &AppState, metrics: MetricsSnapshot, config: &Config) -> String {
     let mut out = String::with_capacity(1_024);
     let _ = writeln!(out, "{RULE}\r");
     let _ = writeln!(out, " {}\r", bold(&config.identity.instance_name));
@@ -167,11 +169,13 @@ pub fn render_dashboard(state: &AppState, requests: u64, errors: u64, config: &C
     out.push_str("\r\n");
     // ── Activity ─────────────────────────────────────────────────────────────
     let _ = writeln!(out, "{}\r", bold("Activity"));
-    let _ = writeln!(out, " Requests : {requests}\r");
-    let err_str = if errors > 0 {
-        red(&errors.to_string())
+    let _ = writeln!(out, " Uptime : {}\r", format_uptime(metrics.uptime));
+    let _ = writeln!(out, " Requests : {}\r", metrics.requests);
+    let _ = writeln!(out, " Unique visitors : {}\r", metrics.unique_visitors);
+    let err_str = if metrics.errors > 0 {
+        red(&metrics.errors.to_string())
     } else {
-        errors.to_string()
+        metrics.errors.to_string()
     };
     let _ = writeln!(out, " Errors : {err_str}\r");
     out.push_str("\r\n");
@@ -285,7 +289,12 @@ fn clean_log_line(line: &str) -> String {
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
-    use super::{clean_log_line, render_shutdown, strip_timestamp};
+    use super::{clean_log_line, render_dashboard, render_shutdown, strip_timestamp};
+    use crate::{
+        config::Config,
+        runtime::state::{AppState, MetricsSnapshot},
+    };
+    use std::time::Duration;
     #[test]
     fn strip_timestamp_ascii_log_line() {
         let line = "[INFO][2024-01-01 12:00:00] message body";
@@ -319,5 +328,20 @@ mod tests {
         let message = render_shutdown(true);
         assert!(message.contains("Shutdown requested"));
         assert!(message.contains("Tor cleanup may take a few seconds"));
+    }
+
+    #[test]
+    fn dashboard_activity_shows_unique_visitors_without_raw_visitor_ip() {
+        let metrics = MetricsSnapshot {
+            requests: 4,
+            errors: 0,
+            unique_visitors: 1,
+            uptime: Duration::from_secs(65),
+        };
+        let output = render_dashboard(&AppState::new(), metrics, &Config::default());
+
+        assert!(output.contains("Unique visitors : 1"));
+        assert!(output.contains("Uptime : 1m 05s"));
+        assert!(!output.contains("203.0.113.10"));
     }
 }

@@ -10,6 +10,11 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
+use std::{
+    collections::hash_map::RandomState,
+    hash::{BuildHasher as _, Hash},
+    time::{Duration, Instant},
+};
 use tokio::sync::RwLock;
 
 // ─── Type aliases ───────────────────────────────────────────────────────────
@@ -19,6 +24,15 @@ pub type SharedState = Arc<RwLock<AppState>>;
 
 /// Thread- and task-safe handle to the hot-path request metrics.
 pub type SharedMetrics = Arc<Metrics>;
+
+/// Runtime visitor identity used only to derive an in-memory counter key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VisitorIdentity {
+    /// A clearnet visitor represented by the best available remote IP.
+    Clearnet(std::net::IpAddr),
+    /// Tor ingress does not expose a stable client identity without invasive tracking.
+    TorAnonymous,
+}
 
 // ─── Enums ──────────────────────────────────────────────────────────────────
 
@@ -137,16 +151,30 @@ impl Default for AppState {
 /// Hot-path request counters. Updated via atomics so the HTTP handler
 /// never needs to acquire a lock on [`AppState`].
 pub struct Metrics {
+    started_at: Instant,
     pub requests: AtomicU64,
     pub errors: AtomicU64,
+    visitor_hasher: RandomState,
+    visitor_keys: dashmap::DashSet<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub requests: u64,
+    pub errors: u64,
+    pub unique_visitors: usize,
+    pub uptime: Duration,
 }
 
 impl Metrics {
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
+            started_at: Instant::now(),
             requests: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            visitor_hasher: RandomState::new(),
+            visitor_keys: dashmap::DashSet::new(),
         }
     }
 
@@ -158,11 +186,18 @@ impl Metrics {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn snapshot(&self) -> (u64, u64) {
-        (
-            self.requests.load(Ordering::Relaxed),
-            self.errors.load(Ordering::Relaxed),
-        )
+    pub fn add_unique_visitor(&self, identity: VisitorIdentity) {
+        let key = self.visitor_hasher.hash_one(identity);
+        self.visitor_keys.insert(key);
+    }
+
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            requests: self.requests.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            unique_visitors: self.visitor_keys.len(),
+            uptime: self.started_at.elapsed(),
+        }
     }
 }
 
@@ -192,5 +227,95 @@ pub fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[must_use]
+pub fn format_uptime(duration: Duration) -> String {
+    const SECS_PER_MINUTE: u64 = 60;
+    const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
+    const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
+
+    let total = duration.as_secs();
+    let days = total / SECS_PER_DAY;
+    let hours = (total % SECS_PER_DAY) / SECS_PER_HOUR;
+    let minutes = (total % SECS_PER_HOUR) / SECS_PER_MINUTE;
+    let seconds = total % SECS_PER_MINUTE;
+
+    if days > 0 {
+        format!("{days}d {hours:02}h {minutes:02}m {seconds:02}s")
+    } else if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds:02}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::{format_uptime, Metrics, VisitorIdentity};
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        time::Duration,
+    };
+
+    #[test]
+    fn same_visitor_counted_once() {
+        let metrics = Metrics::new();
+        let visitor = VisitorIdentity::Clearnet(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)));
+
+        metrics.add_unique_visitor(visitor);
+        metrics.add_unique_visitor(visitor);
+
+        assert_eq!(metrics.snapshot().unique_visitors, 1);
+    }
+
+    #[test]
+    fn different_visitors_counted_separately() {
+        let metrics = Metrics::new();
+
+        metrics.add_unique_visitor(VisitorIdentity::Clearnet(IpAddr::V4(Ipv4Addr::new(
+            203, 0, 113, 10,
+        ))));
+        metrics.add_unique_visitor(VisitorIdentity::Clearnet(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+
+        assert_eq!(metrics.snapshot().unique_visitors, 2);
+    }
+
+    #[test]
+    fn tor_anonymous_bucket_counts_once() {
+        let metrics = Metrics::new();
+
+        metrics.add_unique_visitor(VisitorIdentity::TorAnonymous);
+        metrics.add_unique_visitor(VisitorIdentity::TorAnonymous);
+
+        assert_eq!(metrics.snapshot().unique_visitors, 1);
+    }
+
+    #[test]
+    fn uptime_under_one_minute() {
+        assert_eq!(format_uptime(Duration::from_secs(9)), "09s");
+    }
+
+    #[test]
+    fn uptime_minutes() {
+        assert_eq!(format_uptime(Duration::from_secs(125)), "2m 05s");
+    }
+
+    #[test]
+    fn uptime_hours() {
+        assert_eq!(format_uptime(Duration::from_secs(7_265)), "2h 01m 05s");
+    }
+
+    #[test]
+    fn uptime_days() {
+        assert_eq!(
+            format_uptime(Duration::from_secs(176_461)),
+            "2d 01h 01m 01s"
+        );
     }
 }

@@ -132,8 +132,8 @@ async fn render(
 
     let output = match mode {
         ConsoleMode::Dashboard => {
-            let (reqs, errs) = metrics.snapshot();
-            dashboard::render_dashboard(&state_snapshot, reqs, errs, config)
+            let metrics = metrics.snapshot();
+            dashboard::render_dashboard(&state_snapshot, metrics, config)
         }
         ConsoleMode::LogView => dashboard::render_log_view(config.console.show_timestamps),
         ConsoleMode::Help => dashboard::render_help(),

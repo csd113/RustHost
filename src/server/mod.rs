@@ -63,7 +63,16 @@ struct ServerContext {
     /// IPs whose X-Forwarded-For header is trusted.
     /// Defaults to empty (XFF ignored) for direct-edge deployments.
     trusted_proxies: Arc<Vec<IpAddr>>,
+    ingress: handler::RequestIngress,
 }
+
+#[derive(Clone, Copy)]
+struct ListenerOptions {
+    max_per_ip: Option<u32>,
+    keep_alive: bool,
+    ingress: handler::RequestIngress,
+}
+
 impl ServerContext {
     /// Variant used when the HTTP and HTTPS listeners must share the same
     /// connection-budget arcs. Both servers draw from the same semaphore and
@@ -76,8 +85,7 @@ impl ServerContext {
         data_dir: &Path,
         semaphore: Arc<Semaphore>,
         per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
-        max_per_ip: Option<u32>,
-        keep_alive: bool,
+        options: ListenerOptions,
     ) -> Option<Self> {
         let site_root = data_dir.join(&config.site.directory);
         let canonical_root: Arc<Path> = match site_root.canonicalize() {
@@ -119,7 +127,7 @@ impl ServerContext {
             index_file: Arc::from(config.site.index_file.as_str()),
             csp_header: Arc::from(config.server.csp_level.as_header_value()),
             state,
-            keep_alive,
+            keep_alive: options.keep_alive,
             dir_list: config.site.enable_directory_listing,
             expose_dots: config.site.expose_dotfiles,
             spa_routing: config.site.spa_routing,
@@ -129,9 +137,10 @@ impl ServerContext {
             semaphore,
             per_ip_map,
             max_conns,
-            max_per_ip,
+            max_per_ip: options.max_per_ip,
             // When empty, X-Forwarded-For is ignored on every connection.
             trusted_proxies: Arc::new(config.server.trusted_proxies.clone().unwrap_or_default()),
+            ingress: options.ingress,
         })
     }
     /// Attempt to spawn a handler task for one accepted connection.
@@ -184,6 +193,7 @@ impl ServerContext {
             error_503_page: self.error_503_page.clone(),
             redirects: Arc::clone(&self.redirects),
             trusted_proxies: Arc::clone(&self.trusted_proxies),
+            ingress: self.ingress,
         };
         join_set.spawn(async move {
             let _admission = admission;
@@ -250,8 +260,11 @@ pub async fn run(
         &data_dir,
         shared_semaphore,
         shared_per_ip_map,
-        Some(config.server.max_connections_per_ip),
-        true,
+        ListenerOptions {
+            max_per_ip: Some(config.server.max_connections_per_ip),
+            keep_alive: true,
+            ingress: handler::RequestIngress::Http,
+        },
     ) else {
         return;
     };
@@ -399,8 +412,11 @@ pub async fn run_https(
         &data_dir,
         shared_semaphore,
         shared_per_ip_map,
-        Some(config.server.max_connections_per_ip),
-        true,
+        ListenerOptions {
+            max_per_ip: Some(config.server.max_connections_per_ip),
+            keep_alive: true,
+            ingress: handler::RequestIngress::Https,
+        },
     ) else {
         return;
     };
@@ -478,6 +494,7 @@ pub async fn run_https(
                         let e503 = ctx.error_503_page.clone();
                         let redirects = Arc::clone(&ctx.redirects);
                         let trusted_proxies = Arc::clone(&ctx.trusted_proxies);
+                        let ingress = ctx.ingress;
                         join_set.spawn(async move {
                             // Items must appear before any statements (clippy::items_after_statements).
                             use tokio_util::compat::{
@@ -551,6 +568,7 @@ pub async fn run_https(
                                 error_503_page: e503,
                                 redirects,
                                 trusted_proxies,
+                                ingress,
                             };
                             if let Err(e) = handler::handle(tls_stream, handler_config, met).await {
                                 log::debug!("HTTPS handler error: {e}");
@@ -645,8 +663,11 @@ pub async fn run_tor_ingress(
         &data_dir,
         shared_semaphore,
         Arc::new(DashMap::new()),
-        None,
-        false,
+        ListenerOptions {
+            max_per_ip: None,
+            keep_alive: false,
+            ingress: handler::RequestIngress::Tor,
+        },
     ) else {
         return;
     };

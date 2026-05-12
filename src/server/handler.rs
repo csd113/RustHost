@@ -36,7 +36,7 @@ use tokio_util::io::ReaderStream;
 
 use super::{fallback, mime};
 use crate::{
-    runtime::state::{SharedMetrics, SharedState},
+    runtime::state::{SharedMetrics, SharedState, VisitorIdentity},
     Result,
 };
 use encoding::Encoding;
@@ -99,6 +99,13 @@ pub struct FeatureFlags {
     pub keep_alive: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestIngress {
+    Http,
+    Https,
+    Tor,
+}
+
 #[derive(Clone)]
 pub(crate) struct HandlerConfig {
     pub(crate) peer_addr: std::net::SocketAddr,
@@ -112,6 +119,7 @@ pub(crate) struct HandlerConfig {
     pub(crate) error_503_page: Option<Arc<CustomErrorPage>>,
     pub(crate) redirects: Arc<Vec<crate::config::RedirectRule>>,
     pub(crate) trusted_proxies: Arc<Vec<std::net::IpAddr>>,
+    pub(crate) ingress: RequestIngress,
 }
 
 #[derive(Clone)]
@@ -255,6 +263,7 @@ where
         redirects: config.redirects,
         peer_addr: config.peer_addr,
         trusted_proxies: config.trusted_proxies,
+        ingress: config.ingress,
     });
 
     let io = TokioIo::new(PrefixedStream::new(prefetched, stream));
@@ -473,6 +482,8 @@ struct RouteConfig {
     /// Set of IPs allowed to supply X-Forwarded-For headers.
     /// An empty Vec means XFF is ignored on every connection (default).
     trusted_proxies: Arc<Vec<std::net::IpAddr>>,
+    /// Listener path that accepted this request.
+    ingress: RequestIngress,
 }
 
 #[expect(
@@ -484,6 +495,14 @@ async fn route(
     cfg: &RouteConfig,
     metrics: &SharedMetrics,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    record_unique_visitor(
+        &req,
+        cfg.peer_addr,
+        &cfg.trusted_proxies,
+        cfg.ingress,
+        metrics,
+    );
+
     match req.method() {
         &Method::OPTIONS => {
             metrics.add_request();
@@ -665,6 +684,35 @@ async fn route(
     // Inject HSTS and other security headers that depend on transport.
     let resp = inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await;
     Ok(resp)
+}
+
+fn record_unique_visitor<B>(
+    req: &Request<B>,
+    peer_addr: std::net::SocketAddr,
+    trusted_proxies: &[std::net::IpAddr],
+    ingress: RequestIngress,
+    metrics: &SharedMetrics,
+) {
+    metrics.add_unique_visitor(visitor_identity(req, peer_addr, trusted_proxies, ingress));
+}
+
+fn visitor_identity<B>(
+    req: &Request<B>,
+    peer_addr: std::net::SocketAddr,
+    trusted_proxies: &[std::net::IpAddr],
+    ingress: RequestIngress,
+) -> VisitorIdentity {
+    match ingress {
+        RequestIngress::Http | RequestIngress::Https => {
+            VisitorIdentity::Clearnet(resolved_remote_addr(req, peer_addr, trusted_proxies))
+        }
+        // The in-process Tor proxy intentionally avoids adding cookies,
+        // fingerprints, or circuit-level identifiers. Once Arti proxies a
+        // stream into the local ingress listener, the stable identity available
+        // to HTTP is just the local proxy socket, so Tor is counted as one
+        // anonymous runtime bucket.
+        RequestIngress::Tor => VisitorIdentity::TorAnonymous,
+    }
 }
 
 /// Map a [`Resolved`] value to an HTTP response.
@@ -1972,9 +2020,11 @@ mod sanitize_tests {
 mod proxy_tests {
     #![allow(clippy::expect_used)]
 
-    use super::resolved_remote_addr;
+    use super::{record_unique_visitor, resolved_remote_addr, visitor_identity, RequestIngress};
+    use crate::runtime::state::{Metrics, VisitorIdentity};
     use bytes::Bytes;
     use http_body_util::Empty;
+    use std::sync::Arc;
 
     fn request_with_xff(value: &str) -> hyper::Request<Empty<Bytes>> {
         hyper::Request::builder()
@@ -2003,6 +2053,50 @@ mod proxy_tests {
             resolved_remote_addr(&req, peer, &trusted),
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         );
+    }
+
+    #[test]
+    fn http_and_https_share_clearnet_visitor_identity() {
+        let req = hyper::Request::builder()
+            .body(Empty::<Bytes>::new())
+            .expect("valid request builder");
+        let peer = std::net::SocketAddr::from(([203, 0, 113, 10], 8080));
+        let trusted = [];
+
+        assert_eq!(
+            visitor_identity(&req, peer, &trusted, RequestIngress::Http),
+            visitor_identity(&req, peer, &trusted, RequestIngress::Https)
+        );
+    }
+
+    #[test]
+    fn tor_visitor_identity_is_anonymous_bucket() {
+        let req = hyper::Request::builder()
+            .body(Empty::<Bytes>::new())
+            .expect("valid request builder");
+        let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 48000));
+        let trusted = [];
+
+        assert_eq!(
+            visitor_identity(&req, peer, &trusted, RequestIngress::Tor),
+            VisitorIdentity::TorAnonymous
+        );
+    }
+
+    #[test]
+    fn http_https_and_tor_update_same_unique_counter() {
+        let req = hyper::Request::builder()
+            .body(Empty::<Bytes>::new())
+            .expect("valid request builder");
+        let metrics = Arc::new(Metrics::new());
+        let peer = std::net::SocketAddr::from(([203, 0, 113, 10], 8080));
+        let trusted = [];
+
+        record_unique_visitor(&req, peer, &trusted, RequestIngress::Http, &metrics);
+        record_unique_visitor(&req, peer, &trusted, RequestIngress::Https, &metrics);
+        record_unique_visitor(&req, peer, &trusted, RequestIngress::Tor, &metrics);
+
+        assert_eq!(metrics.snapshot().unique_visitors, 2);
     }
 }
 
