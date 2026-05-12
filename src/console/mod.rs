@@ -138,7 +138,7 @@ async fn render(
     let output = match mode {
         ConsoleMode::Dashboard => {
             let metrics = metrics.snapshot();
-            dashboard::render_dashboard(&state_snapshot, metrics, config)
+            dashboard::render_dashboard(&state_snapshot, metrics, config, data_dir)
         }
         ConsoleMode::Menu => menu::render(&state_snapshot.menu, config, &state_snapshot, data_dir),
         ConsoleMode::LogView => dashboard::render_log_view(config.console.show_timestamps),

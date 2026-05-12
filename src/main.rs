@@ -545,7 +545,7 @@ fn main() -> std::process::ExitCode {
             let _ = writeln!(
                 std::io::stdout(),
                 "{}",
-                rusthost::version::product_version_line()
+                rusthost::version::cli_version_output()
             );
             return std::process::ExitCode::SUCCESS;
         }

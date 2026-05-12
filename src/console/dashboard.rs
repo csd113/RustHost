@@ -8,10 +8,16 @@ use crate::{
     },
 };
 use std::fmt::Write as _;
+use std::path::Path;
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────
 #[must_use]
-pub fn render_dashboard(state: &AppState, metrics: MetricsSnapshot, config: &Config) -> String {
+pub fn render_dashboard(
+    state: &AppState,
+    metrics: MetricsSnapshot,
+    config: &Config,
+    data_dir: &Path,
+) -> String {
     let mut out = String::with_capacity(1_024);
     ui::push_header(&mut out, &config.identity.instance_name);
     out.push_str("\r\n");
@@ -97,8 +103,8 @@ pub fn render_dashboard(state: &AppState, metrics: MetricsSnapshot, config: &Con
     let _ = writeln!(out, "{}\r", ui::bold("Site"));
     let _ = writeln!(
         out,
-        " Directory : ./rusthost-data/{}\r",
-        config.site.directory
+        " Directory : {}\r",
+        data_dir.join(&config.site.directory).display()
     );
     let _ = writeln!(out, " Files : {}\r", state.site_file_count);
     let _ = writeln!(out, " Size : {}\r", format_bytes(state.site_total_bytes));
@@ -230,6 +236,7 @@ mod tests {
         config::Config,
         runtime::state::{AppState, MetricsSnapshot},
     };
+    use std::path::Path;
     use std::time::Duration;
     #[test]
     fn strip_timestamp_ascii_log_line() {
@@ -274,7 +281,12 @@ mod tests {
             unique_visitors: 1,
             uptime: Duration::from_secs(65),
         };
-        let output = render_dashboard(&AppState::new(), metrics, &Config::default());
+        let output = render_dashboard(
+            &AppState::new(),
+            metrics,
+            &Config::default(),
+            Path::new("./rusthost-data"),
+        );
 
         assert!(output.contains("Unique visitors : 1"));
         assert!(output.contains("Uptime : 1m 05s"));
@@ -292,8 +304,27 @@ mod tests {
                 uptime: Duration::ZERO,
             },
             &Config::default(),
+            Path::new("./rusthost-data"),
         );
 
         assert!(output.contains("[M] Menu"));
+    }
+
+    #[test]
+    fn dashboard_site_directory_uses_active_data_dir() {
+        let output = render_dashboard(
+            &AppState::new(),
+            MetricsSnapshot {
+                requests: 0,
+                errors: 0,
+                unique_visitors: 0,
+                uptime: Duration::ZERO,
+            },
+            &Config::default(),
+            Path::new("/tmp/rusthost-custom"),
+        );
+
+        assert!(output.contains("Directory : /tmp/rusthost-custom/site"));
+        assert!(!output.contains("./rusthost-data/site"));
     }
 }

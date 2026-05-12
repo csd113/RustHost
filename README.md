@@ -330,7 +330,23 @@ cargo run -- --help
 cargo run -- --serve ./public
 ```
 
-Quality gates:
+### Release validation
+
+Use this command set before a release candidate or readiness handoff.
+Initialize `./tmp-release-check` once with an isolated live run, then run the validation commands below against that same temp data directory:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo build --bin rusthost-cli
+target/debug/rusthost-cli --version
+target/debug/rusthost-cli doctor --data-dir ./tmp-release-check
+```
+
+For live `/health` and `/ready` verification, start RustHost against an isolated temporary data directory such as `./tmp-release-check` rather than a real deployment data directory.
+
+Additional quality gates:
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings

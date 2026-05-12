@@ -14,6 +14,7 @@
 mod support;
 
 use std::{
+    fmt::Write as _,
     io::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
@@ -243,80 +244,78 @@ fn first_run_setup(
 
     if headless {
         let mut stdout = std::io::stdout();
-        match install_kind {
-            InstallKind::Fresh => {
-                writeln!(stdout, "RustHost initialized data directory")?;
-                writeln!(
-                    stdout,
-                    "Created default config: {}",
-                    settings_path.display()
-                )?;
-            }
-            InstallKind::RegeneratedSettings => {
-                writeln!(stdout, "RustHost regenerated missing settings.toml")?;
-                writeln!(stdout, "Regenerated config: {}", settings_path.display())?;
-            }
-        }
-        writeln!(
-            stdout,
-            "Site directory: {}",
-            data_dir.join("site").display()
+        stdout.write_all(
+            first_run_headless_message(data_dir, settings_path, install_kind).as_bytes(),
         )?;
-        writeln!(
-            stdout,
-            "Runtime directory: {}",
-            runtime_root(data_dir).display()
-        )?;
-        writeln!(stdout, "Starting server now...")?;
         return Ok(());
     }
 
     let mut stdout = std::io::stdout();
-    writeln!(stdout)?;
-    match install_kind {
-        InstallKind::Fresh => {
-            writeln!(stdout, "  RustHost — fresh install detected")?;
-            writeln!(stdout, "  ─────────────────────────────────────────")?;
-            writeln!(
-                stdout,
-                "  Data directories and a default config have been created."
-            )?;
-        }
-        InstallKind::RegeneratedSettings => {
-            writeln!(stdout, "  settings.toml missing; regenerated from defaults")?;
-            writeln!(stdout, "  ─────────────────────────────────────────")?;
-            writeln!(
-                stdout,
-                "  Existing site/runtime data was kept; review the new config before production use."
-            )?;
-        }
-    }
-    writeln!(
-        stdout,
-        "  You can drop your site files into:  ./rusthost-data/site/"
-    )?;
-    writeln!(
-        stdout,
-        "  Runtime-managed files live under:    ./rusthost-data/runtime/"
-    )?;
-    writeln!(stdout)?;
-    writeln!(
-        stdout,
-        "  Tor onion service is built-in — no external install required."
-    )?;
-    writeln!(
-        stdout,
-        "  On first run, Arti will download ~2 MB of directory data (~30 s)."
-    )?;
-    writeln!(
-        stdout,
-        "  Your .onion address will be shown in the dashboard once ready."
-    )?;
-    writeln!(stdout)?;
-    writeln!(stdout, "  Starting server now…")?;
-    writeln!(stdout)?;
+    stdout.write_all(first_run_interactive_message(data_dir, install_kind).as_bytes())?;
 
     Ok(())
+}
+
+fn first_run_headless_message(
+    data_dir: &Path,
+    settings_path: &Path,
+    install_kind: InstallKind,
+) -> String {
+    let mut out = String::new();
+    match install_kind {
+        InstallKind::Fresh => {
+            out.push_str("RustHost initialized data directory\n");
+            let _ = writeln!(out, "Created default config: {}", settings_path.display());
+        }
+        InstallKind::RegeneratedSettings => {
+            out.push_str("RustHost regenerated missing settings.toml\n");
+            let _ = writeln!(out, "Regenerated config: {}", settings_path.display());
+        }
+    }
+    let _ = writeln!(out, "Site directory: {}", data_dir.join("site").display());
+    let _ = writeln!(
+        out,
+        "Runtime directory: {}",
+        runtime_root(data_dir).display()
+    );
+    out.push_str("Starting server now...\n");
+    out
+}
+
+fn first_run_interactive_message(data_dir: &Path, install_kind: InstallKind) -> String {
+    let mut out = String::new();
+    out.push('\n');
+    match install_kind {
+        InstallKind::Fresh => {
+            out.push_str("  RustHost — fresh install detected\n");
+            out.push_str("  ─────────────────────────────────────────\n");
+            out.push_str("  Data directories and a default config have been created.\n");
+        }
+        InstallKind::RegeneratedSettings => {
+            out.push_str("  settings.toml missing; regenerated from defaults\n");
+            out.push_str("  ─────────────────────────────────────────\n");
+            out.push_str(
+                "  Existing site/runtime data was kept; review the new config before production use.\n",
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  You can drop your site files into:  {}/",
+        data_dir.join("site").display()
+    );
+    let _ = writeln!(
+        out,
+        "  Runtime-managed files live under:    {}/",
+        runtime_root(data_dir).display()
+    );
+    out.push('\n');
+    out.push_str("  Tor onion service is built-in — no external install required.\n");
+    out.push_str("  On first run, Arti will download ~2 MB of directory data (~30 s).\n");
+    out.push_str("  Your .onion address will be shown in the dashboard once ready.\n");
+    out.push('\n');
+    out.push_str("  Starting server now…\n\n");
+    out
 }
 
 // ─── Normal Run ──────────────────────────────────────────────────────────────
@@ -895,7 +894,8 @@ const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_managed_runtime_mode, detect_install_kind, ensure_data_directories, first_run_setup,
+        apply_managed_runtime_mode, detect_install_kind, ensure_data_directories,
+        first_run_headless_message, first_run_interactive_message, first_run_setup,
         managed_runner_mode, uses_redirect_public_http, InstallKind, ManagedRunnerMode,
     };
     use crate::config::Config;
@@ -997,6 +997,38 @@ mod tests {
         let data_dir = tmp.path().join("rusthost-data");
 
         assert_eq!(detect_install_kind(&data_dir), InstallKind::Fresh);
+        Ok(())
+    }
+
+    #[test]
+    fn first_run_headless_message_uses_active_data_dir() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("custom-data");
+        let settings_path = data_dir.join("settings.toml");
+
+        let output = first_run_headless_message(&data_dir, &settings_path, InstallKind::Fresh);
+
+        assert!(output.contains(&format!(
+            "Site directory: {}",
+            data_dir.join("site").display()
+        )));
+        assert!(output.contains(&format!(
+            "Runtime directory: {}",
+            data_dir.join("runtime").display()
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn first_run_interactive_message_uses_active_data_dir() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("custom-data");
+
+        let output = first_run_interactive_message(&data_dir, InstallKind::Fresh);
+
+        assert!(output.contains(&format!("{}/", data_dir.join("site").display())));
+        assert!(output.contains(&format!("{}/", data_dir.join("runtime").display())));
+        assert!(!output.contains("./rusthost-data/site/"));
         Ok(())
     }
 }
