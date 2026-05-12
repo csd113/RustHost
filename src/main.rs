@@ -36,9 +36,6 @@ use std::sync::Once;
 use rusthost::runtime::lifecycle::CliArgs;
 use rusthost::terminal::RelaunchIntent;
 
-/// Crate version, sourced once from `Cargo.toml` at compile time.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 // ─── Safe cleanup wrapper ─────────────────────────────────────────────────────
 
 /// Ensure `console::cleanup()` runs at most once, regardless of which thread
@@ -456,7 +453,11 @@ fn print_help() {
         .next()
         .unwrap_or_else(|| "rusthost-cli".to_owned());
 
-    let _ = write!(std::io::stdout(), "{}", format_help(&bin, VERSION));
+    let _ = write!(
+        std::io::stdout(),
+        "{}",
+        format_help(&bin, rusthost::version::package_version())
+    );
 }
 
 fn format_help(bin: &str, version: &str) -> String {
@@ -541,7 +542,11 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::SUCCESS;
         }
         Ok(ParseOutcome::Version) => {
-            let _ = writeln!(std::io::stdout(), "rusthost {VERSION}");
+            let _ = writeln!(
+                std::io::stdout(),
+                "{}",
+                rusthost::version::product_version_line()
+            );
             return std::process::ExitCode::SUCCESS;
         }
         Err(err) => {
@@ -565,7 +570,11 @@ fn main() -> std::process::ExitCode {
         //
         // The version is embedded so that panic reports are unambiguously
         // tied to a specific release without needing additional context.
-        let _ = writeln!(std::io::stderr(), "\nPanic (rusthost {VERSION}): {info}");
+        let _ = writeln!(
+            std::io::stderr(),
+            "\nPanic (RustHost {}): {info}",
+            rusthost::version::package_version()
+        );
 
         let bt = std::backtrace::Backtrace::capture();
         if bt.status() == std::backtrace::BacktraceStatus::Captured {

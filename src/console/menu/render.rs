@@ -54,6 +54,9 @@ fn render_page(page: Page, state: &MenuState) -> String {
     if page == Page::Doctor {
         return render_doctor(state);
     }
+    if page == Page::Diagnostics {
+        return render_diagnostics(state);
+    }
 
     let mut out = String::with_capacity(512);
     let _ = writeln!(out, "{RULE}\r");
@@ -68,6 +71,34 @@ fn render_page(page: Page, state: &MenuState) -> String {
     out.push_str("\r\n");
     let _ = writeln!(out, "{RULE}\r");
     out.push_str("[Esc] Back\r\n");
+    let _ = writeln!(out, "{RULE}\r");
+    out
+}
+
+fn render_diagnostics(state: &MenuState) -> String {
+    let mut out = String::with_capacity(1_024);
+    let _ = writeln!(out, "{RULE}\r");
+    let _ = writeln!(out, " {}\r", bold("RustHost Diagnostics"));
+    let _ = writeln!(out, "{RULE}\r");
+    out.push_str("\r\n");
+
+    let diagnostics = state.diagnostics();
+    if let Some(report) = diagnostics.report() {
+        for line in report.text().lines() {
+            let _ = writeln!(out, "{line}\r");
+        }
+    } else {
+        out.push_str("Diagnostics snapshot has not been collected yet.\r\n");
+    }
+
+    if let Some(status) = diagnostics.status() {
+        out.push_str("\r\n");
+        let _ = writeln!(out, "{}\r", dim(status));
+    }
+
+    out.push_str("\r\n");
+    let _ = writeln!(out, "{RULE}\r");
+    out.push_str("[C] Copy diagnostics  [R] Refresh  [X] Clear status  [Esc] Back\r\n");
     let _ = writeln!(out, "{RULE}\r");
     out
 }
@@ -117,7 +148,7 @@ fn render_doctor(state: &MenuState) -> String {
     out.push_str("\r\n");
     let _ = writeln!(out, "{RULE}\r");
     out.push_str("[R] Re-run fast checks  [D] Run deep checks  [Enter] Expand/collapse\r\n");
-    out.push_str("[↑↓/jk] Navigate sections  [Esc] Back  [Q] Quit\r\n");
+    out.push_str("[↑↓/jk] Navigate sections  [Esc] Back\r\n");
     let _ = writeln!(out, "{RULE}\r");
     out
 }
@@ -144,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_page_renders_minimal_not_implemented_state() {
+    fn doctor_page_renders_without_quit_control() {
         let mut state = MenuState::new();
         state.move_down();
         state.move_down();
@@ -155,6 +186,6 @@ mod tests {
         assert!(output.contains("Doctor"));
         assert!(output.contains("Doctor report has not run yet."));
         assert!(output.contains("[Esc] Back"));
-        assert!(output.contains("[Q] Quit"));
+        assert!(!output.contains("[Q] Quit"));
     }
 }

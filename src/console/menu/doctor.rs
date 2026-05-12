@@ -331,7 +331,7 @@ pub fn run_deep_checks(config: &Config, data_dir: &Path, live: DoctorLiveState) 
     } else {
         section.push(
             DoctorStatus::NotRun,
-            "TLS handshake skipped because TLS is disabled",
+            "TLS is disabled in settings; certificate/key checks were skipped.",
         );
     }
 
@@ -342,24 +342,21 @@ pub fn run_deep_checks(config: &Config, data_dir: &Path, live: DoctorLiveState) 
             section.push(DoctorStatus::Pass, "Tor state/cache directories exist");
         } else {
             section.push(
-                DoctorStatus::Warn,
-                "Tor bootstrap not run from Doctor; state/cache directories are not both present yet",
+                DoctorStatus::NotRun,
+                "Tor bootstrap state was not checked because Doctor does not wait for bootstrap.",
             );
         }
     } else {
-        section.push(
-            DoctorStatus::NotRun,
-            "Tor bootstrap skipped because Tor is disabled",
-        );
+        section.push(DoctorStatus::NotRun, "Tor support is disabled in settings.");
     }
 
     section.push(
-        DoctorStatus::Warn,
-        "public internet and reverse proxy reachability are not probed automatically",
+        DoctorStatus::NotRun,
+        "Doctor avoids external public reachability checks by default to prevent flaky network-dependent results. Use a separate browser/curl test against your public URL if needed.",
     );
     section.push(
         DoctorStatus::NotRun,
-        "load testing is not performed by Doctor",
+        "Doctor does not perform load testing; use the static stress test or external tooling for capacity testing.",
     );
     section
 }
@@ -533,28 +530,29 @@ fn check_network(config: &Config, context: DoctorContext) -> DoctorSection {
     if config.tls.redirect_http {
         section.push(DoctorStatus::Pass, "HTTP->HTTPS redirect is enabled");
     } else {
-        section.push(DoctorStatus::Warn, "HTTP->HTTPS redirect is disabled");
+        section.push(
+            DoctorStatus::NotRun,
+            "HTTP redirect is disabled in settings.",
+        );
     }
-    match context {
-        DoctorContext::CommandLine => section.push(
-            DoctorStatus::Warn,
-            "public internet and reverse proxy reachability not tested by command-line doctor",
-        ),
-        DoctorContext::TuiLive(_) => section.push(
-            DoctorStatus::Warn,
-            "public internet and reverse proxy reachability are reported in Deep Checks",
-        ),
-    }
+    let message = match context {
+        DoctorContext::CommandLine => {
+            "Doctor avoids external public reachability checks by default to prevent flaky network-dependent results. Use a separate browser/curl test against your public URL if needed."
+        }
+        DoctorContext::TuiLive(_) => {
+            "Public reachability is not probed by the fast Doctor pass; use Deep Checks or a separate browser/curl test against your public URL if needed."
+        }
+    };
+    section.push(DoctorStatus::NotRun, message);
     section
 }
 
 fn check_tls(data_dir: &Path, config: &Config, context: DoctorContext) -> DoctorSection {
     let mut section = DoctorSection::new("TLS");
     if !config.tls.enabled {
-        section.push(DoctorStatus::Warn, "TLS disabled");
         section.push(
-            DoctorStatus::Pass,
-            "certificate/key files are not required when TLS is disabled",
+            DoctorStatus::NotRun,
+            "TLS is disabled in settings; certificate/key checks were skipped.",
         );
         return section;
     }
@@ -580,12 +578,12 @@ fn check_tls(data_dir: &Path, config: &Config, context: DoctorContext) -> Doctor
     }
     match context {
         DoctorContext::CommandLine => section.push(
-            DoctorStatus::Warn,
-            "browser TLS handshake not tested by command-line doctor",
+            DoctorStatus::NotRun,
+            "Browser TLS handshakes are not run by command-line Doctor.",
         ),
         DoctorContext::TuiLive(_) => section.push(
-            DoctorStatus::Warn,
-            "TLS listener probing is reported in Deep Checks",
+            DoctorStatus::NotRun,
+            "TLS listener probing is reported by Deep Checks; the fast Doctor pass does not open a TLS client connection.",
         ),
     }
     section
@@ -594,7 +592,7 @@ fn check_tls(data_dir: &Path, config: &Config, context: DoctorContext) -> Doctor
 fn check_tor(data_dir: &Path, config: &Config, context: DoctorContext) -> DoctorSection {
     let mut section = DoctorSection::new("Tor");
     if !config.tor.enabled {
-        section.push(DoctorStatus::Pass, "Tor disabled");
+        section.push(DoctorStatus::NotRun, "Tor support is disabled in settings.");
         return section;
     }
 
@@ -606,12 +604,12 @@ fn check_tor(data_dir: &Path, config: &Config, context: DoctorContext) -> Doctor
     }
     match context {
         DoctorContext::CommandLine => section.push(
-            DoctorStatus::Warn,
-            "Tor bootstrap not tested by command-line doctor",
+            DoctorStatus::NotRun,
+            "Tor bootstrap is not checked by the fast command-line Doctor pass.",
         ),
         DoctorContext::TuiLive(_) => section.push(
-            DoctorStatus::Warn,
-            "Tor bootstrap is reported in Deep Checks and the dashboard runtime status",
+            DoctorStatus::NotRun,
+            "Tor bootstrap is reported by Deep Checks and the runtime dashboard; the fast Doctor pass does not wait for bootstrap.",
         ),
     }
     section
@@ -810,8 +808,8 @@ fn check_acme_config(section: &mut DoctorSection, data_dir: &Path, config: &Conf
         check_directory_usable(section, "ACME cache directory", &cache, true);
     }
     section.push(
-        DoctorStatus::Warn,
-        "ACME issuance and public certificate validation are not tested by command-line doctor",
+        DoctorStatus::NotRun,
+        "ACME issuance and public certificate validation are not run by Doctor.",
     );
 }
 
@@ -1096,6 +1094,62 @@ manual_cert = { cert_path = "missing.crt", key_path = "missing.key" }"#,
             DoctorContext::CommandLine,
         );
         assert!(!has_line(&report, DoctorStatus::Fail, "certificate"));
+        assert!(!has_line(&report, DoctorStatus::Warn, "TLS disabled"));
+        assert!(has_line(
+            &report,
+            DoctorStatus::NotRun,
+            "TLS is disabled in settings"
+        ));
+    }
+
+    #[test]
+    fn disabled_features_are_not_warnings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_settings(tmp.path(), &default_settings(19083));
+        let report = run_fast_doctor(
+            tmp.path(),
+            &tmp.path().join("settings.toml"),
+            DoctorContext::CommandLine,
+        );
+
+        assert!(has_line(
+            &report,
+            DoctorStatus::NotRun,
+            "HTTP redirect is disabled"
+        ));
+        assert!(has_line(
+            &report,
+            DoctorStatus::NotRun,
+            "Tor support is disabled"
+        ));
+        assert!(!has_line(
+            &report,
+            DoctorStatus::Warn,
+            "HTTP->HTTPS redirect is disabled"
+        ));
+        assert!(!has_line(&report, DoctorStatus::Warn, "Tor disabled"));
+    }
+
+    #[test]
+    fn skipped_external_checks_are_not_warnings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_settings(tmp.path(), &default_settings(19084));
+        let report = run_fast_doctor(
+            tmp.path(),
+            &tmp.path().join("settings.toml"),
+            DoctorContext::CommandLine,
+        );
+
+        assert!(has_line(
+            &report,
+            DoctorStatus::NotRun,
+            "Doctor avoids external public reachability checks"
+        ));
+        assert!(!has_line(
+            &report,
+            DoctorStatus::Warn,
+            "reachability not tested"
+        ));
     }
 
     #[test]

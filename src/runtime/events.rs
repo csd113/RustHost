@@ -18,7 +18,9 @@ const RELOAD_STATUS_DURATION: Duration = Duration::from_secs(3);
 pub enum KeyEvent {
     Help,
     Menu,
+    CopyDiagnostics,
     Reload,
+    ClearStatus,
     RunDoctorDeep,
     Open,
     ToggleLogs,
@@ -96,8 +98,12 @@ pub async fn reload_site(
 fn handle_console_state(event: KeyEvent, state: &mut AppState) -> bool {
     match event {
         KeyEvent::Quit => {
-            state.menu.leave();
-            state.console_mode = ConsoleMode::ConfirmQuit;
+            if state.console_mode == ConsoleMode::Dashboard {
+                state.console_mode = ConsoleMode::ConfirmQuit;
+            } else if state.console_mode == ConsoleMode::Menu && !state.menu.has_active_page() {
+                state.menu.leave();
+                state.console_mode = ConsoleMode::ConfirmQuit;
+            }
         }
         KeyEvent::Back => {
             state.console_mode = match state.console_mode {
@@ -180,7 +186,12 @@ fn handle_console_state(event: KeyEvent, state: &mut AppState) -> bool {
                 state.console_mode = ConsoleMode::Dashboard;
             }
         }
-        KeyEvent::ForceQuit | KeyEvent::Reload | KeyEvent::RunDoctorDeep | KeyEvent::Open => {}
+        KeyEvent::ForceQuit
+        | KeyEvent::CopyDiagnostics
+        | KeyEvent::Reload
+        | KeyEvent::ClearStatus
+        | KeyEvent::RunDoctorDeep
+        | KeyEvent::Open => {}
     }
 
     false
@@ -295,6 +306,50 @@ async fn handle_doctor_page_event(
     }
 }
 
+async fn handle_diagnostics_page_event(
+    event: KeyEvent,
+    config: &Config,
+    state: SharedState,
+    data_dir: &std::path::Path,
+    settings_path: Option<&std::path::Path>,
+) -> Option<bool> {
+    let snapshot = {
+        let snapshot = state.read().await;
+        if snapshot.console_mode != ConsoleMode::Menu
+            || snapshot.menu.active_page() != Some(Page::Diagnostics)
+        {
+            return None;
+        }
+        snapshot.clone()
+    };
+
+    match event {
+        KeyEvent::CopyDiagnostics => {
+            state.write().await.menu.set_diagnostics_status(
+                "Clipboard support unavailable; select and copy the diagnostics text.",
+            );
+            Some(false)
+        }
+        KeyEvent::Reload => {
+            let report =
+                menu::diagnostics::build_report(config, &snapshot, data_dir, settings_path);
+            let mut snapshot = state.write().await;
+            snapshot.menu.set_diagnostics_report(report);
+            snapshot
+                .menu
+                .set_diagnostics_status("Diagnostics refreshed.");
+            drop(snapshot);
+            Some(false)
+        }
+        KeyEvent::ClearStatus => {
+            state.write().await.menu.clear_diagnostics_status();
+            Some(false)
+        }
+        KeyEvent::Quit => Some(false),
+        _ => None,
+    }
+}
+
 /// Dispatch a single key event, mutating shared state as needed.
 ///
 /// Returns `true` when the event is [`KeyEvent::Quit`] (the caller should
@@ -318,6 +373,18 @@ pub async fn handle(
     settings_path: Option<PathBuf>,
     root_tx: &tokio::sync::watch::Sender<std::sync::Arc<std::path::Path>>,
 ) -> Result<bool> {
+    if let Some(quit) = handle_diagnostics_page_event(
+        event,
+        config,
+        Arc::clone(&state),
+        &data_dir,
+        settings_path.as_deref(),
+    )
+    .await
+    {
+        return Ok(quit);
+    }
+
     if let Some(quit) = handle_doctor_page_event(
         event,
         config,
@@ -357,11 +424,28 @@ pub async fn handle(
             let should_initialize_doctor = snapshot.console_mode == ConsoleMode::Menu
                 && snapshot.menu.active_page() == Some(Page::Doctor)
                 && snapshot.menu.doctor().report().is_none();
+            let should_initialize_diagnostics = snapshot.console_mode == ConsoleMode::Menu
+                && snapshot.menu.active_page() == Some(Page::Diagnostics)
+                && snapshot.menu.diagnostics().report().is_none();
             let live = live_doctor_state(&snapshot);
+            let diagnostics_snapshot = if should_initialize_diagnostics {
+                Some(snapshot.clone())
+            } else {
+                None
+            };
             drop(snapshot);
             if should_initialize_doctor {
                 let report = run_tui_fast_doctor(config, &data_dir, settings_path.as_deref(), live);
                 state.write().await.menu.set_doctor_report(report);
+            }
+            if let Some(snapshot) = diagnostics_snapshot {
+                let report = menu::diagnostics::build_report(
+                    config,
+                    &snapshot,
+                    &data_dir,
+                    settings_path.as_deref(),
+                );
+                state.write().await.menu.set_diagnostics_report(report);
             }
             return Ok(quit);
         }
@@ -578,6 +662,157 @@ mod tests {
         )
         .await;
         assert_eq!(state.read().await.console_mode, ConsoleMode::LogView);
+    }
+
+    #[tokio::test]
+    async fn quit_is_limited_to_dashboard_and_top_level_menu() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
+        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+
+        let quit = handle_key(
+            KeyEvent::Quit,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert!(!quit);
+        assert_eq!(state.read().await.console_mode, ConsoleMode::ConfirmQuit);
+
+        state.write().await.console_mode = ConsoleMode::Dashboard;
+        handle_key(
+            KeyEvent::Menu,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        handle_key(
+            KeyEvent::Quit,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert_eq!(state.read().await.console_mode, ConsoleMode::ConfirmQuit);
+
+        {
+            let mut snapshot = state.write().await;
+            snapshot.console_mode = ConsoleMode::Menu;
+            snapshot.menu.enter();
+            while snapshot.menu.selected_page() != Page::Doctor {
+                snapshot.menu.move_down();
+            }
+            drop(snapshot);
+        }
+        handle_key(
+            KeyEvent::OpenSelected,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        let quit = handle_key(
+            KeyEvent::Quit,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        let snapshot = state.read().await;
+        assert!(!quit);
+        assert_eq!(snapshot.console_mode, ConsoleMode::Menu);
+        assert_eq!(snapshot.menu.active_page(), Some(Page::Doctor));
+        drop(snapshot);
+
+        {
+            let mut snapshot = state.write().await;
+            let _ = snapshot.menu.back();
+            while snapshot.menu.selected_page() != Page::Diagnostics {
+                snapshot.menu.move_down();
+            }
+            drop(snapshot);
+        }
+        handle_key(
+            KeyEvent::OpenSelected,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        let quit = handle_key(
+            KeyEvent::Quit,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        let snapshot = state.read().await;
+        assert!(!quit);
+        assert_eq!(snapshot.console_mode, ConsoleMode::Menu);
+        assert_eq!(snapshot.menu.active_page(), Some(Page::Diagnostics));
+        drop(snapshot);
+
+        state.write().await.console_mode = ConsoleMode::LogView;
+        let quit = handle_key(
+            KeyEvent::Quit,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert!(!quit);
+        assert_eq!(state.read().await.console_mode, ConsoleMode::LogView);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_page_controls_are_page_local() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
+        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+
+        {
+            let mut snapshot = state.write().await;
+            snapshot.console_mode = ConsoleMode::Menu;
+            snapshot.menu.enter();
+            while snapshot.menu.selected_page() != Page::Diagnostics {
+                snapshot.menu.move_down();
+            }
+            drop(snapshot);
+        }
+        handle_key(
+            KeyEvent::OpenSelected,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert!(state.read().await.menu.diagnostics().report().is_some());
+
+        handle_key(
+            KeyEvent::CopyDiagnostics,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert!(state
+            .read()
+            .await
+            .menu
+            .diagnostics()
+            .status()
+            .is_some_and(|status| status.contains("Clipboard support unavailable")));
+
+        handle_key(
+            KeyEvent::ClearStatus,
+            Arc::clone(&state),
+            tmp.path().to_path_buf(),
+            &root_tx,
+        )
+        .await;
+        assert!(state.read().await.menu.diagnostics().status().is_none());
     }
 
     #[tokio::test]

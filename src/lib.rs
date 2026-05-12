@@ -27,6 +27,7 @@ pub mod server;
 pub mod terminal;
 pub mod tls;
 pub mod tor;
+pub mod version;
 pub(crate) mod windows_identity;
 
 pub use error::AppError;

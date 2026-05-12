@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{doctor::DoctorReport, Page};
+use super::{diagnostics::DiagnosticsReport, doctor::DoctorReport, Page};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuOpenTarget {
@@ -14,6 +14,7 @@ pub struct MenuState {
     selected: usize,
     active_page: Option<Page>,
     doctor: DoctorPageState,
+    diagnostics: DiagnosticsPageState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +92,50 @@ impl Default for DoctorPageState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticsPageState {
+    report: Option<DiagnosticsReport>,
+    status: Option<String>,
+}
+
+impl DiagnosticsPageState {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            report: None,
+            status: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn report(&self) -> Option<&DiagnosticsReport> {
+        self.report.as_ref()
+    }
+
+    #[must_use]
+    pub fn status(&self) -> Option<&str> {
+        self.status.as_deref()
+    }
+
+    pub fn set_report(&mut self, report: DiagnosticsReport) {
+        self.report = Some(report);
+    }
+
+    pub fn set_status(&mut self, status: impl Into<String>) {
+        self.status = Some(status.into());
+    }
+
+    pub fn clear_status(&mut self) {
+        self.status = None;
+    }
+}
+
+impl Default for DiagnosticsPageState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MenuState {
     #[must_use]
     pub const fn new() -> Self {
@@ -98,6 +143,7 @@ impl MenuState {
             selected: 0,
             active_page: None,
             doctor: DoctorPageState::new(),
+            diagnostics: DiagnosticsPageState::new(),
         }
     }
 
@@ -180,8 +226,25 @@ impl MenuState {
         &self.doctor
     }
 
+    #[must_use]
+    pub const fn diagnostics(&self) -> &DiagnosticsPageState {
+        &self.diagnostics
+    }
+
     pub fn set_doctor_report(&mut self, report: DoctorReport) {
         self.doctor.set_report(report);
+    }
+
+    pub fn set_diagnostics_report(&mut self, report: DiagnosticsReport) {
+        self.diagnostics.set_report(report);
+    }
+
+    pub fn set_diagnostics_status(&mut self, status: impl Into<String>) {
+        self.diagnostics.set_status(status);
+    }
+
+    pub fn clear_diagnostics_status(&mut self) {
+        self.diagnostics.clear_status();
     }
 
     pub fn toggle_doctor_section(&mut self) {
