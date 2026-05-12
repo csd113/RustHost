@@ -164,3 +164,42 @@ fn harden_windows_permissions(path: &std::path::Path) -> std::io::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_private_dir;
+
+    #[test]
+    fn ensure_private_dir_accepts_normal_directory_path() -> std::io::Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let base = std::env::current_dir()?
+            .join("target/test-artifacts/tor-fs")
+            .join(unique.to_string());
+        let path = base.join("runtime/tor/arti_state");
+        ensure_private_dir(&path)?;
+        assert!(path.is_dir());
+        let _ = std::fs::remove_dir_all(base);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_rejects_symlink_in_parent_chain() -> std::io::Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().map_err(std::io::Error::other)?;
+        let real_parent = tmp.path().join("real");
+        std::fs::create_dir_all(&real_parent)?;
+        let linked_parent = tmp.path().join("linked");
+        symlink(&real_parent, &linked_parent)?;
+
+        let err = ensure_private_dir(&linked_parent.join("child"))
+            .err()
+            .ok_or_else(|| std::io::Error::other("symlink must fail"))?;
+        assert!(err.to_string().contains("refusing to use symlink"));
+        Ok(())
+    }
+}

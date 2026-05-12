@@ -4,8 +4,8 @@ use crate::Result;
 use std::path::Path;
 
 const DEFAULT_SETTINGS: &str = r#"# ─── RustHost Configuration ──────────────────────────────────────────────────
-# Automatically generated on first run. Edit freely; RustHost reloads this
-# file when you press [R] in the dashboard.
+# Automatically generated on first run. Edit freely; pressing [R] in the
+# dashboard rescans site files and runtime state, but does not reload this file.
 # ─── [server] ─────────────────────────────────────────────────────────────────
 
 [server]
@@ -31,8 +31,10 @@ max_connections = 256
 # Grace period for active HTTP/HTTPS requests during shutdown.
 shutdown_grace_secs = 30
 
-# Content-Security-Policy preset: "off" | "relaxed" | "strict"
-# (see full explanation below)
+# Content-Security-Policy preset:
+# "off"     = no CSP header; best compatibility while setting up.
+# "relaxed" = allows any origin, inline scripts/styles, eval, data:, and blob:.
+# "strict"  = same-origin assets; inline scripts/styles allowed for simple static sites.
 csp_level = "off"
 
 # ─── [site] ───────────────────────────────────────────────────────────────────
@@ -43,6 +45,13 @@ directory = "site"
 
 # File served for directory requests.
 index_file = "index.html"
+
+# Favicon file under ./rusthost-data/site/.
+# /favicon.ico serves this file by default.
+favicon = "favicon.ico"
+
+# Enable /favicon.png support. Leave false unless you set favicon to a .png file.
+enable_png_favicon = false
 
 # Show directory listing instead of index_file.
 enable_directory_listing = false
@@ -146,4 +155,23 @@ pub fn write_default_config(path: &Path) -> Result<()> {
 
     std::fs::write(path, DEFAULT_SETTINGS)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)]
+
+    use super::write_default_config;
+
+    #[test]
+    fn generated_settings_comment_describes_site_rescan_not_config_reload() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("settings.toml");
+
+        write_default_config(&path).expect("write defaults");
+
+        let body = std::fs::read_to_string(path).expect("read defaults");
+        assert!(body.contains("rescans site files and runtime state"));
+        assert!(!body.contains("reloads this\n# file when you press [R]"));
+    }
 }

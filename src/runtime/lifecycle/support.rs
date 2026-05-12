@@ -13,6 +13,8 @@ use crate::{
 
 use super::SharedConnectionBudget;
 
+pub(super) type ListenerReady = std::result::Result<u16, String>;
+
 #[derive(Default)]
 pub(super) struct BackgroundTasks {
     pub(super) https: Option<tokio::task::JoinHandle<()>>,
@@ -33,11 +35,12 @@ struct HttpsTaskArgs<'a> {
 }
 
 pub(super) async fn wait_for_bind_port(
-    port_rx: oneshot::Receiver<u16>,
+    port_rx: oneshot::Receiver<ListenerReady>,
     label: &str,
 ) -> Result<u16> {
     match tokio::time::timeout(Duration::from_secs(10), port_rx).await {
-        Ok(Ok(port)) => Ok(port),
+        Ok(Ok(Ok(port))) => Ok(port),
+        Ok(Ok(Err(message))) => Err(AppError::ServerStartup(message)),
         Ok(Err(_)) => {
             log::error!("{label} port channel closed before sending — startup failed");
             Err(AppError::ServerStartup(format!(
@@ -138,7 +141,7 @@ fn spawn_https_task(
     tasks: &mut BackgroundTasks,
     args: &HttpsTaskArgs<'_>,
     acceptor: tls::Acceptor,
-) -> oneshot::Receiver<u16> {
+) -> oneshot::Receiver<ListenerReady> {
     let tls_config = Arc::clone(args.config);
     let tls_state = Arc::clone(args.state);
     let tls_metrics = Arc::clone(args.metrics);
@@ -147,7 +150,7 @@ fn spawn_https_task(
     let tls_sem = std::sync::Arc::clone(&args.budget.semaphore);
     let tls_ip_map = std::sync::Arc::clone(&args.budget.per_ip_map);
     let tls_root_rx = args.root_tx.subscribe();
-    let (tls_port_tx, tls_port_rx) = oneshot::channel::<u16>();
+    let (tls_port_tx, tls_port_rx) = oneshot::channel::<ListenerReady>();
     tasks.https = Some(tokio::spawn(async move {
         server::run_https(
             tls_config,
@@ -172,23 +175,25 @@ fn spawn_redirect_task(
     state: &SharedState,
     shutdown_rx: &watch::Receiver<bool>,
     budget: &SharedConnectionBudget,
-) -> oneshot::Receiver<u16> {
+) -> oneshot::Receiver<ListenerReady> {
     let bind_addr = config.server.bind;
     let redir_plain_port = config.tls.http_port.get();
     let redir_tls_port = config.tls.port.get();
+    let redir_allowed_hosts = redirect_allowed_hosts(config);
     let redir_state = Arc::clone(state);
     let redir_shutdown = shutdown_rx.clone();
     let redir_sem = std::sync::Arc::clone(&budget.semaphore);
     let redir_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
     let redir_max_per_ip = config.server.max_connections_per_ip;
     let redir_drain_timeout = Duration::from_secs(config.server.shutdown_grace_secs);
-    let (redir_port_tx, redir_port_rx) = oneshot::channel::<u16>();
+    let (redir_port_tx, redir_port_rx) = oneshot::channel::<ListenerReady>();
     tasks.redirect = Some(tokio::spawn(async move {
         server::redirect::run_redirect_server(
             server::redirect::RedirectServerConfig {
                 bind_addr,
                 plain_port: redir_plain_port,
                 tls_port: redir_tls_port,
+                allowed_hosts: redir_allowed_hosts,
                 max_per_ip: redir_max_per_ip,
                 drain_timeout: redir_drain_timeout,
             },
@@ -201,6 +206,50 @@ fn spawn_redirect_task(
         .await;
     }));
     redir_port_rx
+}
+
+fn redirect_allowed_hosts(config: &Config) -> Vec<String> {
+    use std::collections::BTreeSet;
+
+    let mut hosts = BTreeSet::from([
+        "127.0.0.1".to_owned(),
+        "[::1]".to_owned(),
+        "localhost".to_owned(),
+    ]);
+
+    for host in &config.tls.acme.domains {
+        if let Some(normalized) = normalize_redirect_host(host) {
+            hosts.insert(normalized);
+        } else {
+            log::warn!("Ignoring invalid redirect host candidate from [tls.acme].domains: {host}");
+        }
+    }
+
+    hosts.into_iter().collect()
+}
+
+fn normalize_redirect_host(raw: &str) -> Option<String> {
+    let host = raw.trim().trim_end_matches('.');
+    if host.is_empty() || !host.is_ascii() {
+        return None;
+    }
+    if host.eq_ignore_ascii_case("localhost") {
+        return Some("localhost".to_owned());
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        return Some(ip.to_string());
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        return Some(format!("[{ip}]"));
+    }
+    if host
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-'))
+    {
+        Some(host.to_ascii_lowercase())
+    } else {
+        None
+    }
 }
 
 async fn abort_startup_tasks(tasks: &mut BackgroundTasks) {
@@ -247,7 +296,14 @@ pub(super) async fn graceful_shutdown(
     tor_handle: Option<tokio::task::JoinHandle<()>>,
     mut background_tasks: BackgroundTasks,
 ) {
-    log::info!("Shutting down…");
+    log::info!("Shutdown requested — stopping web server and background services...");
+    if config.tor.enabled {
+        log::info!(
+            "Tor cleanup may take up to {} s while active streams close.",
+            config.tor.shutdown_grace_secs
+        );
+    }
+    console::show_shutdown_message(config.tor.enabled);
     let _ = shutdown_tx.send(true);
 
     let http_budget = Duration::from_secs(config.server.shutdown_grace_secs);

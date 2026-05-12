@@ -59,6 +59,14 @@ const RETRY_MAX_SECS: u64 = 300;
 const MAX_RETRIES: u32 = 5;
 const TOR_RELAY_BUFFER_BYTES: usize = 32 * 1024;
 
+fn format_startup_failure(err: &anyhow::Error) -> String {
+    let detail = format!("{err:#}");
+    if detail.contains("refusing to use symlink in private directory path") {
+        return "Tor onion service did not start: secure Tor state directory check failed because the path contains a symlink. HTTP/HTTPS serving will continue. Use a non-symlinked data directory or configure a suitable Tor state directory; set tor.enabled=false to disable onion support.".to_owned();
+    }
+    format!("Tor onion service did not start: {detail}. HTTP/HTTPS serving will continue.")
+}
+
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 pub fn init(
@@ -139,9 +147,9 @@ pub fn init(
                     }
                 }
                 Err(e) => {
-                    // {e:#} prints the full anyhow chain (source causes included).
-                    log::error!("Tor: fatal error: {e:#}");
-                    set_failed_and_clear_onion(&state, format!("{e:#}")).await;
+                    let message = format_startup_failure(&e);
+                    log::warn!("{message}");
+                    set_failed_and_clear_onion(&state, message).await;
                     break;
                 }
             }
@@ -260,13 +268,6 @@ fn log_onion_banner(onion_name: &str) {
         .strip_suffix(".onion")
         .map_or(onion_name, |host| host.get(..12).unwrap_or(host));
 
-    log::info!(
-        "\n  ╔═══════════════════════════════════════════════════╗\n  \
-           ║   TOR ONION SERVICE ACTIVE                        ║\n  \
-           ╠═══════════════════════════════════════════════════╣\n  \
-           ║   {display_prefix}….onion (full address in dashboard)  ║\n  \
-           ╚═══════════════════════════════════════════════════╝"
-    );
     log::info!(
         "Tor onion service active: {display_prefix}….onion (full address visible in dashboard)"
     );
@@ -649,7 +650,7 @@ mod backoff_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_local_addr, onion_address_from_pubkey};
+    use super::{format_local_addr, format_startup_failure, onion_address_from_pubkey};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     const ZERO_KEY_ONION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaam2dqd.onion";
@@ -701,5 +702,18 @@ mod tests {
             format_local_addr(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 8080),
             "[::1]:8080"
         );
+    }
+
+    #[test]
+    fn startup_failure_message_for_symlink_path_is_actionable() {
+        let err = anyhow::anyhow!(
+            "cannot create secure Tor state directory: \
+             refusing to use symlink in private directory path: /var"
+        );
+        let message = format_startup_failure(&err);
+        assert!(message.contains("Tor onion service did not start"));
+        assert!(message.contains("HTTP/HTTPS serving will continue"));
+        assert!(message.contains("non-symlinked data directory"));
+        assert!(message.contains("tor.enabled=false"));
     }
 }

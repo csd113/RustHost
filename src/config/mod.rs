@@ -106,6 +106,9 @@ fn default_site_directory() -> String {
 fn default_index_file() -> String {
     String::from("index.html")
 }
+fn default_favicon_path() -> String {
+    String::from("favicon.ico")
+}
 
 /// Logging defaults
 const fn default_logging_enabled() -> bool {
@@ -352,12 +355,31 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Site config carries independent operator toggles parsed directly from settings.toml."
+)]
 pub struct SiteConfig {
     #[serde(default = "default_site_directory")]
     pub directory: String,
 
     #[serde(default = "default_index_file")]
     pub index_file: String,
+
+    /// Favicon path, relative to the configured site directory.
+    ///
+    /// The path is resolved under the configured site directory and may not
+    /// escape it. The default serves `./rusthost-data/site/favicon.ico` at
+    /// `/favicon.ico`.
+    #[serde(default = "default_favicon_path")]
+    pub favicon: String,
+
+    /// Allow serving PNG favicons from `/favicon.png`.
+    ///
+    /// Disabled by default so the conventional `/favicon.ico` remains the
+    /// only automatically-supported favicon endpoint unless explicitly opted in.
+    #[serde(default)]
+    pub enable_png_favicon: bool,
 
     #[serde(default)]
     pub enable_directory_listing: bool,
@@ -462,6 +484,8 @@ impl Default for Config {
             site: SiteConfig {
                 directory: default_site_directory(),
                 index_file: default_index_file(),
+                favicon: default_favicon_path(),
+                enable_png_favicon: false,
                 enable_directory_listing: false,
                 expose_dotfiles: false,
                 spa_routing: false,
@@ -489,5 +513,15 @@ impl Default for Config {
             redirects: Vec::new(),
             tls: TlsConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn default_config_keeps_tor_enabled() {
+        assert!(Config::default().tor.enabled);
     }
 }

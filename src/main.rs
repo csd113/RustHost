@@ -11,6 +11,7 @@
 //! --port     <n>      Port to use with --serve (default: 8080)
 //! --no-tor            Disable Tor when using --serve
 //! --headless          Disable the interactive console (CI / scripted use)
+//! doctor              Run fast preflight checks without starting the server
 //! -V, --version       Print the crate version and exit
 //! -h, --help          Print usage and exit
 //! ```
@@ -33,9 +34,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 
 use rusthost::runtime::lifecycle::CliArgs;
-
-/// Crate version, sourced once from `Cargo.toml` at compile time.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+use rusthost::terminal::RelaunchIntent;
 
 // ─── Safe cleanup wrapper ─────────────────────────────────────────────────────
 
@@ -272,6 +271,32 @@ fn validate_serve_flags(
     Ok(())
 }
 
+fn finish_parse(doctor: bool, args: CliArgs) -> Result<ParseOutcome, ArgError> {
+    if doctor && args.serve_dir.is_some() {
+        return Err(ArgError::Inapplicable(
+            "doctor cannot be combined with --serve".to_owned(),
+        ));
+    }
+
+    if doctor {
+        Ok(ParseOutcome::Doctor(args))
+    } else {
+        Ok(ParseOutcome::Args(args))
+    }
+}
+
+fn warn_ignored_positionals(extras: &[String]) {
+    if extras.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        std::io::stderr(),
+        "warning: positional arguments after '--' are not yet \
+         supported and will be ignored: {}",
+        extras.join(", ")
+    );
+}
+
 // ─── CLI argument parsing ─────────────────────────────────────────────────────
 
 /// Outcome of a successful [`parse_args_from`] call.
@@ -283,10 +308,9 @@ fn validate_serve_flags(
 enum ParseOutcome {
     /// Fully parsed arguments; the caller should proceed with startup.
     Args(CliArgs),
-    /// A flag like `--help` or `--version` was handled; the caller should
-    /// exit with the given code. Any required output has already been written
-    /// to stdout.
-    EarlyExit(std::process::ExitCode),
+    Doctor(CliArgs),
+    Help,
+    Version,
 }
 
 /// Parse an iterator of raw argument strings into a [`ParseOutcome`].
@@ -307,6 +331,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<ParseOutcom
     let mut no_tor = false;
     let mut headless = false;
     let mut explicit_port = false;
+    let mut doctor = false;
 
     while let Some(raw_flag) = args.next() {
         if raw_flag == "--" {
@@ -316,17 +341,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<ParseOutcom
             // `args.collect()` exhausts the iterator; the enclosing
             // `while let` exits naturally on its next evaluation.
             let extras: Vec<String> = args.collect();
-            if !extras.is_empty() {
-                // Use writeln! on raw stderr for consistency with the rest of
-                // the error-output strategy in this binary. Warnings go to
-                // stderr so they don't pollute stdout in scripted use.
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "warning: positional arguments after '--' are not yet \
-                     supported and will be ignored: {}",
-                    extras.join(", ")
-                );
-            }
+            warn_ignored_positionals(&extras);
             break;
         }
 
@@ -336,18 +351,18 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<ParseOutcom
         };
 
         match flag.as_str() {
+            "doctor" => {
+                reject_inline_value(inline_value.as_deref(), "doctor")?;
+                check_duplicate(doctor, "doctor")?;
+                doctor = true;
+            }
             "--version" | "-V" => {
                 reject_inline_value(inline_value.as_deref(), &flag)?;
-                // Print to stdout and signal the caller to exit 0.
-                // We intentionally do NOT call process::exit here so that
-                // parse_args_from remains fully testable.
-                let _ = writeln!(std::io::stdout(), "rusthost {VERSION}");
-                return Ok(ParseOutcome::EarlyExit(std::process::ExitCode::SUCCESS));
+                return Ok(ParseOutcome::Version);
             }
             "--help" | "-h" => {
                 reject_inline_value(inline_value.as_deref(), &flag)?;
-                print_help();
-                return Ok(ParseOutcome::EarlyExit(std::process::ExitCode::SUCCESS));
+                return Ok(ParseOutcome::Help);
             }
             "--config" => {
                 check_duplicate(config_path.is_some(), "--config")?;
@@ -405,37 +420,29 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<ParseOutcom
     }
 
     validate_serve_flags(serve_dir.is_some(), explicit_port, no_tor)?;
-
-    Ok(ParseOutcome::Args(CliArgs {
-        config_path,
-        data_dir,
-        serve_dir,
-        serve_port,
-        no_tor,
-        headless,
-    }))
+    finish_parse(
+        doctor,
+        CliArgs {
+            config_path,
+            data_dir,
+            serve_dir,
+            serve_port,
+            no_tor,
+            headless,
+        },
+    )
 }
 
-/// Parse `std::env::args()` into a [`CliArgs`] value, exiting the process on
-/// early-exit flags (`--help`, `--version`) or any argument error.
-///
-/// This is the only location in the binary where [`std::process::exit`] is
-/// called for argument-related outcomes, keeping the underlying
-/// [`parse_args_from`] fully testable.
-///
-/// Argument errors exit with code `2` (POSIX convention for command-line
-/// syntax errors); early-exit flags exit with code `0`.
-fn parse_args() -> std::result::Result<CliArgs, std::process::ExitCode> {
-    match parse_args_from(std::env::args().skip(1)) {
-        Ok(ParseOutcome::Args(args)) => Ok(args),
-        Ok(ParseOutcome::EarlyExit(code)) => Err(code),
-        Err(err) => {
-            // Use writeln! on raw stderr: same rationale as in main() —
-            // reduces secondary-panic risk vs eprintln! when stderr is in a
-            // broken state.
-            let _ = writeln!(std::io::stderr(), "{err}");
-            Err(std::process::ExitCode::from(2))
-        }
+const fn relaunch_intent_for_parse_result(
+    parsed: &std::result::Result<ParseOutcome, ArgError>,
+) -> RelaunchIntent {
+    match parsed {
+        Ok(ParseOutcome::Args(args)) if args.headless => RelaunchIntent::Headless,
+        Ok(ParseOutcome::Doctor(_)) => RelaunchIntent::Headless,
+        Ok(ParseOutcome::Args(_)) => RelaunchIntent::Interactive,
+        Ok(ParseOutcome::Help) => RelaunchIntent::Help,
+        Ok(ParseOutcome::Version) => RelaunchIntent::Version,
+        Err(_) => RelaunchIntent::InvalidArguments,
     }
 }
 
@@ -448,7 +455,14 @@ fn print_help() {
 
     let _ = write!(
         std::io::stdout(),
-        "rusthost {ver}
+        "{}",
+        format_help(&bin, rusthost::version::package_version())
+    );
+}
+
+fn format_help(bin: &str, version: &str) -> String {
+    format!(
+        "rusthost {version}
 {desc}
 
 USAGE:
@@ -465,24 +479,27 @@ OPTIONS:
     --no-tor            Disable Tor in --serve mode
     --headless          Disable the interactive console (applies to all modes;
                         useful for CI / scripted use)
+    doctor              Run fast Doctor preflight checks and exit
     -V, --version       Print version and exit
     -h, --help          Print this message and exit
 
 Both --flag value and --flag=value forms are accepted.
 Use -- to signal the end of options.",
-        ver = VERSION,
         desc = env!("CARGO_PKG_DESCRIPTION"),
-    );
+    )
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 fn main() -> std::process::ExitCode {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let parsed_args = parse_args_from(raw_args.iter().cloned());
+
     // ── Terminal auto-launcher ────────────────────────────────────────────────
-    // Must be the very first thing: if stdout is not a TTY (e.g. the binary
-    // was double-clicked), relaunch inside a terminal emulator and exit.
-    // The sentinel env var `RUSTHOST_SPAWNED=1` prevents an infinite loop.
-    if rusthost::terminal::maybe_relaunch() {
+    // Must happen before startup side effects. Relaunch is only attempted for
+    // the narrow detached-interactive case; help/version/headless/invalid
+    // invocations stay in the current process.
+    if rusthost::terminal::maybe_relaunch(relaunch_intent_for_parse_result(&parsed_args)) {
         return std::process::ExitCode::SUCCESS;
     }
 
@@ -502,9 +519,40 @@ fn main() -> std::process::ExitCode {
 
     // Parse arguments before starting the async runtime so that --help and
     // --version never pay the runtime-construction cost.
-    let args = match parse_args() {
-        Ok(args) => args,
-        Err(code) => return code,
+    let args = match parsed_args {
+        Ok(ParseOutcome::Args(args)) => args,
+        Ok(ParseOutcome::Doctor(args)) => {
+            let (data_dir, settings_path) =
+                rusthost::runtime::lifecycle::resolve_config_paths(&args);
+            let mut report = rusthost::console::menu::run_fast_doctor(
+                &data_dir,
+                &settings_path,
+                rusthost::console::menu::DoctorContext::CommandLine,
+            );
+            rusthost::console::menu::doctor::write_doctor_log(&mut report);
+            let _ = write!(std::io::stdout(), "{}", report.render_text());
+            return if report.has_failures() {
+                std::process::ExitCode::from(1)
+            } else {
+                std::process::ExitCode::SUCCESS
+            };
+        }
+        Ok(ParseOutcome::Help) => {
+            print_help();
+            return std::process::ExitCode::SUCCESS;
+        }
+        Ok(ParseOutcome::Version) => {
+            let _ = writeln!(
+                std::io::stdout(),
+                "{}",
+                rusthost::version::cli_version_output()
+            );
+            return std::process::ExitCode::SUCCESS;
+        }
+        Err(err) => {
+            let _ = writeln!(std::io::stderr(), "{err}");
+            return std::process::ExitCode::from(2);
+        }
     };
 
     // Register a panic hook so the terminal is always restored even when a
@@ -522,7 +570,11 @@ fn main() -> std::process::ExitCode {
         //
         // The version is embedded so that panic reports are unambiguously
         // tied to a specific release without needing additional context.
-        let _ = writeln!(std::io::stderr(), "\nPanic (rusthost {VERSION}): {info}");
+        let _ = writeln!(
+            std::io::stderr(),
+            "\nPanic (RustHost {}): {info}",
+            rusthost::version::package_version()
+        );
 
         let bt = std::backtrace::Backtrace::capture();
         if bt.status() == std::backtrace::BacktraceStatus::Captured {
@@ -585,4 +637,68 @@ fn main() -> std::process::ExitCode {
     }
 
     std::process::ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_help, parse_args_from, relaunch_intent_for_parse_result, ParseOutcome};
+    use rusthost::terminal::RelaunchIntent;
+
+    #[test]
+    fn headless_args_suppress_terminal_relaunch() {
+        let parsed = parse_args_from(std::iter::once("--headless").map(str::to_owned));
+        assert!(matches!(parsed, Ok(ParseOutcome::Args(_))));
+        assert_eq!(
+            relaunch_intent_for_parse_result(&parsed),
+            RelaunchIntent::Headless
+        );
+    }
+
+    #[test]
+    fn help_args_suppress_terminal_relaunch() {
+        let parsed = parse_args_from(std::iter::once("--help").map(str::to_owned));
+        assert!(matches!(parsed, Ok(ParseOutcome::Help)));
+        assert_eq!(
+            relaunch_intent_for_parse_result(&parsed),
+            RelaunchIntent::Help
+        );
+    }
+
+    #[test]
+    fn version_args_suppress_terminal_relaunch() {
+        let parsed = parse_args_from(std::iter::once("--version").map(str::to_owned));
+        assert!(matches!(parsed, Ok(ParseOutcome::Version)));
+        assert_eq!(
+            relaunch_intent_for_parse_result(&parsed),
+            RelaunchIntent::Version
+        );
+    }
+
+    #[test]
+    fn invalid_args_suppress_terminal_relaunch() {
+        let parsed = parse_args_from(std::iter::once("--definitely-invalid").map(str::to_owned));
+        assert!(parsed.is_err());
+        assert_eq!(
+            relaunch_intent_for_parse_result(&parsed),
+            RelaunchIntent::InvalidArguments
+        );
+    }
+
+    #[test]
+    fn doctor_subcommand_suppresses_terminal_relaunch() {
+        let parsed = parse_args_from(std::iter::once("doctor").map(str::to_owned));
+        assert!(matches!(parsed, Ok(ParseOutcome::Doctor(_))));
+        assert_eq!(
+            relaunch_intent_for_parse_result(&parsed),
+            RelaunchIntent::Headless
+        );
+    }
+
+    #[test]
+    fn help_text_mentions_headless_usage() {
+        let help = format_help("rusthost-cli", "1.2.3");
+        assert!(help.contains("--headless"));
+        assert!(help.contains("doctor"));
+        assert!(help.contains("rusthost 1.2.3"));
+    }
 }

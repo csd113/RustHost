@@ -18,20 +18,32 @@
 mod encoding;
 mod pathing;
 
-use std::{path::Path, sync::Arc, time::UNIX_EPOCH};
+use std::{
+    fs::OpenOptions,
+    future::Future as _,
+    io::Cursor,
+    io::Write as _,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use http_body_util::{BodyExt as _, Full, StreamBody};
 use httpdate::{fmt_http_date, parse_http_date};
 use hyper::{body::Incoming, header, Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
+use tokio::time::{Instant, Sleep};
 use tokio_util::io::ReaderStream;
 
 use super::{fallback, mime};
 use crate::{
-    runtime::state::{SharedMetrics, SharedState},
+    runtime::state::{SharedMetrics, SharedState, VisitorIdentity},
     Result,
 };
 use encoding::Encoding;
@@ -49,6 +61,9 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 const MAX_REQUEST_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_CUSTOM_ERROR_PAGE_BYTES: u64 = 64 * 1024;
 const IDENTITY_STREAM_CHUNK_BYTES: usize = 128 * 1024;
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+static READINESS_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn full_body(data: impl Into<Bytes>) -> BoxBody {
     Full::new(data.into()).map_err(|e| match e {}).boxed()
 }
@@ -94,18 +109,55 @@ pub struct FeatureFlags {
     pub keep_alive: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestIngress {
+    Http,
+    Https,
+    Tor,
+}
+
 #[derive(Clone)]
 pub(crate) struct HandlerConfig {
     pub(crate) peer_addr: std::net::SocketAddr,
     pub(crate) canonical_root: Arc<Path>,
+    pub(crate) favicon: Arc<FaviconConfig>,
     pub(crate) index_file: Arc<str>,
     pub(crate) flags: FeatureFlags,
     pub(crate) state: SharedState,
+    pub(crate) readiness: ReadinessConfig,
     pub(crate) csp: Arc<str>,
     pub(crate) error_404_page: Option<Arc<CustomErrorPage>>,
     pub(crate) error_503_page: Option<Arc<CustomErrorPage>>,
     pub(crate) redirects: Arc<Vec<crate::config::RedirectRule>>,
     pub(crate) trusted_proxies: Arc<Vec<std::net::IpAddr>>,
+    pub(crate) ingress: RequestIngress,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReadinessConfig {
+    pub(crate) data_dir: Arc<Path>,
+    pub(crate) log_dir: Arc<Path>,
+}
+
+#[derive(Clone)]
+pub(crate) struct FaviconConfig {
+    pub(crate) path: PathBuf,
+    pub(crate) site_root: Arc<Path>,
+    pub(crate) enable_png: bool,
+}
+
+enum FaviconResolution {
+    NotFavicon,
+    File(PathBuf),
+    NotFound,
+    Forbidden,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaviconKind {
+    Ico,
+    Png,
+    Svg,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -211,23 +263,36 @@ pub(crate) async fn handle<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let peer_addr = config.peer_addr;
+    let mut stream = stream;
+    let Some(prefetched) = preflight_initial_headers(&mut stream, peer_addr).await? else {
+        return Ok(());
+    };
     let cfg = Arc::new(RouteConfig {
         canonical_root: config.canonical_root,
+        favicon: config.favicon,
         index_file: config.index_file,
         csp: config.csp,
         flags: config.flags,
         state: config.state,
+        readiness: config.readiness,
         error_404_page: config.error_404_page,
         error_503_page: config.error_503_page,
         redirects: config.redirects,
         peer_addr: config.peer_addr,
         trusted_proxies: config.trusted_proxies,
+        ingress: config.ingress,
     });
 
-    let io = TokioIo::new(stream);
+    let io = TokioIo::new(IdleTimeoutStream::new(
+        PrefixedStream::new(prefetched, stream),
+        KEEP_ALIVE_IDLE_TIMEOUT,
+    ));
 
-    hyper::server::conn::http1::Builder::new()
+    let result = hyper::server::conn::http1::Builder::new()
         .keep_alive(cfg.flags.keep_alive)
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .timer(TokioTimer::new())
         .max_buf_size(MAX_REQUEST_BUFFER_BYTES)
         .serve_connection(
             io,
@@ -237,8 +302,262 @@ where
                 async move { route(req, &cfg, &met).await }
             }),
         )
-        .await
-        .map_err(|e| crate::AppError::Io(std::io::Error::other(e.to_string())))
+        .await;
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_parse_too_large() => {
+            log::warn!(
+                "Rejected request with oversized headers from {peer_addr} \
+                 (limit: {MAX_REQUEST_BUFFER_BYTES} bytes)"
+            );
+            Ok(())
+        }
+        Err(error) => Err(crate::AppError::Io(std::io::Error::other(
+            error.to_string(),
+        ))),
+    }
+}
+
+struct PrefixedStream<S> {
+    prefix: Cursor<Vec<u8>>,
+    inner: S,
+}
+
+impl<S> PrefixedStream<S> {
+    const fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix: Cursor::new(prefix),
+            inner,
+        }
+    }
+}
+
+impl<S> AsyncRead for PrefixedStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        let prefix = this.prefix.get_ref();
+        let pos = usize::try_from(this.prefix.position()).unwrap_or(prefix.len());
+
+        if pos < prefix.len() {
+            let remaining = &prefix[pos..];
+            let to_copy = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..to_copy]);
+            this.prefix
+                .set_position(u64::try_from(pos.saturating_add(to_copy)).unwrap_or(u64::MAX));
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S> AsyncWrite for PrefixedStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.as_mut().get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.as_mut().get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.as_mut().get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+struct IdleTimeoutStream<S> {
+    inner: S,
+    timeout: Duration,
+    read_deadline: std::pin::Pin<Box<Sleep>>,
+}
+
+impl<S> IdleTimeoutStream<S> {
+    fn new(inner: S, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            read_deadline: Box::pin(tokio::time::sleep(timeout)),
+        }
+    }
+
+    fn reset_deadline(&mut self) {
+        self.read_deadline
+            .as_mut()
+            .reset(Instant::now() + self.timeout);
+    }
+}
+
+impl<S> AsyncRead for IdleTimeoutStream<S>
+where
+    S: AsyncRead + Unpin,
+{
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
+            std::task::Poll::Ready(Ok(())) => {
+                if buf.filled().len() > before {
+                    self.reset_deadline();
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
+            std::task::Poll::Pending => {
+                if self.read_deadline.as_mut().poll(cx).is_ready() {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "connection idle timeout",
+                    )));
+                }
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+impl<S> AsyncWrite for IdleTimeoutStream<S>
+where
+    S: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+async fn preflight_initial_headers<S>(
+    stream: &mut S,
+    peer_addr: std::net::SocketAddr,
+) -> std::io::Result<Option<Vec<u8>>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Ok(result) = tokio::time::timeout(
+        HEADER_READ_TIMEOUT,
+        preflight_initial_headers_inner(stream, peer_addr),
+    )
+    .await
+    {
+        result
+    } else {
+        log::warn!("Timed out reading initial request headers from {peer_addr}");
+        write_simple_response(stream, StatusCode::REQUEST_TIMEOUT, "Request Timeout").await?;
+        Ok(None)
+    }
+}
+
+async fn preflight_initial_headers_inner<S>(
+    stream: &mut S,
+    peer_addr: std::net::SocketAddr,
+) -> std::io::Result<Option<Vec<u8>>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut buffered = Vec::with_capacity(4096);
+    let mut staging = [0_u8; 4096];
+
+    loop {
+        let n = stream.read(&mut staging).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        buffered.extend_from_slice(&staging[..n]);
+
+        if let Some(header_end) = find_header_end(&buffered) {
+            if header_end > MAX_REQUEST_BUFFER_BYTES {
+                log::warn!(
+                    "Rejected request with oversized headers from {peer_addr} \
+                     (limit: {MAX_REQUEST_BUFFER_BYTES} bytes)"
+                );
+                write_simple_response(
+                    stream,
+                    StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                    "Request Header Fields Too Large",
+                )
+                .await?;
+                return Ok(None);
+            }
+            return Ok(Some(buffered));
+        }
+
+        if buffered.len() > MAX_REQUEST_BUFFER_BYTES {
+            log::warn!(
+                "Rejected request with oversized headers from {peer_addr} \
+                 (limit: {MAX_REQUEST_BUFFER_BYTES} bytes)"
+            );
+            write_simple_response(
+                stream,
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                "Request Header Fields Too Large",
+            )
+            .await?;
+            return Ok(None);
+        }
+    }
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|idx| idx.saturating_add(4))
+}
+
+async fn write_simple_response<S>(
+    stream: &mut S,
+    status: StatusCode,
+    reason: &str,
+) -> std::io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        status.as_u16(),
+        reason
+    );
+    tokio::io::AsyncWriteExt::write_all(stream, response.as_bytes()).await?;
+    tokio::io::AsyncWriteExt::flush(stream).await
 }
 
 struct RequestContext<'a> {
@@ -271,10 +590,12 @@ struct FileResponseContext<'a> {
 #[derive(Clone)]
 struct RouteConfig {
     canonical_root: Arc<Path>,
+    favicon: Arc<FaviconConfig>,
     index_file: Arc<str>,
     csp: Arc<str>,
     flags: FeatureFlags,
     state: SharedState,
+    readiness: ReadinessConfig,
     error_404_page: Option<Arc<CustomErrorPage>>,
     error_503_page: Option<Arc<CustomErrorPage>>,
     /// Operator redirect or rewrite rules checked before filesystem resolution.
@@ -286,6 +607,8 @@ struct RouteConfig {
     /// Set of IPs allowed to supply X-Forwarded-For headers.
     /// An empty Vec means XFF is ignored on every connection (default).
     trusted_proxies: Arc<Vec<std::net::IpAddr>>,
+    /// Listener path that accepted this request.
+    ingress: RequestIngress,
 }
 
 #[expect(
@@ -297,6 +620,28 @@ async fn route(
     cfg: &RouteConfig,
     metrics: &SharedMetrics,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    record_unique_visitor(
+        &req,
+        cfg.peer_addr,
+        &cfg.trusted_proxies,
+        cfg.ingress,
+        metrics,
+    );
+
+    if let Some(endpoint) = OperationalEndpoint::from_path(req.uri().path()) {
+        let resp = route_operational_endpoint(&req, cfg, metrics, endpoint).await?;
+        log_request(
+            &req,
+            resp.status().as_u16(),
+            response_size(&resp),
+            cfg.peer_addr,
+            &cfg.trusted_proxies,
+        );
+        return Ok(
+            inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await,
+        );
+    }
+
     match req.method() {
         &Method::OPTIONS => {
             metrics.add_request();
@@ -367,6 +712,67 @@ async fn route(
         }
     }
 
+    match resolve_favicon_request(&decoded, &cfg.favicon) {
+        FaviconResolution::File(abs_path) => {
+            metrics.add_request();
+            let resp = serve_favicon(&abs_path, is_head, &cfg.csp, &decoded).await?;
+            log_request(
+                &req,
+                resp.status().as_u16(),
+                response_size(&resp),
+                cfg.peer_addr,
+                &cfg.trusted_proxies,
+            );
+            return Ok(inject_security_headers(
+                resp,
+                &req,
+                cfg.flags.is_https,
+                &cfg.csp,
+                &cfg.state,
+            )
+            .await);
+        }
+        FaviconResolution::NotFound => {
+            metrics.add_request();
+            let resp = text_response(StatusCode::NOT_FOUND, "Not Found", &cfg.csp, &decoded);
+            log_request(
+                &req,
+                resp.status().as_u16(),
+                response_size(&resp),
+                cfg.peer_addr,
+                &cfg.trusted_proxies,
+            );
+            return Ok(inject_security_headers(
+                resp,
+                &req,
+                cfg.flags.is_https,
+                &cfg.csp,
+                &cfg.state,
+            )
+            .await);
+        }
+        FaviconResolution::Forbidden => {
+            metrics.add_error();
+            let resp = text_response(StatusCode::FORBIDDEN, "Forbidden", &cfg.csp, &decoded);
+            log_request(
+                &req,
+                resp.status().as_u16(),
+                response_size(&resp),
+                cfg.peer_addr,
+                &cfg.trusted_proxies,
+            );
+            return Ok(inject_security_headers(
+                resp,
+                &req,
+                cfg.flags.is_https,
+                &cfg.csp,
+                &cfg.state,
+            )
+            .await);
+        }
+        FaviconResolution::NotFavicon => {}
+    }
+
     let canonical_root = Arc::clone(&cfg.canonical_root);
     let index_file = Arc::clone(&cfg.index_file);
     let decoded_for_resolve = decoded.clone();
@@ -417,6 +823,177 @@ async fn route(
     // Inject HSTS and other security headers that depend on transport.
     let resp = inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await;
     Ok(resp)
+}
+
+#[derive(Clone, Copy)]
+enum OperationalEndpoint {
+    Health,
+    Ready,
+}
+
+impl OperationalEndpoint {
+    const fn from_path(path: &str) -> Option<Self> {
+        match path.as_bytes() {
+            b"/health" => Some(Self::Health),
+            b"/ready" => Some(Self::Ready),
+            _ => None,
+        }
+    }
+}
+
+async fn route_operational_endpoint(
+    req: &Request<Incoming>,
+    cfg: &RouteConfig,
+    metrics: &SharedMetrics,
+    endpoint: OperationalEndpoint,
+) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    if req.method() != Method::GET && req.method() != Method::HEAD {
+        metrics.add_error();
+        return Ok(method_not_allowed_with_allow("GET, HEAD"));
+    }
+
+    let is_head = req.method() == Method::HEAD;
+    match endpoint {
+        OperationalEndpoint::Health => {
+            metrics.add_request();
+            Ok(operational_text_response(
+                StatusCode::OK,
+                "OK\n",
+                is_head,
+                &cfg.csp,
+            ))
+        }
+        OperationalEndpoint::Ready => {
+            let readiness = cfg.readiness.clone();
+            let canonical_root = Arc::clone(&cfg.canonical_root);
+            let runtime_ready = cfg.state.read().await.runtime_ready;
+            let status = tokio::task::spawn_blocking(move || {
+                readiness_status(runtime_ready, canonical_root.as_ref(), &readiness)
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("readiness check task panicked: {e}")))?;
+
+            match status {
+                Ok(()) => {
+                    metrics.add_request();
+                    Ok(operational_text_response(
+                        StatusCode::OK,
+                        "READY\n",
+                        is_head,
+                        &cfg.csp,
+                    ))
+                }
+                Err(reason) => {
+                    metrics.add_error();
+                    let body = format!("NOT READY: {}\n", reason.as_str());
+                    Ok(operational_text_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &body,
+                        is_head,
+                        &cfg.csp,
+                    ))
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReadinessFailure {
+    StartupIncomplete,
+    DataDirUnavailable,
+    SiteRootUnavailable,
+    LogDirUnavailable,
+}
+
+impl ReadinessFailure {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StartupIncomplete => "startup incomplete",
+            Self::DataDirUnavailable => "data directory unavailable",
+            Self::SiteRootUnavailable => "site root unavailable",
+            Self::LogDirUnavailable => "log directory unavailable",
+        }
+    }
+}
+
+fn readiness_status(
+    runtime_ready: bool,
+    canonical_root: &Path,
+    readiness: &ReadinessConfig,
+) -> std::result::Result<(), ReadinessFailure> {
+    if !runtime_ready {
+        return Err(ReadinessFailure::StartupIncomplete);
+    }
+    if !is_accessible_dir(readiness.data_dir.as_ref()) {
+        return Err(ReadinessFailure::DataDirUnavailable);
+    }
+    if !is_accessible_dir(canonical_root) {
+        return Err(ReadinessFailure::SiteRootUnavailable);
+    }
+    if !log_dir_is_writable(readiness.log_dir.as_ref()) {
+        return Err(ReadinessFailure::LogDirUnavailable);
+    }
+    Ok(())
+}
+
+fn is_accessible_dir(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        && std::fs::read_dir(path).is_ok()
+}
+
+fn log_dir_is_writable(path: &Path) -> bool {
+    if !is_accessible_dir(path) {
+        return false;
+    }
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let counter = READINESS_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let probe = path.join(format!(
+        ".rusthost-ready-check-{}-{suffix}-{counter}",
+        std::process::id()
+    ));
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut file| file.write_all(b"ready\n"));
+
+    let cleanup = std::fs::remove_file(&probe);
+    let cleanup_ok = cleanup.is_ok()
+        || matches!(&cleanup, Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+    result.is_ok() && cleanup_ok
+}
+
+fn record_unique_visitor<B>(
+    req: &Request<B>,
+    peer_addr: std::net::SocketAddr,
+    trusted_proxies: &[std::net::IpAddr],
+    ingress: RequestIngress,
+    metrics: &SharedMetrics,
+) {
+    metrics.add_unique_visitor(visitor_identity(req, peer_addr, trusted_proxies, ingress));
+}
+
+fn visitor_identity<B>(
+    req: &Request<B>,
+    peer_addr: std::net::SocketAddr,
+    trusted_proxies: &[std::net::IpAddr],
+    ingress: RequestIngress,
+) -> VisitorIdentity {
+    match ingress {
+        RequestIngress::Http | RequestIngress::Https => {
+            VisitorIdentity::Clearnet(resolved_remote_addr(req, peer_addr, trusted_proxies))
+        }
+        // The in-process Tor proxy intentionally avoids adding cookies,
+        // fingerprints, or circuit-level identifiers. Once Arti proxies a
+        // stream into the local ingress listener, the stable identity available
+        // to HTTP is just the local proxy socket, so Tor is counted as one
+        // anonymous runtime bucket.
+        RequestIngress::Tor => VisitorIdentity::TorAnonymous,
+    }
 }
 
 /// Map a [`Resolved`] value to an HTTP response.
@@ -556,6 +1133,96 @@ fn external_redirect_response(
         .header("Cache-Control", "no-cache");
     builder = security_headers(builder, csp, "text/plain");
     finalize_response(builder, full_body(data), "operator redirect response")
+}
+
+fn resolve_favicon_request(path: &str, cfg: &FaviconConfig) -> FaviconResolution {
+    let Some(requested_kind) = requested_favicon_kind(path) else {
+        return FaviconResolution::NotFavicon;
+    };
+
+    if requested_kind == FaviconKind::Png && !cfg.enable_png {
+        return FaviconResolution::NotFound;
+    }
+
+    resolve_favicon_candidate(&cfg.path, requested_kind, cfg)
+}
+
+fn requested_favicon_kind(path: &str) -> Option<FaviconKind> {
+    match path {
+        "/favicon.ico" => Some(FaviconKind::Ico),
+        "/favicon.png" => Some(FaviconKind::Png),
+        "/favicon.svg" => Some(FaviconKind::Svg),
+        _ => None,
+    }
+}
+
+fn resolve_favicon_candidate(
+    candidate: &Path,
+    requested_kind: FaviconKind,
+    cfg: &FaviconConfig,
+) -> FaviconResolution {
+    let resolved = match candidate.canonicalize() {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return FaviconResolution::NotFound
+        }
+        Err(_) => return FaviconResolution::Forbidden,
+    };
+
+    let extension_kind =
+        resolved
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(|ext| match ext.to_ascii_lowercase().as_str() {
+                "ico" => Some(FaviconKind::Ico),
+                "png" => Some(FaviconKind::Png),
+                "svg" => Some(FaviconKind::Svg),
+                _ => None,
+            });
+    let Some(extension_kind) = extension_kind else {
+        return FaviconResolution::Forbidden;
+    };
+
+    if requested_kind != extension_kind {
+        return FaviconResolution::NotFound;
+    }
+    if extension_kind == FaviconKind::Png && !cfg.enable_png {
+        return FaviconResolution::NotFound;
+    }
+    if !resolved.starts_with(cfg.site_root.as_ref()) {
+        return FaviconResolution::Forbidden;
+    }
+
+    match std::fs::metadata(&resolved) {
+        Ok(metadata) if metadata.is_file() => FaviconResolution::File(resolved),
+        Ok(_) | Err(_) => FaviconResolution::Forbidden,
+    }
+}
+
+async fn serve_favicon(
+    abs_path: &Path,
+    is_head: bool,
+    csp: &str,
+    url_path: &str,
+) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    let body_bytes = tokio::fs::read(abs_path).await?;
+    let extension = abs_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
+    let content_type = mime::for_extension(extension);
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, body_bytes.len())
+        .header("Cache-Control", cache_control_for(content_type, url_path));
+    builder = security_headers(builder, csp, content_type);
+    let body = if is_head {
+        empty_body()
+    } else {
+        full_body(body_bytes)
+    };
+    finalize_response(builder, body, "favicon response")
 }
 
 // ─── File serving ─────────────────────────────────────────────────────────────
@@ -1172,7 +1839,7 @@ async fn onion_location_header_value(
         .uri()
         .path_and_query()
         .map_or("/", hyper::http::uri::PathAndQuery::as_str);
-    let location = format!("https://{onion_address}{path_and_query}");
+    let location = format!("http://{onion_address}{path_and_query}");
     let safe_location = sanitize_header_value(&location);
     header::HeaderValue::from_str(safe_location.as_ref()).ok()
 }
@@ -1263,10 +1930,35 @@ fn redirect_response(location: &str, csp: &str) -> Response<BoxBody> {
     builder.body(full_body(data)).unwrap_or_default()
 }
 
+fn operational_text_response(
+    status: StatusCode,
+    body: &str,
+    is_head: bool,
+    csp: &str,
+) -> Response<BoxBody> {
+    let data = Bytes::copy_from_slice(body.as_bytes());
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CONTENT_LENGTH, data.len())
+        .header("Cache-Control", "no-store, no-cache, max-age=0");
+    builder = security_headers(builder, csp, "text/plain");
+    let body = if is_head {
+        empty_body()
+    } else {
+        full_body(data)
+    };
+    builder.body(body).unwrap_or_default()
+}
+
 fn method_not_allowed() -> Response<BoxBody> {
+    method_not_allowed_with_allow("GET, HEAD, OPTIONS")
+}
+
+fn method_not_allowed_with_allow(allow: &'static str) -> Response<BoxBody> {
     Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
-        .header(header::ALLOW, "GET, HEAD, OPTIONS")
+        .header(header::ALLOW, allow)
         .header(header::CONTENT_LENGTH, "0")
         .body(empty_body())
         .unwrap_or_default()
@@ -1340,7 +2032,10 @@ fn response_size(resp: &Response<BoxBody>) -> Option<u64> {
 mod tests {
     #![allow(clippy::expect_used)]
 
-    use super::{percent_decode, resolve_path, CustomErrorPage, Resolved};
+    use super::{
+        percent_decode, resolve_favicon_request, resolve_path, CustomErrorPage, FaviconConfig,
+        FaviconResolution, Resolved,
+    };
     use bytes::Bytes;
     use hyper::StatusCode;
     use std::path::Path;
@@ -1494,6 +2189,45 @@ mod tests {
         assert_eq!(result, Resolved::CustomError(page));
     }
 
+    #[test]
+    fn default_favicon_resolves_inside_site_root() {
+        let (_tmp, root) = make_test_tree();
+        let favicon = root.join("favicon.ico");
+        std::fs::write(&favicon, b"ico").expect("write favicon");
+        let cfg = FaviconConfig {
+            path: root.join("favicon.ico"),
+            site_root: Arc::from(root.as_path()),
+            enable_png: false,
+        };
+
+        assert!(matches!(
+            resolve_favicon_request("/favicon.ico", &cfg),
+            FaviconResolution::File(path) if path == favicon
+        ));
+    }
+
+    #[test]
+    fn png_favicon_requires_opt_in() {
+        let (_tmp, root) = make_test_tree();
+        std::fs::write(root.join("favicon.png"), b"png").expect("write favicon");
+        let mut cfg = FaviconConfig {
+            path: root.join("favicon.png"),
+            site_root: Arc::from(root.as_path()),
+            enable_png: false,
+        };
+
+        assert!(matches!(
+            resolve_favicon_request("/favicon.png", &cfg),
+            FaviconResolution::NotFound
+        ));
+
+        cfg.enable_png = true;
+        assert!(matches!(
+            resolve_favicon_request("/favicon.png", &cfg),
+            FaviconResolution::File(_)
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolve_path_rejects_symlinked_directory_listing_outside_root() {
@@ -1592,9 +2326,11 @@ mod sanitize_tests {
 mod proxy_tests {
     #![allow(clippy::expect_used)]
 
-    use super::resolved_remote_addr;
+    use super::{record_unique_visitor, resolved_remote_addr, visitor_identity, RequestIngress};
+    use crate::runtime::state::{Metrics, VisitorIdentity};
     use bytes::Bytes;
     use http_body_util::Empty;
+    use std::sync::Arc;
 
     fn request_with_xff(value: &str) -> hyper::Request<Empty<Bytes>> {
         hyper::Request::builder()
@@ -1623,6 +2359,50 @@ mod proxy_tests {
             resolved_remote_addr(&req, peer, &trusted),
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
         );
+    }
+
+    #[test]
+    fn http_and_https_share_clearnet_visitor_identity() {
+        let req = hyper::Request::builder()
+            .body(Empty::<Bytes>::new())
+            .expect("valid request builder");
+        let peer = std::net::SocketAddr::from(([203, 0, 113, 10], 8080));
+        let trusted = [];
+
+        assert_eq!(
+            visitor_identity(&req, peer, &trusted, RequestIngress::Http),
+            visitor_identity(&req, peer, &trusted, RequestIngress::Https)
+        );
+    }
+
+    #[test]
+    fn tor_visitor_identity_is_anonymous_bucket() {
+        let req = hyper::Request::builder()
+            .body(Empty::<Bytes>::new())
+            .expect("valid request builder");
+        let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 48000));
+        let trusted = [];
+
+        assert_eq!(
+            visitor_identity(&req, peer, &trusted, RequestIngress::Tor),
+            VisitorIdentity::TorAnonymous
+        );
+    }
+
+    #[test]
+    fn http_https_and_tor_update_same_unique_counter() {
+        let req = hyper::Request::builder()
+            .body(Empty::<Bytes>::new())
+            .expect("valid request builder");
+        let metrics = Arc::new(Metrics::new());
+        let peer = std::net::SocketAddr::from(([203, 0, 113, 10], 8080));
+        let trusted = [];
+
+        record_unique_visitor(&req, peer, &trusted, RequestIngress::Http, &metrics);
+        record_unique_visitor(&req, peer, &trusted, RequestIngress::Https, &metrics);
+        record_unique_visitor(&req, peer, &trusted, RequestIngress::Tor, &metrics);
+
+        assert_eq!(metrics.snapshot().unique_visitors, 2);
     }
 }
 

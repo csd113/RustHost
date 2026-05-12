@@ -14,6 +14,7 @@
 mod support;
 
 use std::{
+    fmt::Write as _,
     io::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
@@ -33,6 +34,7 @@ use crate::{
 };
 use support::{
     graceful_shutdown, maybe_open_browser, setup_tls, wait_for_background_task, wait_for_bind_port,
+    ListenerReady,
 };
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -55,6 +57,18 @@ pub struct CliArgs {
     pub no_tor: bool,
     /// Disable the interactive console (useful for headless / CI use).
     pub headless: bool,
+}
+
+/// Resolve the data directory and settings path using the same precedence as
+/// production startup.
+#[must_use]
+pub fn resolve_config_paths(args: &CliArgs) -> (PathBuf, PathBuf) {
+    let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
+    let settings_path = args
+        .config_path
+        .clone()
+        .unwrap_or_else(|| data_dir.join("settings.toml"));
+    (data_dir, settings_path)
 }
 
 // ─── Shared connection budget ─────────────────────────────────────────────────
@@ -90,16 +104,13 @@ pub async fn run(args: CliArgs) -> Result<()> {
 
     // data_dir is computed exactly once and threaded everywhere. A CLI
     // override takes precedence; the default is relative to current_exe().
-    let data_dir = args.data_dir.unwrap_or_else(default_data_dir);
-
-    let settings_path = args
-        .config_path
-        .unwrap_or_else(|| data_dir.join("settings.toml"));
+    let (data_dir, settings_path) = resolve_config_paths(&args);
 
     if !settings_path.exists() {
-        first_run_setup(&data_dir, &settings_path)?;
+        let install_kind = detect_install_kind(&data_dir);
+        first_run_setup(&data_dir, &settings_path, install_kind, args.headless)?;
     }
-    normal_run(data_dir, &settings_path).await?;
+    normal_run(data_dir, &settings_path, args.headless).await?;
     Ok(())
 }
 
@@ -144,6 +155,8 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
         site: SiteConfig {
             directory: site_dir,
             index_file: "index.html".into(),
+            favicon: "favicon.ico".into(),
+            enable_png_favicon: false,
             enable_directory_listing: true,
             expose_dotfiles: false,
             spa_routing: false,
@@ -172,7 +185,7 @@ async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bo
         tls: crate::config::TlsConfig::default(),
     });
 
-    normal_run_with_config(data_dir, config).await
+    normal_run_with_config(data_dir, None, config).await
 }
 
 /// Compute the default data directory (`<exe-dir>/rusthost-data/`).
@@ -199,7 +212,26 @@ fn default_data_dir() -> PathBuf {
 
 // ─── First Run ───────────────────────────────────────────────────────────────
 
-fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallKind {
+    Fresh,
+    RegeneratedSettings,
+}
+
+fn detect_install_kind(data_dir: &Path) -> InstallKind {
+    if data_dir.join("site").exists() || runtime_root(data_dir).exists() {
+        InstallKind::RegeneratedSettings
+    } else {
+        InstallKind::Fresh
+    }
+}
+
+fn first_run_setup(
+    data_dir: &Path,
+    settings_path: &Path,
+    install_kind: InstallKind,
+    headless: bool,
+) -> Result<()> {
     std::fs::create_dir_all(data_dir.join("site"))?;
     std::fs::create_dir_all(runtime_root(data_dir))?;
 
@@ -210,47 +242,108 @@ fn first_run_setup(data_dir: &Path, settings_path: &Path) -> Result<()> {
         std::fs::write(&placeholder, PLACEHOLDER_HTML)?;
     }
 
+    if headless {
+        let mut stdout = std::io::stdout();
+        stdout.write_all(
+            first_run_headless_message(data_dir, settings_path, install_kind).as_bytes(),
+        )?;
+        return Ok(());
+    }
+
     let mut stdout = std::io::stdout();
-    writeln!(stdout)?;
-    writeln!(stdout, "  RustHost — fresh install detected")?;
-    writeln!(stdout, "  ─────────────────────────────────────────")?;
-    writeln!(
-        stdout,
-        "  Data directories and a default config have been created."
-    )?;
-    writeln!(
-        stdout,
-        "  You can drop your site files into:  ./rusthost-data/site/"
-    )?;
-    writeln!(
-        stdout,
-        "  Runtime-managed files live under:    ./rusthost-data/runtime/"
-    )?;
-    writeln!(stdout)?;
-    writeln!(
-        stdout,
-        "  Tor onion service is built-in — no external install required."
-    )?;
-    writeln!(
-        stdout,
-        "  On first run, Arti will download ~2 MB of directory data (~30 s)."
-    )?;
-    writeln!(
-        stdout,
-        "  Your .onion address will be shown in the dashboard once ready."
-    )?;
-    writeln!(stdout)?;
-    writeln!(stdout, "  Starting server now…")?;
-    writeln!(stdout)?;
+    stdout.write_all(first_run_interactive_message(data_dir, install_kind).as_bytes())?;
 
     Ok(())
 }
 
+fn first_run_headless_message(
+    data_dir: &Path,
+    settings_path: &Path,
+    install_kind: InstallKind,
+) -> String {
+    let mut out = String::new();
+    match install_kind {
+        InstallKind::Fresh => {
+            out.push_str("RustHost initialized data directory\n");
+            let _ = writeln!(out, "Created default config: {}", settings_path.display());
+        }
+        InstallKind::RegeneratedSettings => {
+            out.push_str("RustHost regenerated missing settings.toml\n");
+            let _ = writeln!(out, "Regenerated config: {}", settings_path.display());
+        }
+    }
+    let _ = writeln!(out, "Site directory: {}", data_dir.join("site").display());
+    let _ = writeln!(
+        out,
+        "Runtime directory: {}",
+        runtime_root(data_dir).display()
+    );
+    out.push_str("Starting server now...\n");
+    out
+}
+
+fn first_run_interactive_message(data_dir: &Path, install_kind: InstallKind) -> String {
+    let mut out = String::new();
+    out.push('\n');
+    match install_kind {
+        InstallKind::Fresh => {
+            out.push_str("  RustHost — fresh install detected\n");
+            out.push_str("  ─────────────────────────────────────────\n");
+            out.push_str("  Data directories and a default config have been created.\n");
+        }
+        InstallKind::RegeneratedSettings => {
+            out.push_str("  settings.toml missing; regenerated from defaults\n");
+            out.push_str("  ─────────────────────────────────────────\n");
+            out.push_str(
+                "  Existing site/runtime data was kept; review the new config before production use.\n",
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  You can drop your site files into:  {}/",
+        data_dir.join("site").display()
+    );
+    let _ = writeln!(
+        out,
+        "  Runtime-managed files live under:    {}/",
+        runtime_root(data_dir).display()
+    );
+    out.push('\n');
+    out.push_str("  Tor onion service is built-in — no external install required.\n");
+    out.push_str("  On first run, Arti will download ~2 MB of directory data (~30 s).\n");
+    out.push_str("  Your .onion address will be shown in the dashboard once ready.\n");
+    out.push('\n');
+    out.push_str("  Starting server now…\n\n");
+    out
+}
+
 // ─── Normal Run ──────────────────────────────────────────────────────────────
 
-async fn normal_run(data_dir: PathBuf, settings_path: &Path) -> Result<()> {
-    let config = Arc::new(config::loader::load(settings_path)?);
-    normal_run_with_config(data_dir, config).await
+async fn normal_run(data_dir: PathBuf, settings_path: &Path, headless: bool) -> Result<()> {
+    let mut config = config::loader::load(settings_path)?;
+    let mode = managed_runner_mode(headless, &config);
+    apply_managed_runtime_mode(&mut config, mode);
+    let config = Arc::new(config);
+    normal_run_with_config(data_dir, Some(settings_path.to_path_buf()), config).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedRunnerMode {
+    Interactive,
+    Headless,
+}
+
+const fn managed_runner_mode(headless: bool, config: &Config) -> ManagedRunnerMode {
+    if headless || !config.console.interactive {
+        ManagedRunnerMode::Headless
+    } else {
+        ManagedRunnerMode::Interactive
+    }
+}
+
+const fn apply_managed_runtime_mode(config: &mut Config, mode: ManagedRunnerMode) {
+    config.console.interactive = matches!(mode, ManagedRunnerMode::Interactive);
 }
 
 // ─── Extracted helpers for normal_run_with_config ─────────────────────────────
@@ -294,7 +387,13 @@ fn schedule_initial_site_scan(config: &Arc<Config>, state: &SharedState, data_di
     clippy::too_many_lines,
     reason = "Startup wiring intentionally centralizes subsystem initialization."
 )]
-async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Result<()> {
+async fn normal_run_with_config(
+    data_dir: PathBuf,
+    settings_path: Option<PathBuf>,
+    config: Arc<Config>,
+) -> Result<()> {
+    ensure_data_directories(&data_dir)?;
+
     // 2. Initialise logging.
     logging::init(&config.logging, &data_dir)?;
     if let Err(e) = logging::init_access_log(&config.logging, &data_dir) {
@@ -333,7 +432,7 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
         None
     } else {
         // 6. Start HTTP server task.
-        let (port_tx, port_rx) = oneshot::channel::<u16>();
+        let (port_tx, port_rx) = oneshot::channel::<ListenerReady>();
         let server_handle = spawn_server(
             &config,
             &state,
@@ -383,7 +482,7 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     //    Pass shutdown_rx so Tor's stream loop exits on clean shutdown.
     let tor_handle = if config.tor.enabled {
         let tor_bind_addr = server::tor_loopback_addr(config.server.bind);
-        let (tor_ingress_port_tx, tor_ingress_port_rx) = oneshot::channel::<u16>();
+        let (tor_ingress_port_tx, tor_ingress_port_rx) = oneshot::channel::<ListenerReady>();
         let tor_ingress_config = Arc::clone(&config);
         let tor_ingress_state = Arc::clone(&state);
         let tor_ingress_metrics = Arc::clone(&metrics);
@@ -439,8 +538,22 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
     // 9. Open browser (if configured).
     maybe_open_browser(&config, &state).await;
 
-    // 10. Event dispatch loop.
-    event_loop(key_rx, &config, &state, &metrics, data_dir, root_tx).await?;
+    state.write().await.runtime_ready = true;
+
+    // 10. Event dispatch loop.  Always continue into the single shutdown path
+    // so listener/background cleanup runs even if event handling fails.
+    let event_result = event_loop(
+        key_rx,
+        &config,
+        &state,
+        &metrics,
+        data_dir,
+        settings_path,
+        root_tx,
+    )
+    .await;
+
+    state.write().await.runtime_ready = false;
 
     // 11. Graceful shutdown.
     graceful_shutdown(
@@ -451,6 +564,11 @@ async fn normal_run_with_config(data_dir: PathBuf, config: Arc<Config>) -> Resul
         background_tasks,
     )
     .await;
+    event_result
+}
+
+fn ensure_data_directories(data_dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(runtime_root(data_dir))?;
     Ok(())
 }
 
@@ -470,7 +588,7 @@ fn spawn_server(
     state: &SharedState,
     metrics: &SharedMetrics,
     shutdown: &watch::Receiver<bool>,
-    port_tx: oneshot::Sender<u16>,
+    port_tx: oneshot::Sender<ListenerReady>,
     data_dir: PathBuf,
     root_rx: watch::Receiver<Arc<std::path::Path>>,
     budget: SharedConnectionBudget,
@@ -527,6 +645,7 @@ async fn start_console(
             Arc::clone(state),
             Arc::clone(metrics),
             shutdown,
+            data_dir.to_path_buf(),
         )?;
         Ok(Some(rx))
     } else {
@@ -637,6 +756,7 @@ async fn event_loop(
     state: &SharedState,
     metrics: &SharedMetrics,
     data_dir: PathBuf,
+    settings_path: Option<PathBuf>,
     root_tx: watch::Sender<Arc<std::path::Path>>,
 ) -> Result<()> {
     // 2.8 — mutable so we can set to None when the channel closes.
@@ -704,6 +824,7 @@ async fn event_loop(
                         Arc::clone(state),
                         Arc::clone(metrics),
                         data_dir.clone(),
+                        settings_path.clone(),
                         &root_tx,
                     ).await?;
                     if quit { break; }
@@ -772,8 +893,55 @@ const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
 
 #[cfg(test)]
 mod tests {
-    use super::uses_redirect_public_http;
+    use super::{
+        apply_managed_runtime_mode, detect_install_kind, ensure_data_directories,
+        first_run_headless_message, first_run_interactive_message, first_run_setup,
+        managed_runner_mode, uses_redirect_public_http, InstallKind, ManagedRunnerMode,
+    };
     use crate::config::Config;
+
+    #[test]
+    fn headless_cli_selects_headless_managed_runner() {
+        let mut config = Config::default();
+        config.console.interactive = true;
+
+        assert_eq!(
+            managed_runner_mode(true, &config),
+            ManagedRunnerMode::Headless
+        );
+    }
+
+    #[test]
+    fn default_interactive_config_selects_interactive_managed_runner() {
+        let mut config = Config::default();
+        config.console.interactive = true;
+
+        assert_eq!(
+            managed_runner_mode(false, &config),
+            ManagedRunnerMode::Interactive
+        );
+    }
+
+    #[test]
+    fn config_can_disable_interactive_managed_runner_without_cli_flag() {
+        let mut config = Config::default();
+        config.console.interactive = false;
+
+        assert_eq!(
+            managed_runner_mode(false, &config),
+            ManagedRunnerMode::Headless
+        );
+    }
+
+    #[test]
+    fn applying_headless_managed_runner_disables_console_interactivity() {
+        let mut config = Config::default();
+        config.console.interactive = true;
+
+        apply_managed_runtime_mode(&mut config, ManagedRunnerMode::Headless);
+
+        assert!(!config.console.interactive);
+    }
 
     #[test]
     fn redirect_http_replaces_public_plain_http_only_when_tls_is_enabled() {
@@ -783,5 +951,84 @@ mod tests {
 
         config.tls.enabled = true;
         assert!(uses_redirect_public_http(&config));
+    }
+
+    #[test]
+    fn first_run_setup_creates_site_and_runtime_directories() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("rusthost-data");
+        let settings = data_dir.join("settings.toml");
+
+        first_run_setup(&data_dir, &settings, InstallKind::Fresh, false)?;
+
+        assert!(data_dir.join("site").is_dir());
+        assert!(data_dir.join("runtime").is_dir());
+        assert!(settings.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_data_directories_creates_runtime_directory() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("rusthost-data");
+
+        ensure_data_directories(&data_dir)?;
+
+        assert!(data_dir.join("runtime").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_settings_with_existing_site_is_regeneration() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("rusthost-data");
+        std::fs::create_dir_all(data_dir.join("site"))?;
+
+        assert_eq!(
+            detect_install_kind(&data_dir),
+            InstallKind::RegeneratedSettings
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_settings_without_site_or_runtime_is_fresh_install() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("rusthost-data");
+
+        assert_eq!(detect_install_kind(&data_dir), InstallKind::Fresh);
+        Ok(())
+    }
+
+    #[test]
+    fn first_run_headless_message_uses_active_data_dir() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("custom-data");
+        let settings_path = data_dir.join("settings.toml");
+
+        let output = first_run_headless_message(&data_dir, &settings_path, InstallKind::Fresh);
+
+        assert!(output.contains(&format!(
+            "Site directory: {}",
+            data_dir.join("site").display()
+        )));
+        assert!(output.contains(&format!(
+            "Runtime directory: {}",
+            data_dir.join("runtime").display()
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn first_run_interactive_message_uses_active_data_dir() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let data_dir = tmp.path().join("custom-data");
+
+        let output = first_run_interactive_message(&data_dir, InstallKind::Fresh);
+
+        assert!(output.contains(&format!("{}/", data_dir.join("site").display())));
+        assert!(output.contains(&format!("{}/", data_dir.join("runtime").display())));
+        assert!(!output.contains("./rusthost-data/site/"));
+        Ok(())
     }
 }

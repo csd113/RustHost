@@ -19,9 +19,12 @@
 
 pub mod dashboard;
 pub mod input;
+pub mod menu;
+pub mod ui;
 
 use std::{
     io::{stdout, Write as _},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -61,6 +64,7 @@ pub fn start(
     state: SharedState,
     metrics: SharedMetrics,
     mut shutdown: watch::Receiver<bool>,
+    data_dir: PathBuf,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<KeyEvent>> {
     // crossterm 0.27+ enables Windows VT (Virtual Terminal) processing
     // automatically — no manual call needed.
@@ -97,7 +101,7 @@ pub fn start(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    if let Err(e) = render(&config, &state, &metrics, &mut last_rendered).await {
+                    if let Err(e) = render(&config, &state, &metrics, &data_dir, &mut last_rendered).await {
                         log::debug!("Render error: {e}");
                     }
                 }
@@ -117,6 +121,7 @@ async fn render(
     config: &Config,
     state: &SharedState,
     metrics: &SharedMetrics,
+    data_dir: &std::path::Path,
     last_rendered: &mut String,
 ) -> Result<()> {
     // Acquire the lock ONCE and extract everything needed for this frame.
@@ -132,12 +137,14 @@ async fn render(
 
     let output = match mode {
         ConsoleMode::Dashboard => {
-            let (reqs, errs) = metrics.snapshot();
-            dashboard::render_dashboard(&state_snapshot, reqs, errs, config)
+            let metrics = metrics.snapshot();
+            dashboard::render_dashboard(&state_snapshot, metrics, config, data_dir)
         }
+        ConsoleMode::Menu => menu::render(&state_snapshot.menu, config, &state_snapshot, data_dir),
         ConsoleMode::LogView => dashboard::render_log_view(config.console.show_timestamps),
         ConsoleMode::Help => dashboard::render_help(),
         ConsoleMode::ConfirmQuit => dashboard::render_confirm_quit(),
+        ConsoleMode::ShuttingDown => dashboard::render_shutdown(config.tor.enabled),
     };
 
     // Skip terminal I/O when the frame is unchanged to avoid needless redraws.
@@ -160,7 +167,6 @@ async fn render(
 
     Ok(())
 }
-
 // ─── Cleanup ──────────────────────────────────────────────────────────────────
 
 /// Restore the terminal to its original state.
@@ -173,4 +179,21 @@ pub fn cleanup() {
         let _ = terminal::disable_raw_mode();
         let _ = writeln!(stdout());
     }
+}
+
+/// Replace the current frame with an explicit shutdown-in-progress message.
+pub fn show_shutdown_message(tor_enabled: bool) {
+    if !RAW_MODE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+
+    let output = dashboard::render_shutdown(tor_enabled);
+    let mut out = stdout();
+    let _ = execute!(
+        out,
+        cursor::MoveTo(0, 0),
+        terminal::Clear(terminal::ClearType::FromCursorDown)
+    );
+    let _ = out.write_all(output.as_bytes());
+    let _ = out.flush();
 }

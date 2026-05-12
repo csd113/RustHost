@@ -8,6 +8,28 @@ RustHost is designed for small, explicit static hosting deployments where the se
 
 RustHost is intentionally not a web framework or application server. It does not provide users, sessions, logins, uploads, private routes, a CMS, or an admin authorization layer. If you need private or operator-only access, put RustHost behind a reverse proxy or another authenticated service.
 
+## Why RustHost
+
+RustHost aims to keep static hosting operationally simple:
+
+- one binary
+- one data directory
+- one explicit config file
+- one place to inspect runtime status
+
+For 1.0.0, that simplicity now extends further into day-to-day operations with first-class health/readiness endpoints, a built-in Doctor workflow, richer diagnostics, and a larger operator-focused TUI.
+
+## At a Glance
+
+| Area | What RustHost provides |
+|------|-------------------------|
+| Static hosting | Canonical-root path resolution, keep-alive HTTP/1.1, compression, range requests, SPA fallback, custom error pages |
+| HTTPS | Self-signed local certs, manual PEM loading, ACME / Let's Encrypt, optional redirect listener |
+| Tor | In-process Arti onion service for the same site and runtime state kept under the data directory |
+| Operations | `/health`, `/ready`, structured logs, headless mode, graceful shutdown, connection limits |
+| Operator UX | Main dashboard, logs view, menu index, Doctor, Diagnostics, Network, Site, Settings, Tor, and Help pages |
+| Diagnostics | `rusthost-cli doctor`, build-aware `--version`, runtime diagnostics snapshots, documented release validation commands |
+
 ## Features
 
 **Static file serving**
@@ -41,9 +63,19 @@ RustHost is intentionally not a web framework or application server. It does not
 - Strict TOML config deserialization and validation.
 - Global and per-IP connection limits.
 - Configurable graceful shutdown windows.
+- Built-in `/health` and `/ready` endpoints for monitoring and readiness checks.
 - Security headers on responses, with configurable CSP presets for HTML.
 - Structured access log in Combined Log Format when logging is enabled.
 - Interactive dashboard with reload and log views, plus headless mode for services.
+- Accurate runtime path reporting for custom `--data-dir` deployments.
+
+**Operator tooling**
+
+- `rusthost-cli doctor` for fast preflight checks across config, paths, listeners, TLS, Tor, favicon setup, and logging.
+- `rusthost-cli --version` output that includes version, build profile, short commit, and target triple.
+- TUI menu index with dedicated Home, Logs, Doctor, Diagnostics, Tor, Network, Site, Settings, and Help pages.
+- Diagnostics snapshots that can be refreshed in the TUI for troubleshooting and support handoff.
+- Release-validation commands documented in the README for repeatable release readiness checks.
 
 **Development quality**
 
@@ -84,6 +116,14 @@ The release binary is written to:
 ./target/release/rusthost-cli
 ```
 
+Quick checks after building:
+
+```bash
+./target/release/rusthost-cli --version
+./target/release/rusthost-cli --help
+./target/release/rusthost-cli doctor --data-dir ./tmp-rusthost-check
+```
+
 ### One-shot directory serving
 
 Use `--serve` when you want to serve a directory directly without creating a persistent `settings.toml`.
@@ -121,6 +161,18 @@ rusthost-data/
 
 Put your static files in `rusthost-data/site/`. In interactive mode, press `R` in the dashboard to reload site state after changing files. On Unix, sending `SIGHUP` also triggers the reload path.
 
+### First operator checks
+
+After startup, RustHost supports a compact operator validation flow:
+
+```bash
+curl -i http://127.0.0.1:8080/health
+curl -i http://127.0.0.1:8080/ready
+./target/release/rusthost-cli doctor --data-dir ./rusthost-data
+```
+
+`/health` returns a simple liveness response. `/ready` returns `200 READY` only after startup has completed and the active data, site, and log directories are usable.
+
 ## Configuration
 
 The generated `settings.toml` is the main control surface. The most important defaults are:
@@ -130,6 +182,7 @@ The generated `settings.toml` is the main control surface. The most important de
 - Tor is enabled in generated configs.
 - The interactive dashboard is enabled.
 - The site directory is `site`, relative to the data directory.
+- `/favicon.ico` serves `rusthost-data/site/favicon.ico` by default.
 - Logging writes under `runtime/logs/` when enabled.
 
 Common sections:
@@ -137,7 +190,7 @@ Common sections:
 | Section | Purpose |
 |---------|---------|
 | `[server]` | bind address, port, connection limits, CSP preset, trusted proxies, browser opening |
-| `[site]` | site directory, index file, directory listing, dotfile exposure, SPA fallback, custom error pages |
+| `[site]` | site directory, index file, favicon, directory listing, dotfile exposure, SPA fallback, custom error pages |
 | `[tls]` | HTTPS listener, redirect behavior, ACME, manual certificates |
 | `[tor]` | onion service enablement and Tor shutdown grace period |
 | `[logging]` | application log level, log file, dependency log filtering |
@@ -187,6 +240,40 @@ status = 301
 
 Redirect status must be `301` or `302`. Redirect targets must be safe to emit in an HTTP `Location` header.
 
+## TUI and Operator Views
+
+When `[console] interactive = true`, RustHost starts in the main dashboard and exposes a wider operator console than earlier releases.
+
+### Home dashboard
+
+- Local HTTP/HTTPS/onion endpoints
+- uptime, request counts, and unique visitor counts
+- current site directory under the active data directory
+- transient status messages such as reload completion
+
+### Main controls
+
+- `H` shows the global help screen
+- `R` rescans the site directory and refreshes serving state
+- `O` opens the local URL in the system browser
+- `L` opens the recent log view
+- `M` opens the menu index
+- `Q` opens shutdown confirmation from the dashboard or top-level menu
+
+### Menu pages
+
+- `Home` returns to the main dashboard
+- `Logs` opens the recent log view
+- `Doctor` summarizes readiness checks and can run bounded deep checks
+- `Diagnostics` builds a compact troubleshooting snapshot and can refresh or clear status messages
+- `Tor` shows onion-service state and related controls
+- `Network` shows configured listeners and local listener checks
+- `Site` summarizes the served root and key site files
+- `Settings` shows effective runtime settings and embedded diagnostics text when copy fallback is needed
+- `Help` provides in-console guidance for controls, CLI commands, networking, Tor, and troubleshooting
+
+Nested-page navigation is intentionally conservative: page-local controls stay on the current page, `Esc` backs out safely, and `Q` does not tear down RustHost from every nested screen.
+
 ## Static File Behavior
 
 RustHost resolves every requested path against the canonical site root and rejects escapes outside that root. Direct dotfile requests and dotfile entries in directory listings are blocked unless `site.expose_dotfiles = true`.
@@ -212,6 +299,43 @@ Security-related response headers include:
 - `Content-Security-Policy` for HTML when `[server] csp_level` is not `off`
 
 When HTTPS and Tor are both active, RustHost can add an `Onion-Location` header on clearnet HTTPS responses after the onion address is available.
+
+## Health, Readiness, and Diagnostics
+
+RustHost now exposes a small set of built-in operational surfaces that are useful in local testing, service management, and release validation.
+
+### `/health`
+
+- accepts `GET` and `HEAD`
+- returns `200 OK`
+- is routed before static files
+- can be used as a simple liveness probe
+
+### `/ready`
+
+- accepts `GET` and `HEAD`
+- returns `200 READY` only when startup is complete
+- returns `503 NOT READY: ...` with a short reason when required runtime state is missing or unusable
+- checks the active data directory, site root, and log directory instead of assuming defaults
+
+### `rusthost-cli doctor`
+
+Use Doctor when you want preflight validation without starting the full interactive console:
+
+```bash
+rusthost-cli doctor --data-dir ./rusthost-data
+```
+
+Doctor checks:
+
+- config parsing and validation
+- filesystem and site-root expectations
+- bind/listener sanity
+- TLS and Tor configuration
+- favicon and logging setup
+- bounded local deep checks when run through the TUI
+
+Doctor also writes `doctor.log` under the active runtime log directory so the report can be retained with other operator diagnostics.
 
 ## HTTPS and Certificates
 
@@ -314,11 +438,19 @@ OPTIONS:
     --port     <n>      Port for --serve mode, default 8080
     --no-tor            Disable Tor in --serve mode
     --headless          Disable the interactive console
+    doctor              Run fast Doctor preflight checks and exit
     -V, --version       Print version and exit
     -h, --help          Print help and exit
 ```
 
 Both `--flag value` and `--flag=value` forms are accepted.
+
+`--version` prints:
+
+- RustHost version
+- build profile
+- short commit
+- target triple
 
 ## Development
 
@@ -329,7 +461,30 @@ cargo run -- --help
 cargo run -- --serve ./public
 ```
 
-Quality gates:
+### Release validation
+
+Use this command set before a release candidate or readiness handoff.
+Initialize `./tmp-release-check` once with an isolated live run, then run the validation commands below against that same temp data directory:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo build --bin rusthost-cli
+target/debug/rusthost-cli --version
+target/debug/rusthost-cli doctor --data-dir ./tmp-release-check
+```
+
+For live `/health` and `/ready` verification, start RustHost against an isolated temporary data directory such as `./tmp-release-check` rather than a real deployment data directory.
+
+Suggested manual release checks:
+
+```bash
+curl -i http://127.0.0.1:8080/health
+curl -i http://127.0.0.1:8080/ready
+```
+
+Additional quality gates:
 
 ```bash
 cargo clippy --all-targets --all-features -- -D warnings

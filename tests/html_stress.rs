@@ -115,7 +115,7 @@ impl TestServer {
         let state = Arc::new(RwLock::new(AppState::new()));
         let metrics = Arc::new(Metrics::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
+        let (port_tx, port_rx) = tokio::sync::oneshot::channel::<Result<u16, String>>();
 
         let joined = data_dir.join(&config.site.directory);
         let site_root_arc: Arc<Path> = Arc::from(joined.as_path());
@@ -147,7 +147,8 @@ impl TestServer {
         let bound_port = tokio::time::timeout(Duration::from_secs(5), port_rx)
             .await
             .map_err(|_elapsed| "timed out waiting for server to report its bound port")?
-            .map_err(|_closed| "server port channel closed before sending")?;
+            .map_err(|_closed| "server port channel closed before sending")?
+            .map_err(std::io::Error::other)?;
 
         Ok(Self {
             addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound_port),

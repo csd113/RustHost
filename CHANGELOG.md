@@ -7,16 +7,55 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [v0.1.4]
+## [v1.0.0]
+
+### Added
+
+- Added `rusthost-cli doctor` for fast preflight checks of config, paths, network listeners, TLS, Tor, favicon setup, and logging, with bounded deep checks available in the TUI.
+- Added `rusthost-cli --version` build metadata output, including the RustHost version, build profile, short commit, and target triple.
+- Added built-in `GET`/`HEAD` operational endpoints at `/health` and `/ready` for service monitoring and readiness checks.
+- Added first-class favicon handling from `[site].favicon`, serving `/favicon.ico` by default and optional `/favicon.png` when PNG favicon support is enabled.
+- Added a full-screen TUI menu with dedicated Home, Logs, Doctor, Diagnostics, Tor, Network, Site, Settings, and Help pages.
 
 ### Changed
 
-- Bumped RustHost to `v0.1.4` and refreshed the Arti Tor dependency stack to `0.42`, including the accompanying lockfile updates.
-- Refactored request handling and runtime lifecycle plumbing to reduce long argument lists, centralize per-request and per-file state, and improve startup and shutdown robustness.
-- Tightened redirect, admission, and cache semantics so overloaded listeners and serve-root edge cases behave more predictably.
-- Hardened logging and console behavior with idempotent access-log initialization, clearer error reporting on rotation and flush failures, and cleaner terminal fallback handling.
-- Continued the broad Clippy cleanup pass across the codebase and test suite.
-- Updated the README and related documentation to match the current project overview and usage guidance.
+- Promoted RustHost to `v1.0.0` and refreshed the bundled Arti Tor stack to `0.42`.
+- Expanded the main dashboard to show uptime, unique visitor counts, transient status notices, accurate active site paths, and a direct shortcut into the menu.
+- Improved headless and first-run output so generated paths, site/runtime directories, and startup messaging reflect the active `--data-dir` instead of assuming the default layout.
+- Reworked the setup and README docs around current 1.0.0 behavior, including favicon configuration, headless operation, and a repeatable release-validation command set.
+
+### Fixed
+
+- Fixed nested menu navigation so page-local controls stay on the current page, `Esc` backs out safely, and `Q` only enters shutdown from the dashboard or menu index.
+- Fixed diagnostics and support flows so the Diagnostics page can refresh its snapshot, clear transient notices, and degrade cleanly when clipboard support is unavailable.
+- Fixed the dashboard, diagnostics, doctor output, and settings views to report custom data-directory paths consistently for `--data-dir` deployments.
+- Fixed headless startup behavior to avoid stray interactive-console assumptions and keep service-style runs clean.
+- Fixed TUI shutdown and log viewing polish with an explicit shutdown-in-progress screen and cleaner recent-log rendering.
+
+### Security / Hardening
+
+- Hardened readiness checks so `/ready` fails closed until startup is complete and the active data, site, and log directories are actually usable.
+- Hardened favicon serving so custom favicon paths cannot escape the site root through traversal or symlink tricks.
+- Hardened redirect handling to reject malformed or unconfigured `Host` values and ignore spoofed forwarded-host headers when building HTTPS redirect targets.
+- Hardened request parsing and diagnostics with explicit oversized-header rejection, safer bind-error reporting, and more predictable listener readiness checks.
+
+### TUI / UX
+
+- Added a dedicated Network page with local listener checks and HTTPS/redirect status that distinguishes disabled settings from actual runtime problems.
+- Added a dedicated Doctor page that summarizes PASS/WARN/FAIL readiness checks and can run bounded deep checks without leaving the console.
+- Added a dedicated Diagnostics page for compact operator snapshots that can be refreshed and copied for troubleshooting.
+- Added dedicated Site, Settings, Tor, and Help pages so operators can inspect primary site files, effective runtime settings, Tor status, and console guidance without leaving the TUI.
+
+### CLI / Diagnostics
+
+- `rusthost-cli doctor` intentionally writes `doctor.log` under the active runtime log directory so preflight output can be retained alongside other operator diagnostics.
+- `/health` is routed ahead of static files, returns `OK`, and stays available even when no matching site file exists.
+- `/ready` returns `READY` only when RustHost startup has completed and runtime directories remain accessible; otherwise it returns `503` with a short reason.
+
+### Validation
+
+- Documented a release-readiness command set in `README.md` covering formatting, Clippy, tests, a CLI build, `--version`, and `doctor --data-dir ./tmp-release-check`.
+- Documented using an isolated temporary data directory when manually verifying `/health` and `/ready` for release validation.
 
 ---
 

@@ -26,7 +26,7 @@ use std::io::Write as _;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
-    sync::{atomic::AtomicU32, Arc},
+    sync::{atomic::AtomicU32, Arc, Once},
     time::Duration,
 };
 
@@ -50,6 +50,7 @@ use tokio::{
 /// A live server instance scoped to one test.
 struct TestServer {
     addr: SocketAddr,
+    state: Arc<RwLock<AppState>>,
     shutdown_tx: watch::Sender<bool>,
     /// Keeps the root watch channel open for the lifetime of the server.
     /// Dropping this would put the receiver into a "sender gone" state, which
@@ -84,7 +85,7 @@ impl TestServer {
         let state = Arc::new(RwLock::new(AppState::new()));
         let metrics = Arc::new(Metrics::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
+        let (port_tx, port_rx) = tokio::sync::oneshot::channel::<Result<u16, String>>();
 
         // The server joins data_dir + config.site.directory to find files.
         // `site_root` is `<tmp>/site`; `data_dir` must therefore be `<tmp>`.
@@ -135,16 +136,22 @@ impl TestServer {
         let bound_port = tokio::time::timeout(Duration::from_secs(5), port_rx)
             .await
             .map_err(|_elapsed| "timed out waiting for server to report its bound port")?
-            .map_err(|_closed| "server port channel closed before sending")?;
+            .map_err(|_closed| "server port channel closed before sending")?
+            .map_err(std::io::Error::other)?;
 
         let addr = SocketAddr::new(bind_addr, bound_port);
 
         Ok(Self {
             addr,
+            state,
             shutdown_tx,
             _root_tx: root_tx,
             handle: Some(handle),
         })
+    }
+
+    async fn set_runtime_ready(&self, ready: bool) {
+        self.state.write().await.runtime_ready = ready;
     }
 
     /// Send raw `request` bytes and return the complete response as a `Vec<u8>`.
@@ -335,7 +342,7 @@ impl HttpsTestServer {
         let config = Arc::new(config);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
         let cert_path = data_dir.join("runtime/tls/dev/self-signed.crt");
-        let (tls_port_tx, _tls_port_rx) = tokio::sync::oneshot::channel::<u16>();
+        let (tls_port_tx, _tls_port_rx) = tokio::sync::oneshot::channel::<Result<u16, String>>();
         let handle = tokio::spawn(async move {
             rusthost::server::run_https(
                 config,
@@ -470,6 +477,85 @@ fn make_site(
     Ok((tmp, site))
 }
 
+fn make_runtime_log_dir(site_root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = site_root.parent().unwrap_or(site_root);
+    std::fs::create_dir_all(data_dir.join("runtime/logs"))?;
+    Ok(())
+}
+
+fn init_test_logger() {
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        let config = rusthost::config::LoggingConfig {
+            enabled: false,
+            level: rusthost::config::LogLevel::Debug,
+            file: "runtime/logs/test.log".into(),
+            filter_dependencies: false,
+        };
+        rusthost::logging::init(&config, Path::new(".")).expect("initialize test logger");
+    });
+}
+
+fn reserve_port_or_skip() -> Result<Option<u16>, Box<dyn std::error::Error>> {
+    match reserve_port() {
+        Ok(port) => Ok(Some(port)),
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[http_integration] skipping test: loopback sockets are blocked in this environment"
+            );
+            Ok(None)
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+async fn start_redirect_server(
+    plain_port: u16,
+    tls_port: u16,
+    allowed_hosts: Vec<String>,
+) -> Result<
+    (watch::Sender<bool>, tokio::task::JoinHandle<()>, SocketAddr),
+    Box<dyn std::error::Error>,
+> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel::<Result<u16, String>>();
+    let state = Arc::new(RwLock::new(AppState::new()));
+    let handle = tokio::spawn(async move {
+        rusthost::server::redirect::run_redirect_server(
+            rusthost::server::redirect::RedirectServerConfig {
+                bind_addr: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                plain_port,
+                tls_port,
+                allowed_hosts,
+                max_per_ip: 8,
+                drain_timeout: Duration::from_secs(5),
+            },
+            state,
+            shutdown_rx,
+            port_tx,
+            Arc::new(Semaphore::new(8)),
+            Arc::new(DashMap::new()),
+        )
+        .await;
+    });
+
+    let bound_port = tokio::time::timeout(Duration::from_secs(5), port_rx)
+        .await
+        .map_err(|_elapsed| "redirect server did not signal readiness within 5 s")?
+        .map_err(|closed| {
+            std::io::Error::other(format!("redirect server port channel closed: {closed}"))
+        })?
+        .map_err(std::io::Error::other)?;
+
+    Ok((
+        shutdown_tx,
+        handle,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), bound_port),
+    ))
+}
+
 // ─── Response assertion helpers ───────────────────────────────────────────────
 
 /// `true` when there are no bytes after the `\r\n\r\n` header terminator.
@@ -521,6 +607,152 @@ async fn get_index_html_returns_200() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn get_health_returns_200_without_static_file() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert_eq!(
+        header_value(&response, "cache-control")?.as_deref(),
+        Some("no-store, no-cache, max-age=0")
+    );
+    assert!(response_to_str(&response)?.ends_with("\r\n\r\nOK\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn head_health_returns_200_with_no_body() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send_no_body(b"HEAD /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert_eq!(
+        header_value(&response, "content-length")?.as_deref(),
+        Some("3")
+    );
+    assert!(body_is_empty(&response)?);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_ready_returns_200_when_runtime_is_ready() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    make_runtime_log_dir(&site)?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+    server.set_runtime_ready(true).await;
+
+    let response = server
+        .send(b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert!(response_to_str(&response)?.ends_with("\r\n\r\nREADY\n"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_ready_returns_503_when_runtime_is_not_ready() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    make_runtime_log_dir(&site)?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 503);
+    assert!(response_to_str(&response)?.contains("NOT READY: startup incomplete"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn get_ready_returns_503_when_log_dir_is_unavailable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+    server.set_runtime_ready(true).await;
+
+    let response = server
+        .send(b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 503);
+    assert!(response_to_str(&response)?.contains("NOT READY: log directory unavailable"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn operational_endpoints_reject_unsupported_methods() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (tmp, site) = make_site(&[])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"OPTIONS /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 405);
+    assert_eq!(
+        header_value(&response, "allow")?.as_deref(),
+        Some("GET, HEAD")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn operational_endpoints_are_routed_before_static_files(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("health", b"STATIC")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert!(response_to_str(&response)?.ends_with("\r\n\r\nOK\n"));
+    assert!(!response_to_str(&response)?.contains("STATIC"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn get_index_html_returns_200_over_ipv6() -> Result<(), Box<dyn std::error::Error>> {
     let (tmp, site) = make_site(&[("index.html", b"<h1>hello ipv6</h1>")])?;
     let Some(server) =
@@ -563,7 +795,7 @@ async fn https_self_signed_server_returns_200() -> Result<(), Box<dyn std::error
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn https_response_includes_onion_location_when_onion_is_ready(
+async fn https_response_includes_http_onion_location_when_onion_is_ready(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (tmp, site) = make_site(&[("index.html", b"<h1>secure hello</h1>")])?;
     let server = match HttpsTestServer::start_with_state(&site, |state| {
@@ -598,7 +830,9 @@ async fn https_response_includes_onion_location_when_onion_is_ready(
 
     assert_eq!(
         header_value(&response, "onion-location")?.as_deref(),
-        Some("https://exampleexampleexampleexampleexampleexampleexampleexample.onion/docs/app.js?q=1")
+        Some(
+            "http://exampleexampleexampleexampleexampleexampleexampleexample.onion/docs/app.js?q=1"
+        )
     );
     Ok(())
 }
@@ -1139,44 +1373,332 @@ async fn connection_limit_rejects_second_socket() -> Result<(), Box<dyn std::err
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::error::Error>> {
-    let plain_port = match reserve_port() {
-        Ok(port) => port,
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            let _ = writeln!(
-                std::io::stderr(),
-                "[http_integration] skipping test: loopback sockets are blocked in this environment"
-            );
-            return Ok(());
-        }
-        Err(err) => return Err(err.into()),
+async fn header_under_limit_is_accepted() -> Result<(), Box<dyn std::error::Error>> {
+    init_test_logger();
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
     };
-    let tls_port = 8443;
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
+
+    let request = format!(
+        "GET /index.html HTTP/1.1\r\nHost: localhost\r\nX-Test: {}\r\n\r\n",
+        "a".repeat(14_000)
+    );
+    let response = server.send(request.as_bytes()).await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn oversized_header_returns_431_without_logging_payload(
+) -> Result<(), Box<dyn std::error::Error>> {
+    init_test_logger();
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let marker = "OVERSIZED_HEADER_MARKER_";
+    let request = format!(
+        "GET /index.html HTTP/1.1\r\nHost: localhost\r\nX-Test: {}\r\n\r\n",
+        marker.repeat(1_000)
+    );
+    let response = server.send(request.as_bytes()).await?;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let recent_lines = rusthost::logging::recent_lines(1_000);
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 431);
+    assert!(
+        recent_lines
+            .iter()
+            .any(|line| line.contains("Rejected request with oversized headers")),
+        "expected oversized-header warning in recent logs, got: {recent_lines:?}"
+    );
+    assert!(
+        recent_lines.iter().all(|line| !line.contains(marker)),
+        "oversized header payload leaked into logs: {recent_lines:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn partial_initial_headers_time_out() -> Result<(), Box<dyn std::error::Error>> {
+    init_test_logger();
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let mut stream = TcpStream::connect(server.addr).await?;
+    stream
+        .write_all(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n")
+        .await?;
+
+    let mut buf = [0_u8; 256];
+    let read = tokio::time::timeout(Duration::from_secs(7), stream.read(&mut buf))
+        .await
+        .map_err(|_elapsed| "partial-header timeout did not close the connection")??;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert!(read > 0, "expected timeout response before close");
+    assert_eq!(status_code(&buf[..read])?, 408);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn idle_keep_alive_connection_releases_capacity() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let Some(server) = start_server_with_config_or_skip(&site, |config| {
+        config.server.max_connections = 1;
+        config.server.max_connections_per_ip = 4;
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let mut first = TcpStream::connect(server.addr).await?;
+    first
+        .write_all(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let response = tokio::time::timeout(Duration::from_secs(5), read_one_response(&mut first))
+        .await
+        .map_err(|_elapsed| "first response timed out")??;
+    assert_eq!(status_code(&response)?, 200);
+
+    let mut idle_buf = [0_u8; 1];
+    let idle_read = tokio::time::timeout(Duration::from_secs(7), first.read(&mut idle_buf))
+        .await
+        .map_err(|_elapsed| "idle keep-alive timeout did not close the first connection")??;
+    assert_eq!(idle_read, 0, "idle keep-alive connection should close");
+
+    let mut second = TcpStream::connect(server.addr).await?;
+    second
+        .write_all(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    let second_response =
+        tokio::time::timeout(Duration::from_secs(5), read_one_response(&mut second))
+            .await
+            .map_err(|_elapsed| "second response timed out after idle connection expiry")??;
+
+    drop(first);
+    drop(second);
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&second_response)?, 200);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn site_root_serves_default_ico_favicon() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    std::fs::write(site.join("favicon.ico"), [0_u8, 0, 1, 0, 1, 0, 16, 16])?;
+
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+    let response = server
+        .send(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert_eq!(
+        header_value(&response, "content-type")?.as_deref(),
+        Some("image/x-icon")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn missing_favicon_returns_404() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 404);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn png_favicon_is_served_when_enabled() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    std::fs::write(site.join("custom.png"), [137, 80, 78, 71])?;
+
+    let Some(server) = start_server_with_config_or_skip(&site, |config| {
+        config.site.favicon = "custom.png".into();
+        config.site.enable_png_favicon = true;
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let response = server
+        .send_no_body(b"HEAD /favicon.png HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 200);
+    assert_eq!(
+        header_value(&response, "content-type")?.as_deref(),
+        Some("image/png")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn custom_favicon_cannot_expose_runtime_private_file(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    std::fs::create_dir_all(tmp.path().join("runtime/logs"))?;
+    std::fs::write(tmp.path().join("runtime/logs/private.png"), [1, 2, 3, 4])?;
+
+    let Some(server) = start_server_with_config_or_skip(&site, |config| {
+        config.site.favicon = "../runtime/logs/private.png".into();
+        config.site.enable_png_favicon = true;
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /favicon.png HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 403);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn custom_favicon_symlink_escape_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let outside = tmp.path().join("outside.png");
+    std::fs::write(&outside, [137, 80, 78, 71])?;
+    symlink(&outside, site.join("link.png"))?;
+
+    let Some(server) = start_server_with_config_or_skip(&site, |config| {
+        config.site.favicon = "link.png".into();
+        config.site.enable_png_favicon = true;
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    let response = server
+        .send(b"GET /favicon.png HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&response)?, 403);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn occupied_http_port_reports_actionable_bind_error() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let occupied =
+        std::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+    let occupied_port = occupied.local_addr()?.port();
+
+    let mut config = build_test_config(&site, IpAddr::V4(Ipv4Addr::LOCALHOST), occupied_port)?;
+    config.server.max_connections = 16;
+    let config = Arc::new(config);
     let state = Arc::new(RwLock::new(AppState::new()));
-    let handle = tokio::spawn(async move {
-        rusthost::server::redirect::run_redirect_server(
-            rusthost::server::redirect::RedirectServerConfig {
-                bind_addr: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                plain_port,
-                tls_port,
-                max_per_ip: 8,
-                drain_timeout: Duration::from_secs(5),
-            },
-            state,
-            shutdown_rx,
-            port_tx,
-            Arc::new(Semaphore::new(8)),
-            Arc::new(DashMap::new()),
-        )
-        .await;
+    let metrics = Arc::new(Metrics::new());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel::<Result<u16, String>>();
+    let data_dir = site.parent().unwrap_or(&site).to_path_buf();
+    let site_root_arc: Arc<Path> = Arc::from(data_dir.join(&config.site.directory).as_path());
+    let (root_tx, root_rx) = watch::channel(site_root_arc);
+    let conn_semaphore: Arc<Semaphore> =
+        Arc::new(Semaphore::new(config.server.max_connections as usize));
+    let ip_connections: Arc<DashMap<IpAddr, Arc<AtomicU32>>> = Arc::new(DashMap::new());
+
+    let handle = tokio::spawn({
+        let cfg = Arc::clone(&config);
+        let st = Arc::clone(&state);
+        let met = Arc::clone(&metrics);
+        async move {
+            rusthost::server::run(
+                cfg,
+                st,
+                met,
+                data_dir,
+                shutdown_rx,
+                port_tx,
+                root_rx,
+                conn_semaphore,
+                ip_connections,
+            )
+            .await;
+        }
     });
 
-    let bound_port = tokio::time::timeout(Duration::from_secs(5), port_rx)
+    let bind_result = tokio::time::timeout(Duration::from_secs(5), port_rx)
         .await
-        .map_err(|_elapsed| "redirect server did not signal readiness within 5 s")??;
-    let addr: SocketAddr = format!("127.0.0.1:{bound_port}").parse()?;
+        .map_err(|_elapsed| "timed out waiting for occupied-port startup result")?
+        .map_err(|_closed| "occupied-port startup channel closed")?;
+
+    let _ = shutdown_tx.send(true);
+    drop(root_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    drop(occupied);
+    let _ = tmp;
+
+    let message = bind_result.expect_err("startup should fail when the port is occupied");
+    let lower = message.to_ascii_lowercase();
+    assert!(message.contains("HTTP listener"));
+    assert!(message.contains(&format!("127.0.0.1:{occupied_port}")));
+    assert!(
+        lower.contains("already in use") || lower.contains("address in use"),
+        "expected address-in-use wording, got: {message}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(plain_port) = reserve_port_or_skip()? else {
+        return Ok(());
+    };
+    let tls_port = 8443;
+    let (shutdown_tx, handle, addr) =
+        start_redirect_server(plain_port, tls_port, vec!["example.com".into()]).await?;
     let mut stream = match TcpStream::connect(addr).await {
         Ok(stream) => stream,
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -1206,6 +1728,128 @@ async fn redirect_server_returns_https_location() -> Result<(), Box<dyn std::err
     assert_eq!(
         header_value(&response, "location")?.as_deref(),
         Some("https://example.com:8443/docs?q=1")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn redirect_server_rejects_unconfigured_host_header() -> Result<(), Box<dyn std::error::Error>>
+{
+    let Some(plain_port) = reserve_port_or_skip()? else {
+        return Ok(());
+    };
+    let (shutdown_tx, handle, addr) =
+        start_redirect_server(plain_port, 8443, vec!["localhost".into()]).await?;
+    let mut stream = TcpStream::connect(addr).await?;
+    stream
+        .write_all(b"GET /index.html HTTP/1.1\r\nHost: attacker.example\r\n\r\n")
+        .await?;
+    let response = read_headers_only(&mut stream).await?;
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    assert_eq!(status_code(&response)?, 400);
+    assert_ne!(
+        header_value(&response, "location")?.as_deref(),
+        Some("https://attacker.example:8443/index.html")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn redirect_server_accepts_loopback_host_and_preserves_query(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(plain_port) = reserve_port_or_skip()? else {
+        return Ok(());
+    };
+    let tls_port = 9443;
+    let (shutdown_tx, handle, addr) = start_redirect_server(
+        plain_port,
+        tls_port,
+        vec!["localhost".into(), "127.0.0.1".into(), "[::1]".into()],
+    )
+    .await?;
+    let mut stream = TcpStream::connect(addr).await?;
+    let request = format!("GET /index.html?x=1 HTTP/1.1\r\nHost: 127.0.0.1:{plain_port}\r\n\r\n");
+    stream.write_all(request.as_bytes()).await?;
+    let response = read_headers_only(&mut stream).await?;
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    assert_eq!(status_code(&response)?, 301);
+    assert_eq!(
+        header_value(&response, "location")?.as_deref(),
+        Some("https://127.0.0.1:9443/index.html?x=1")
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn redirect_server_rejects_malformed_host_forms() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(plain_port) = reserve_port_or_skip()? else {
+        return Ok(());
+    };
+    let (shutdown_tx, handle, addr) =
+        start_redirect_server(plain_port, 8443, vec!["localhost".into(), "[::1]".into()]).await?;
+
+    for host in [
+        "evil.com@legit.com",
+        "example.com:abc",
+        "[::1]:bad",
+        "[::1:8443",
+        "http://localhost",
+        "localhost/path",
+        "localhost\\path",
+        "localhost:65536",
+        "localhost:0",
+    ] {
+        let mut stream = TcpStream::connect(addr).await?;
+        let request = format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+        stream.write_all(request.as_bytes()).await?;
+        let response = read_headers_only(&mut stream).await?;
+        let response_text = response_to_str(&response)?;
+        assert_eq!(status_code(&response)?, 400, "host={host}");
+        assert_eq!(header_value(&response, "location")?, None, "host={host}");
+        assert!(
+            !response_text.contains("https://127.0.0.1:8443/"),
+            "host={host}; response={response_text}"
+        );
+        assert!(
+            !response_text.contains("https://localhost:8443/"),
+            "host={host}; response={response_text}"
+        );
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn redirect_server_ignores_x_forwarded_host_spoofing(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(plain_port) = reserve_port_or_skip()? else {
+        return Ok(());
+    };
+    let (shutdown_tx, handle, addr) =
+        start_redirect_server(plain_port, 8443, vec!["localhost".into()]).await?;
+    let mut stream = TcpStream::connect(addr).await?;
+    stream
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-Host: attacker.example\r\n\r\n",
+        )
+        .await?;
+    let response = read_headers_only(&mut stream).await?;
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+    assert_eq!(status_code(&response)?, 301);
+    assert_eq!(
+        header_value(&response, "location")?.as_deref(),
+        Some("https://localhost:8443/")
     );
     Ok(())
 }
