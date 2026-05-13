@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, oneshot, watch, RwLock};
 use crate::{
     config::{self, Config},
     console, logging,
+    path_display::display_path,
     runtime::{
         events, runtime_root,
         state::{AppState, Metrics, SharedMetrics, SharedState, TorStatus},
@@ -265,18 +266,26 @@ fn first_run_headless_message(
     match install_kind {
         InstallKind::Fresh => {
             out.push_str("RustHost initialized data directory\n");
-            let _ = writeln!(out, "Created default config: {}", settings_path.display());
+            let _ = writeln!(
+                out,
+                "Created default config: {}",
+                display_path(settings_path)
+            );
         }
         InstallKind::RegeneratedSettings => {
             out.push_str("RustHost regenerated missing settings.toml\n");
-            let _ = writeln!(out, "Regenerated config: {}", settings_path.display());
+            let _ = writeln!(out, "Regenerated config: {}", display_path(settings_path));
         }
     }
-    let _ = writeln!(out, "Site directory: {}", data_dir.join("site").display());
+    let _ = writeln!(
+        out,
+        "Site directory: {}",
+        display_path(&data_dir.join("site"))
+    );
     let _ = writeln!(
         out,
         "Runtime directory: {}",
-        runtime_root(data_dir).display()
+        display_path(&runtime_root(data_dir))
     );
     out.push_str("Starting server now...\n");
     out
@@ -302,12 +311,12 @@ fn first_run_interactive_message(data_dir: &Path, install_kind: InstallKind) -> 
     let _ = writeln!(
         out,
         "  You can drop your site files into:  {}/",
-        data_dir.join("site").display()
+        display_path(&data_dir.join("site"))
     );
     let _ = writeln!(
         out,
         "  Runtime-managed files live under:    {}/",
-        runtime_root(data_dir).display()
+        display_path(&runtime_root(data_dir))
     );
     out.push('\n');
     out.push_str("  Tor onion service is built-in — no external install required.\n");
@@ -665,7 +674,7 @@ async fn start_console(
         let _ = writeln!(
             stdout,
             " Site : {}",
-            data_dir.join(&config.site.directory).display()
+            display_path(&data_dir.join(&config.site.directory))
         );
         let _ = writeln!(
             stdout,
@@ -899,6 +908,7 @@ mod tests {
         managed_runner_mode, uses_redirect_public_http, InstallKind, ManagedRunnerMode,
     };
     use crate::config::Config;
+    use std::path::Path;
 
     #[test]
     fn headless_cli_selects_headless_managed_runner() {
@@ -1030,5 +1040,22 @@ mod tests {
         assert!(output.contains(&format!("{}/", data_dir.join("runtime").display())));
         assert!(!output.contains("./rusthost-data/site/"));
         Ok(())
+    }
+
+    #[test]
+    fn first_run_messages_trim_parents_before_rusthost_data() {
+        let data_dir = Path::new("/Users/example/Desktop/rusthost-data");
+        let settings_path = data_dir.join("settings.toml");
+
+        let headless = first_run_headless_message(data_dir, &settings_path, InstallKind::Fresh);
+        let interactive = first_run_interactive_message(data_dir, InstallKind::Fresh);
+
+        assert!(headless.contains("Created default config: rusthost-data/settings.toml"));
+        assert!(headless.contains("Site directory: rusthost-data/site"));
+        assert!(headless.contains("Runtime directory: rusthost-data/runtime"));
+        assert!(interactive.contains("rusthost-data/site/"));
+        assert!(interactive.contains("rusthost-data/runtime/"));
+        assert!(!headless.contains("/Users/example/Desktop/rusthost-data"));
+        assert!(!interactive.contains("/Users/example/Desktop/rusthost-data"));
     }
 }

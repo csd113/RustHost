@@ -3,6 +3,7 @@ use crate::{
     config::Config,
     console::ui,
     logging,
+    path_display::display_path,
     runtime::state::{
         format_bytes, format_uptime, AppState, CertStatus, MetricsSnapshot, TorStatus,
     },
@@ -104,7 +105,7 @@ pub fn render_dashboard(
     let _ = writeln!(
         out,
         " Directory : {}\r",
-        data_dir.join(&config.site.directory).display()
+        display_path(&data_dir.join(&config.site.directory))
     );
     let _ = writeln!(out, " Files : {}\r", state.site_file_count);
     let _ = writeln!(out, " Size : {}\r", format_bytes(state.site_total_bytes));
@@ -326,5 +327,23 @@ mod tests {
 
         assert!(output.contains("Directory : /tmp/rusthost-custom/site"));
         assert!(!output.contains("./rusthost-data/site"));
+    }
+
+    #[test]
+    fn dashboard_site_directory_trims_parents_before_rusthost_data() {
+        let output = render_dashboard(
+            &AppState::new(),
+            MetricsSnapshot {
+                requests: 0,
+                errors: 0,
+                unique_visitors: 0,
+                uptime: Duration::ZERO,
+            },
+            &Config::default(),
+            Path::new("/Users/example/Desktop/rusthost-data"),
+        );
+
+        assert!(output.contains("Directory : rusthost-data/site"));
+        assert!(!output.contains("/Users/example/Desktop/rusthost-data/site"));
     }
 }

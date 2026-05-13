@@ -7,7 +7,9 @@ use std::{
 
 use chrono::{DateTime, Local};
 
-use crate::{config::Config, console::ui, runtime::state::format_bytes};
+use crate::{
+    config::Config, console::ui, path_display::display_path, runtime::state::format_bytes,
+};
 
 const SCAN_LIMIT: usize = 5_000;
 
@@ -88,7 +90,10 @@ pub fn collect_report(data_dir: &Path, config: &Config) -> SiteReport {
     let root_canon = root.canonicalize().ok();
     let mut warnings = Vec::new();
     if !root.is_dir() {
-        warnings.push(format!("Site root is unavailable at {}", root.display()));
+        warnings.push(format!(
+            "Site root is unavailable at {}",
+            display_path(&root)
+        ));
     }
     if !root.join(&config.site.index_file).is_file() {
         warnings.push(format!(
@@ -123,7 +128,7 @@ pub fn render(page: &SitePageState) -> String {
 
     let _ = writeln!(out, "{}\r", ui::bold("Served Content"));
     out.push_str("\r\n");
-    let _ = writeln!(out, "Root: {}\r", report.root.display());
+    let _ = writeln!(out, "Root: {}\r", display_path(&report.root));
     for warning in &report.warnings {
         let _ = writeln!(out, "{}\r", ui::yellow(warning));
     }

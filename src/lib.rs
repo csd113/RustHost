@@ -22,6 +22,7 @@ pub mod config;
 pub mod console;
 pub mod error;
 pub mod logging;
+pub(crate) mod path_display;
 pub mod runtime;
 pub mod server;
 pub mod terminal;
