@@ -11,6 +11,7 @@ use chrono::Local;
 
 use crate::{
     config::{self, Config},
+    path_display::display_path,
     AppError,
 };
 
@@ -172,9 +173,9 @@ impl DoctorReport {
         let mut out = String::with_capacity(2_048);
         let _ = writeln!(out, "RustHost Doctor");
         let _ = writeln!(out);
-        let _ = writeln!(out, "Data directory: {}", self.data_dir.display());
+        let _ = writeln!(out, "Data directory: {}", display_path(&self.data_dir));
         if let Some(settings_path) = &self.settings_path {
-            let _ = writeln!(out, "Settings: {}", settings_path.display());
+            let _ = writeln!(out, "Settings: {}", display_path(settings_path));
         }
         if let Some(generated_at) = &self.generated_at {
             let _ = writeln!(out, "Generated: {generated_at}");

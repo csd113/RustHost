@@ -1,11 +1,12 @@
 use std::{
     fmt::Write as _,
     net::{IpAddr, SocketAddr},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use crate::{
     config::Config,
+    path_display::display_path,
     runtime::state::{AppState, TorStatus},
     version,
 };
@@ -44,13 +45,13 @@ pub fn build_report(
         "Redirect HTTP: {}",
         enabled_label(config.tls.enabled && config.tls.redirect_http)
     );
-    let _ = writeln!(text, "Site root: {}", site_root.display());
-    let _ = writeln!(text, "Runtime path: {}", runtime_path.display());
+    let _ = writeln!(text, "Site root: {}", display_path(&site_root));
+    let _ = writeln!(text, "Runtime path: {}", display_path(&runtime_path));
     let _ = writeln!(text, "Logs: {logs}");
     let _ = writeln!(text, "Tor: {}", tor_label(config, state));
     let _ = writeln!(text, "Favicon: {favicon}");
     if let Some(settings_path) = settings_path {
-        let _ = writeln!(text, "Settings: {}", settings_path.display());
+        let _ = writeln!(text, "Settings: {}", display_path(settings_path));
     }
 
     DiagnosticsReport { text }
@@ -92,9 +93,9 @@ const fn display_bind_addr(bind: IpAddr) -> IpAddr {
 fn logs_label(config: &Config, data_dir: &Path) -> String {
     let log_path = data_dir.join(&config.logging.file);
     if config.logging.enabled {
-        log_path.display().to_string()
+        display_path(&log_path).into_owned()
     } else {
-        format!("disabled ({})", log_path.display())
+        format!("disabled ({})", display_path(&log_path))
     }
 }
 
@@ -118,7 +119,7 @@ fn favicon_label(config: &Config, site_root: &Path) -> String {
 
     let favicon_path = site_root.join(&config.site.favicon);
     if !favicon_path.is_file() {
-        return format!("missing ({})", favicon_path.display());
+        return format!("missing ({})", display_path(&favicon_path));
     }
 
     if config.site.favicon == "favicon.ico" {
@@ -129,14 +130,7 @@ fn favicon_label(config: &Config, site_root: &Path) -> String {
 }
 
 fn display_relative_or_absolute(path: &Path) -> String {
-    path.strip_prefix(current_dir_fallback()).map_or_else(
-        |_| path.display().to_string(),
-        |path| path.display().to_string(),
-    )
-}
-
-fn current_dir_fallback() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    display_path(path).into_owned()
 }
 
 fn single_line(value: &str) -> String {

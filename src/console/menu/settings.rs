@@ -3,6 +3,7 @@ use std::{fmt::Write as _, net::SocketAddr, path::Path};
 use crate::{
     config::Config,
     console::{menu::diagnostics, ui},
+    path_display::display_path,
     runtime::state::AppState,
 };
 
@@ -60,7 +61,7 @@ pub fn render(
     let _ = writeln!(out, "{}\r", ui::bold("Mode"));
     let _ = writeln!(out, "Console:        {}\r", console_mode_label(config));
     let _ = writeln!(out, "Headless:       {}\r", !config.console.interactive);
-    let _ = writeln!(out, "Data dir:       {}\r", data_dir.display());
+    let _ = writeln!(out, "Data dir:       {}\r", display_path(data_dir));
     out.push_str("\r\n");
 
     let _ = writeln!(out, "{}\r", ui::bold("Server"));
@@ -79,7 +80,7 @@ pub fn render(
 
     let _ = writeln!(out, "{}\r", ui::bold("Site"));
     let site_root = data_dir.join(&config.site.directory);
-    let _ = writeln!(out, "Site root:      {}\r", site_root.display());
+    let _ = writeln!(out, "Site root:      {}\r", display_path(&site_root));
     let _ = writeln!(
         out,
         "Favicon:        {}\r",
@@ -97,7 +98,7 @@ pub fn render(
         .join(&config.logging.file)
         .parent()
         .map_or_else(|| data_dir.to_path_buf(), Path::to_path_buf);
-    let _ = writeln!(out, "Log dir:        {}\r", log_dir.display());
+    let _ = writeln!(out, "Log dir:        {}\r", display_path(&log_dir));
     let _ = writeln!(
         out,
         "Access log:     {}\r",
