@@ -44,7 +44,7 @@ multiple_crate_versions = "allow"
 
 rustls-pemfile = "2"         # PEM parsing — used in mod.rs
 x509-cert      = "0.2"      # cert expiry parsing — used in self_signed.rs
-pem-rfc7468    = "0.7"      # PEM decode for the expiry check
+pem-rfc7468    = { version = "1.0", features = ["alloc"] }  # PEM decode for the expiry check
 time           = "0.3"      # OffsetDateTime for rcgen cert params
 
 # TLS / HTTPS support.
@@ -52,8 +52,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tokio-util   = { version = "0.7",  features = ["compat", "io"] }  # futures-io ↔ tokio-io compatibility bridge
 rustls       = { version = "0.23", features = ["ring"] }    # rustls TLS implementation
 rustls-acme  = { version = "0.15", default-features = false, features = ["tokio", "ring"] } # ACME / Let's Encrypt automation
-webpki-roots = "0.26"                                        # Mozilla root store for ACME client TLS
-rcgen        = "0.13"                                        # self-signed dev cert generation
+webpki-roots = "1.0"                                         # Mozilla root store for ACME client TLS
+rcgen        = "0.14.8"                                      # self-signed dev cert generation
 
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -84,13 +84,13 @@ futures       = "0.3"
 # unmaintained. `anyhow` is retained for use in other modules.
 anyhow  = "1"
 
-sha3          = "0.10"
+sha3          = "0.11"
 data-encoding = "2"
 thiserror     = "2"
 serde         = { version = "1",   features = ["derive"] }
-toml          = "0.8"
+toml          = "1.1.2"
 log           = "0.4"
-crossterm     = "0.28"
+crossterm     = "0.29"
 chrono        = { version = "0.4", features = ["clock"] }
 
 # OS error codes used in the accept-loop backoff to distinguish EMFILE/ENFILE
@@ -101,7 +101,7 @@ libc = "0.2"
 # arti-client pulls rusqlite transitively; declaring it here unifies the feature
 # across the whole dep tree so cross-compiling to Linux/Windows works without a
 # system sqlite3 library present on the host Mac.
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 # Per-IP connection tracking for rate limiting.
 # DashMap is a concurrent hash map with fine-grained shard locking; it avoids
