@@ -1066,7 +1066,13 @@ enabled = false
     #[test]
     fn address_in_use_is_failure() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+                return;
+            }
+        };
         let port = listener.local_addr().expect("addr").port();
         write_settings(tmp.path(), &default_settings(port));
         let report = run_fast_doctor(
