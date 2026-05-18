@@ -119,12 +119,7 @@ impl TestServer {
 fn reserve_port_or_skip() -> Result<Option<u16>, Box<dyn std::error::Error>> {
     match reserve_port() {
         Ok(port) => Ok(Some(port)),
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!(
-                "[html_stress] skipping test: loopback sockets are blocked in this environment"
-            );
-            Ok(None)
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Ok(None),
         Err(err) => Err(err.into()),
     }
 }

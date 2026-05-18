@@ -1631,19 +1631,12 @@ async fn custom_favicon_symlink_escape_is_rejected() -> Result<(), Box<dyn std::
 async fn occupied_http_port_reports_actionable_bind_error() -> Result<(), Box<dyn std::error::Error>>
 {
     let (tmp, site) = make_site(&[("index.html", b"ok")])?;
-    let occupied = match std::net::TcpListener::bind(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        0,
-    )) {
-        Ok(listener) => listener,
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!(
-                    "[http_integration] skipping test: loopback sockets are blocked in this environment"
-                );
-            return Ok(());
-        }
-        Err(err) => return Err(err.into()),
-    };
+    let occupied =
+        match std::net::TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)) {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
     let occupied_port = occupied.local_addr()?.port();
 
     let mut config = build_test_config(&site, IpAddr::V4(Ipv4Addr::LOCALHOST), occupied_port)?;
