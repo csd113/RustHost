@@ -43,6 +43,7 @@ use tokio::{
 };
 use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{config::OnionServiceConfigBuilder, handle_rend_requests, HsId, StreamRequest};
+use tor_rtcompat::PreferredRuntime;
 
 use crate::runtime::state::{SharedState, TorStatus};
 use fs::ensure_private_dir;
@@ -58,6 +59,8 @@ const RETRY_BASE_SECS: u64 = 30;
 const RETRY_MAX_SECS: u64 = 300;
 const MAX_RETRIES: u32 = 5;
 const TOR_RELAY_BUFFER_BYTES: usize = 32 * 1024;
+
+type SharedTorClient = Arc<TorClient<PreferredRuntime>>;
 
 fn format_startup_failure(err: &anyhow::Error) -> String {
     let detail = format!("{err:#}");
@@ -160,6 +163,9 @@ pub fn init(
 // ─── Core async logic ─────────────────────────────────────────────────────────
 
 struct TorSession {
+    /// Kept alive with the onion service so Arti client ownership remains
+    /// explicit when the client is shared internally by Arti components.
+    tor_client: SharedTorClient,
     /// Must be kept alive for the session lifetime — dropping it de-registers
     /// the onion service from the Tor network.
     onion_service_guard: Arc<tor_hsservice::RunningOnionService>,
@@ -185,7 +191,7 @@ async fn bootstrap_and_launch(
 
     log::info!("Tor: bootstrapping — first run downloads ~2 MB of directory data (~30 s)");
 
-    let tor_client = {
+    let tor_client = Arc::new({
         let mut sd = shutdown.clone();
         tokio::select! {
             result = tokio::time::timeout(
@@ -204,7 +210,7 @@ async fn bootstrap_and_launch(
                 return Ok(None);
             }
         }
-    };
+    });
 
     log::info!("Tor: connected to the Tor network");
 
@@ -231,6 +237,7 @@ async fn bootstrap_and_launch(
     let stream_requests = Box::pin(handle_rend_requests(rend_requests));
 
     Ok(Some(TorSession {
+        tor_client,
         onion_service_guard,
         stream_requests,
         onion_name,
@@ -282,11 +289,13 @@ async fn process_streams(
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<bool> {
     let TorSession {
+        tor_client,
         onion_service_guard,
         mut stream_requests,
         onion_name: _,
     } = session;
 
+    let _keep_tor_client_alive = tor_client;
     let _keep_onion_service_alive = onion_service_guard;
     let semaphore = Arc::new(tokio::sync::Semaphore::new(max_connections));
     let mut active_tasks = JoinSet::new();

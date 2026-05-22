@@ -75,6 +75,7 @@ arti-client = { version = "0.42", default-features = false, features = [
 ] }
 tor-hsservice = { version = "0.42", default-features = false }
 tor-cell      = { version = "0.42", default-features = false }
+tor-rtcompat  = { version = "0.42", default-features = false, features = ["tokio", "rustls"] }
 futures       = "0.3"
 
 # Terminal auto-launcher: TTY detection uses std::io::IsTerminal

@@ -3283,6 +3283,7 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tor-cell",
  "tor-hsservice",
+ "tor-rtcompat",
  "webpki-roots 1.0.7",
  "x509-cert",
 ]

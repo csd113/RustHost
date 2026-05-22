@@ -127,7 +127,7 @@ use std::{
 };
 
 // New imports
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::TorClient;
@@ -135,11 +135,13 @@ use futures::StreamExt;
 use tokio::net::TcpStream;
 use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{config::OnionServiceConfigBuilder, handle_rend_requests, HsId, StreamRequest};
+use tor_rtcompat::PreferredRuntime;
 ```
 
 Notes on the import changes:
 - `TorClientConfig` is **not** imported — it is not used directly. The builder is accessed via `TorClientConfigBuilder` instead (see the config section below).
 - `HsId` is imported from `tor_hsservice`, **not** from `arti_client`. In arti 0.42, the re-export in `arti_client` is gated behind `feature = "onion-service-client"` and `feature = "experimental-api"` — neither of which is enabled in this setup. `tor_hsservice::HsId` is the ungated path.
+- `PreferredRuntime` comes from `tor_rtcompat` so retained shared client handles can be spelled as `Arc<TorClient<PreferredRuntime>>`.
 
 ---
 
@@ -183,14 +185,14 @@ pub fn kill() {
     }
 }
 
-// New — nothing to do; TorClient drops with the task
+// New — nothing to do; the retained Arc<TorClient<PreferredRuntime>> drops with the task
 pub fn kill() {}
 ```
 
 The call site in your shutdown sequence does not need to change. The
-`TorClient` is owned by the `tokio::spawn` task. When the Tokio runtime
-shuts down, the task is dropped, which drops `TorClient`, which closes all
-circuits cleanly.
+`Arc<TorClient<PreferredRuntime>>` is owned by the `tokio::spawn` task's
+session state. When the Tokio runtime shuts down, the task is dropped, which
+drops the retained client handle and closes all circuits cleanly.
 
 ---
 
@@ -280,7 +282,7 @@ let child = Command::new(tor_bin)
     .spawn();
 
 // New
-let tor_client = TorClient::create_bootstrapped(config).await?;
+let tor_client = Arc::new(TorClient::create_bootstrapped(config).await?);
 ```
 
 `create_bootstrapped` async-blocks until Tor has downloaded enough directory
@@ -506,7 +508,7 @@ Search for and update any references to:
 | `torrc` | Remove — config is built in Rust code |
 | `SocksPort 0` | Not applicable |
 | `spawns std threads` | `spawns a Tokio task` |
-| `Kill the Tor subprocess` | `Drop the Arti TorClient` |
+| `Kill the Tor subprocess` | `Drop the retained Arti client handle` |
 
 In any first-run setup output, replace the `brew`/`apt-get` install
 instructions with a note that Tor is built-in and the first run takes ~30 s.
@@ -516,7 +518,7 @@ instructions with a note that Tor is built-in and the first run takes ~30 s.
 ## Complete `src/tor/mod.rs` After Migration
 
 ```rust
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::TorClient;
@@ -524,8 +526,17 @@ use futures::StreamExt;
 use tokio::net::TcpStream;
 use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{config::OnionServiceConfigBuilder, handle_rend_requests, HsId, StreamRequest};
+use tor_rtcompat::PreferredRuntime;
 
 use crate::runtime::state::{SharedState, TorStatus};
+
+type SharedTorClient = Arc<TorClient<PreferredRuntime>>;
+
+struct TorSession {
+    tor_client: SharedTorClient,
+    onion_service: Arc<tor_hsservice::RunningOnionService>,
+    onion_name: String,
+}
 
 pub fn init(data_dir: PathBuf, bind_port: u16, state: SharedState) {
     tokio::spawn(async move {
@@ -553,9 +564,11 @@ async fn run(
 
     log::info!("Tor: bootstrapping — first run downloads ~2 MB (~30 s)");
 
-    let tor_client = TorClient::create_bootstrapped(config)
-        .await
-        .map_err(|e| format!("Tor bootstrap failed: {e}"))?;
+    let tor_client: SharedTorClient = Arc::new(
+        TorClient::create_bootstrapped(config)
+            .await
+            .map_err(|e| format!("Tor bootstrap failed: {e}"))?,
+    );
 
     log::info!("Tor: connected to the Tor network");
 
@@ -573,7 +586,20 @@ async fn run(
     let onion_name = hsid_to_onion_address(hsid);
 
     log::info!("Tor: onion service active — http://{onion_name}");
-    set_onion(&state, onion_name).await;
+    set_onion(&state, onion_name.clone()).await;
+
+    let session = TorSession {
+        tor_client,
+        onion_service,
+        onion_name,
+    };
+    let TorSession {
+        tor_client,
+        onion_service,
+        onion_name: _,
+    } = session;
+    let _keep_tor_client_alive = tor_client;
+    let _keep_onion_service_alive = onion_service;
 
     let mut stream_requests = handle_rend_requests(rend_requests);
 
