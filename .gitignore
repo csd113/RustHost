@@ -25,3 +25,8 @@ clippy_reports
 src/.DS_Store
 build-release.sh
 tests/fixtures/runtime/
+
+# Local-only Playwright browser validation. Keep the full harness, npm metadata,
+# browser artifacts, reports, screenshots, and traces out of the published repo.
+tests/playwright/
+tests/playwright/**

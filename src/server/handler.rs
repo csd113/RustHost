@@ -620,6 +620,21 @@ async fn route(
     cfg: &RouteConfig,
     metrics: &SharedMetrics,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    if !has_valid_host_header(&req) {
+        metrics.add_error();
+        let resp = text_response(StatusCode::BAD_REQUEST, "Bad Request", &cfg.csp, "");
+        log_request(
+            &req,
+            resp.status().as_u16(),
+            response_size(&resp),
+            cfg.peer_addr,
+            &cfg.trusted_proxies,
+        );
+        return Ok(
+            inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await,
+        );
+    }
+
     record_unique_visitor(
         &req,
         cfg.peer_addr,
@@ -1851,6 +1866,48 @@ fn is_html_response(resp: &Response<BoxBody>) -> bool {
         .is_some_and(|content_type| content_type.starts_with("text/html"))
 }
 
+fn has_valid_host_header<B>(req: &Request<B>) -> bool {
+    let mut values = req.headers().get_all(header::HOST).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    if values.next().is_some() {
+        return false;
+    }
+    value.to_str().is_ok_and(is_valid_host_value)
+}
+
+fn is_valid_host_value(host: &str) -> bool {
+    let host = host.trim();
+    if host.is_empty()
+        || !host.is_ascii()
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains('@')
+        || host.contains("://")
+    {
+        return false;
+    }
+
+    if let Some(remainder) = host.strip_prefix('[') {
+        let Some((addr, port)) = remainder.split_once(']') else {
+            return false;
+        };
+        return !addr.is_empty()
+            && addr.contains(':')
+            && (port.is_empty() || port.strip_prefix(':').is_some_and(valid_host_port));
+    }
+
+    match host.rsplit_once(':') {
+        Some((name, port)) => !name.is_empty() && !name.contains(':') && valid_host_port(port),
+        None => !host.contains(':'),
+    }
+}
+
+fn valid_host_port(raw: &str) -> bool {
+    raw.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
 fn security_headers(
     mut builder: hyper::http::response::Builder,
     csp: &str,
@@ -2087,6 +2144,36 @@ mod tests {
     #[test]
     fn percent_decode_invalid_hex() {
         assert_eq!(percent_decode("/foo%ZZ"), "/foo%ZZ");
+    }
+
+    #[test]
+    fn host_validation_accepts_loopback_and_domains() {
+        for host in [
+            "localhost",
+            "localhost:8080",
+            "127.0.0.1:8080",
+            "[::1]:8080",
+        ] {
+            assert!(super::is_valid_host_value(host), "host={host}");
+        }
+    }
+
+    #[test]
+    fn host_validation_rejects_malformed_authorities() {
+        for host in [
+            "",
+            "localhost/path",
+            "localhost\\path",
+            "evil.com@legit.com",
+            "http://localhost",
+            "localhost:0",
+            "localhost:65536",
+            "::1",
+            "[::1",
+            "[::1]:bad",
+        ] {
+            assert!(!super::is_valid_host_value(host), "host={host}");
+        }
     }
 
     #[test]
