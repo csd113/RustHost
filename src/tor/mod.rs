@@ -191,7 +191,7 @@ async fn bootstrap_and_launch(
 
     log::info!("Tor: bootstrapping — first run downloads ~2 MB of directory data (~30 s)");
 
-    let tor_client = Arc::new({
+    let tor_client = {
         let mut sd = shutdown.clone();
         tokio::select! {
             result = tokio::time::timeout(
@@ -210,7 +210,7 @@ async fn bootstrap_and_launch(
                 return Ok(None);
             }
         }
-    });
+    };
 
     log::info!("Tor: connected to the Tor network");
 
