@@ -5,7 +5,7 @@
 [![CI](https://github.com/csd113/RustHost/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/RustHost/actions/workflows/ci.yml)
 [![Dependency Audit](https://github.com/csd113/RustHost/actions/workflows/audit.yml/badge.svg)](https://github.com/csd113/RustHost/actions/workflows/audit.yml)
 [![License: MIT](https://img.shields.io/github/license/csd113/RustHost)](LICENSE)
-[![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-orange)](Cargo.toml)
+[![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange)](Cargo.toml)
 [![Version](https://img.shields.io/badge/version-v1.0.0-blue)](CHANGELOG.md)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-3b82f6)](.github/workflows/ci.yml)
 
@@ -47,7 +47,7 @@ It is intentionally narrow in scope: no web framework, no CMS, no reverse proxy,
 
 ## Quick Start
 
-Requires Rust 1.90+.
+Requires Rust 1.91+.
 
 ```bash
 git clone https://github.com/csd113/RustHost.git

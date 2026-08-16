@@ -2,10 +2,8 @@
 name = "rusthost"
 version = "1.0.0"
 edition = "2021"
-# Bumped from 1.86 → 1.90 to match the highest MSRV in the transitive dep tree:
-# arti-client 0.43 and most tor-* crates require 1.90
-# typed-index-collections 3.5 (via tor-netdir) requires 1.90
-rust-version = "1.90"
+# Arti 0.45 and its Tor crates require Rust 1.91.
+rust-version = "1.91"
 description = "Single-binary, zero-setup static site hosting appliance with Tor support"
 license = "MIT"
 repository = "https://github.com/csd113/RustHost"
@@ -43,7 +41,7 @@ multiple_crate_versions = "allow"
 [dependencies]
 
 rustls-pemfile = "2"         # PEM parsing — used in mod.rs
-x509-cert      = "0.2"      # cert expiry parsing — used in self_signed.rs
+x509-cert      = "0.3"      # cert expiry parsing — used in self_signed.rs
 pem-rfc7468    = { version = "1.0", features = ["alloc"] }  # PEM decode for the expiry check
 time           = "0.3"      # OffsetDateTime for rcgen cert params
 
@@ -53,7 +51,7 @@ tokio-util   = { version = "0.7",  features = ["compat", "io"] }  # futures-io �
 rustls       = { version = "0.23", features = ["ring"] }    # rustls TLS implementation
 rustls-acme  = { version = "0.15", default-features = false, features = ["tokio", "ring"] } # ACME / Let's Encrypt automation
 webpki-roots = "1.0"                                         # Mozilla root store for ACME client TLS
-rcgen        = "0.14.8"                                      # self-signed dev cert generation
+rcgen        = "0.14.9"                                      # self-signed dev cert generation
 
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -68,18 +66,18 @@ tokio = { version = "1", features = [
 
 # default-features = false removes the implicit "native-tls" default that
 # would otherwise pull in openssl-sys and break cross-compilation.
-arti-client = { version = "0.43", default-features = false, features = [
+arti-client = { version = "0.45", default-features = false, features = [
     "tokio",
     "rustls",
     "onion-service-service",
 ] }
-tor-hsservice = { version = "0.43", default-features = false }
-tor-cell      = { version = "0.43", default-features = false }
-tor-rtcompat  = { version = "0.43", default-features = false, features = ["tokio", "rustls"] }
+tor-hsservice = { version = "0.45", default-features = false }
+tor-cell      = { version = "0.45", default-features = false }
+tor-rtcompat  = { version = "0.45", default-features = false, features = ["tokio", "rustls"] }
 futures       = "0.3"
 
 # Terminal auto-launcher: TTY detection uses std::io::IsTerminal
-# (stable since Rust 1.70; this project's MSRV is 1.90) — no additional crate
+# (stable since Rust 1.70; this project's MSRV is 1.91) — no additional crate
 # required. The previously used `atty` crate has been removed: it carried a
 # memory-safety vulnerability on Windows (RUSTSEC-2021-0145) and was
 # unmaintained. `anyhow` is retained for use in other modules.
@@ -89,7 +87,7 @@ sha3          = "0.12"
 data-encoding = "2"
 thiserror     = "2"
 serde         = { version = "1",   features = ["derive"] }
-toml          = "1.1.2"
+toml          = "1.1.4"
 log           = "0.4"
 crossterm     = "0.29"
 chrono        = { version = "0.4", features = ["clock"] }
@@ -102,6 +100,8 @@ libc = "0.2"
 # arti-client pulls rusqlite transitively; declaring it here unifies the feature
 # across the whole dep tree so cross-compiling to Linux/Windows works without a
 # system sqlite3 library present on the host Mac.
+# Arti 0.45's tor-dirmgr requires rusqlite < 0.40.  Keeping the newest
+# compatible 0.39 line here also enables bundled SQLite for the whole graph.
 rusqlite = { version = "0.39", features = ["bundled"] }
 
 # Per-IP connection tracking for rate limiting.

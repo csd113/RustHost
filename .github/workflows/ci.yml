@@ -31,7 +31,7 @@ jobs:
         uses: actions/checkout@v6.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.91
         with:
           components: clippy, rustfmt
 
@@ -62,7 +62,7 @@ jobs:
         uses: actions/checkout@v6.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.91
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -96,7 +96,7 @@ jobs:
         uses: actions/checkout@v6.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.91
         with:
           targets: ${{ matrix.target }}
 

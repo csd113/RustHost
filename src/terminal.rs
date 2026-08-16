@@ -37,7 +37,7 @@
 //! ## MSRV note
 //!
 //! TTY detection uses [`std::io::IsTerminal`], stable since Rust 1.70 (June
-//! 2023). This project's MSRV is 1.90, so no additional crate is required.
+//! 2023). This project's MSRV is 1.91, so no additional crate is required.
 //! The `atty` crate previously used here carries a known memory-safety
 //! vulnerability on Windows (RUSTSEC-2021-0145) and has been removed.
 //!

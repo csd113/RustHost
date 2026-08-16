@@ -235,7 +235,7 @@ fn remaining_validity_days(cert_path: &Path) -> Option<u64> {
         .ok()?;
 
     // `not_after` is stored as an ASN.1 Time; convert via Unix timestamp.
-    let not_after = cert.tbs_certificate.validity.not_after.to_system_time();
+    let not_after = cert.tbs_certificate().validity().not_after.to_system_time();
     let remaining = not_after
         .duration_since(SystemTime::now())
         .map_err(|e| {
