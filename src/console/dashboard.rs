@@ -313,6 +313,7 @@ mod tests {
 
     #[test]
     fn dashboard_site_directory_uses_active_data_dir() {
+        let data_dir = Path::new("/tmp/rusthost-custom");
         let output = render_dashboard(
             &AppState::new(),
             MetricsSnapshot {
@@ -322,10 +323,10 @@ mod tests {
                 uptime: Duration::ZERO,
             },
             &Config::default(),
-            Path::new("/tmp/rusthost-custom"),
+            data_dir,
         );
 
-        assert!(output.contains("Directory : /tmp/rusthost-custom/site"));
+        assert!(output.contains(&format!("Directory : {}", data_dir.join("site").display())));
         assert!(!output.contains("./rusthost-data/site"));
     }
 
@@ -343,7 +344,10 @@ mod tests {
             Path::new("/Users/example/Desktop/rusthost-data"),
         );
 
-        assert!(output.contains("Directory : rusthost-data/site"));
+        assert!(output.contains(&format!(
+            "Directory : {}",
+            Path::new("rusthost-data").join("site").display()
+        )));
         assert!(!output.contains("/Users/example/Desktop/rusthost-data/site"));
     }
 }

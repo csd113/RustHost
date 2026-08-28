@@ -62,6 +62,8 @@ const MAX_REQUEST_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_CUSTOM_ERROR_PAGE_BYTES: u64 = 64 * 1024;
 const IDENTITY_STREAM_CHUNK_BYTES: usize = 128 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const REJECTED_HEADER_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_REJECTED_HEADER_DRAIN_BYTES: usize = 64 * 1024;
 const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 static READINESS_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn full_body(data: impl Into<Bytes>) -> BoxBody {
@@ -532,9 +534,47 @@ where
                 "Request Header Fields Too Large",
             )
             .await?;
+            drain_rejected_headers(stream, &buffered).await;
             return Ok(None);
         }
     }
+}
+
+/// Briefly consume the rest of a rejected header block after sending the 431.
+///
+/// Closing a Winsock connection with unread inbound bytes produces a TCP reset,
+/// which can discard the response before the client observes it. The strict
+/// time and byte bounds keep this best-effort drain from becoming a slow-client
+/// resource sink.
+async fn drain_rejected_headers<S>(stream: &mut S, buffered: &[u8])
+where
+    S: AsyncRead + Unpin,
+{
+    let tail_start = buffered.len().saturating_sub(3);
+    let mut scan = buffered[tail_start..].to_vec();
+    let mut staging = [0_u8; 4096];
+    let mut drained = 0_usize;
+
+    let drain = async {
+        while drained < MAX_REJECTED_HEADER_DRAIN_BYTES {
+            let remaining = MAX_REJECTED_HEADER_DRAIN_BYTES.saturating_sub(drained);
+            let read_len = remaining.min(staging.len());
+            let n = match stream.read(&mut staging[..read_len]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            drained = drained.saturating_add(n);
+            scan.extend_from_slice(&staging[..n]);
+            if find_header_end(&scan).is_some() {
+                break;
+            }
+            if scan.len() > 3 {
+                scan.drain(..scan.len() - 3);
+            }
+        }
+    };
+
+    let _ = tokio::time::timeout(REJECTED_HEADER_DRAIN_TIMEOUT, drain).await;
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {

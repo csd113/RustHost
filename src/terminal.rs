@@ -230,7 +230,7 @@ fn is_dev_null(metadata: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(not(unix))]
-fn classify_stdio(_fd: i32, is_terminal: bool) -> StdioKind {
+const fn classify_stdio(_fd: i32, is_terminal: bool) -> StdioKind {
     if is_terminal {
         StdioKind::Terminal
     } else {

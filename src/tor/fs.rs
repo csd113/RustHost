@@ -152,14 +152,11 @@ fn harden_windows_permissions(path: &std::path::Path) -> std::io::Result<()> {
         .output()?;
 
     if !icacls_out.status.success() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "icacls failed (exit {:?}): {}",
-                icacls_out.status.code(),
-                String::from_utf8_lossy(&icacls_out.stderr).trim(),
-            ),
-        ));
+        return Err(std::io::Error::other(format!(
+            "icacls failed (exit {:?}): {}",
+            icacls_out.status.code(),
+            String::from_utf8_lossy(&icacls_out.stderr).trim(),
+        )));
     }
 
     Ok(())

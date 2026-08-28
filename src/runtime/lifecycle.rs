@@ -703,7 +703,7 @@ fn make_sighup_signal() -> Option<tokio::signal::unix::Signal> {
 }
 
 #[cfg(not(unix))]
-fn make_sighup_signal() -> Option<()> {
+const fn make_sighup_signal() -> Option<()> {
     None
 }
 
@@ -1050,11 +1050,21 @@ mod tests {
         let headless = first_run_headless_message(data_dir, &settings_path, InstallKind::Fresh);
         let interactive = first_run_interactive_message(data_dir, InstallKind::Fresh);
 
-        assert!(headless.contains("Created default config: rusthost-data/settings.toml"));
-        assert!(headless.contains("Site directory: rusthost-data/site"));
-        assert!(headless.contains("Runtime directory: rusthost-data/runtime"));
-        assert!(interactive.contains("rusthost-data/site/"));
-        assert!(interactive.contains("rusthost-data/runtime/"));
+        let display_root = Path::new("rusthost-data");
+        assert!(headless.contains(&format!(
+            "Created default config: {}",
+            display_root.join("settings.toml").display()
+        )));
+        assert!(headless.contains(&format!(
+            "Site directory: {}",
+            display_root.join("site").display()
+        )));
+        assert!(headless.contains(&format!(
+            "Runtime directory: {}",
+            display_root.join("runtime").display()
+        )));
+        assert!(interactive.contains(&format!("{}/", display_root.join("site").display())));
+        assert!(interactive.contains(&format!("{}/", display_root.join("runtime").display())));
         assert!(!headless.contains("/Users/example/Desktop/rusthost-data"));
         assert!(!interactive.contains("/Users/example/Desktop/rusthost-data"));
     }

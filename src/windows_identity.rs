@@ -63,7 +63,7 @@ pub fn current_windows_identity(extra_disallowed: &[char]) -> io::Result<(String
     validate_windows_identity_name_component(&username, extra_disallowed)?;
     validate_windows_identity_name_component(&userdomain, extra_disallowed)?;
 
-    Ok((username, userdomain))
+    Ok((userdomain, username))
 }
 
 #[cfg(test)]

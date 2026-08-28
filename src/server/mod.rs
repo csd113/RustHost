@@ -768,6 +768,14 @@ fn bind_with_fallback(
                 // Try the next port.
             }
             Err(source) => {
+                let source = if source.kind() == std::io::ErrorKind::AddrInUse {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        format!("address already in use: {source}"),
+                    )
+                } else {
+                    source
+                };
                 return Err(AppError::ServerBind {
                     listener,
                     addr: socket_addr,
