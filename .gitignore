@@ -30,3 +30,6 @@ tests/fixtures/runtime/
 # browser artifacts, reports, screenshots, and traces out of the published repo.
 tests/playwright/
 tests/playwright/**
+
+# Private instructions for local Codex sessions.
+rules.md
