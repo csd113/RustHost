@@ -142,20 +142,19 @@ fn harden_windows_permissions(path: &std::path::Path) -> std::io::Result<()> {
     let grant_arg = format!("{userdomain}\\{username}:(OI)(CI)F");
 
     let path_str = path.to_string_lossy();
-    let icacls_out = std::process::Command::new("icacls")
-        .args([
+    let status = crate::process::run_bounded(
+        std::process::Command::new("icacls").args([
             path_str.as_ref(),
             "/inheritance:r",
             "/grant:r",
             grant_arg.as_str(),
-        ])
-        .output()?;
-
-    if !icacls_out.status.success() {
+        ]),
+        std::time::Duration::from_secs(5),
+    )?;
+    if !status.success() {
         return Err(std::io::Error::other(format!(
-            "icacls failed (exit {:?}): {}",
-            icacls_out.status.code(),
-            String::from_utf8_lossy(&icacls_out.stderr).trim(),
+            "icacls failed (exit {:?})",
+            status.code()
         )));
     }
 

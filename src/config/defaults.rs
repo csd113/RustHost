@@ -145,15 +145,7 @@ cache_dir = "runtime/tls/acme"
 ///
 /// Returns [`crate::AppError::Io`] on any filesystem error.
 pub fn write_default_config(path: &Path) -> Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    std::fs::write(path, DEFAULT_SETTINGS)?;
+    crate::persistence::create_default(path, DEFAULT_SETTINGS.as_bytes())?;
     Ok(())
 }
 

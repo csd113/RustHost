@@ -69,15 +69,18 @@ fn try_acquire_per_ip(
     addr: IpAddr,
     limit: u32,
 ) -> Result<PerIpGuard, AdmissionRejection> {
-    let counter = Arc::clone(
-        map.entry(addr)
-            .or_insert_with(|| Arc::new(AtomicU32::new(0)))
-            .value(),
-    );
+    // Hold the shard lock until the count is incremented. Otherwise the last
+    // departing connection can remove this entry after we clone its counter,
+    // leaving the new connection on an untracked counter.
+    let entry = map
+        .entry(addr)
+        .or_insert_with(|| Arc::new(AtomicU32::new(0)));
+    let counter = entry.value();
 
     let mut current = counter.load(Ordering::Acquire);
     loop {
         if current >= limit {
+            drop(entry);
             return Err(AdmissionRejection::PerIpLimit { limit });
         }
         match counter.compare_exchange_weak(
@@ -87,6 +90,8 @@ fn try_acquire_per_ip(
             Ordering::Acquire,
         ) {
             Ok(_) => {
+                let counter = Arc::clone(counter);
+                drop(entry);
                 return Ok(PerIpGuard {
                     counter,
                     map: Arc::clone(map),
@@ -110,6 +115,35 @@ mod tests {
         },
     };
     use tokio::sync::Semaphore;
+
+    #[test]
+    fn concurrent_admissions_keep_every_live_counter_tracked() -> Result<(), &'static str> {
+        let map = Arc::new(DashMap::new());
+        let addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for _ in 0..8 {
+                threads.push(scope.spawn(|| {
+                    for _ in 0..10_000 {
+                        if let Ok(guard) = super::try_acquire_per_ip(&map, addr, 4) {
+                            let tracked = map.get(&addr).ok_or("live counter must be tracked")?;
+                            assert!(Arc::ptr_eq(tracked.value(), &guard.counter));
+                            assert!(tracked.load(Ordering::Acquire) <= 4);
+                            drop(tracked);
+                            drop(guard);
+                        }
+                    }
+                    Ok::<_, &'static str>(())
+                }));
+            }
+            for thread in threads {
+                thread.join().map_err(|_| "admission thread panicked")??;
+            }
+            Ok::<_, &'static str>(())
+        })?;
+        assert!(map.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn admission_releases_per_ip_slot_and_removes_empty_entry() -> Result<(), &'static str> {

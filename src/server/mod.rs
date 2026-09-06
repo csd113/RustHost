@@ -9,6 +9,8 @@
 //! - [`mime`] — file-extension → MIME type mapping
 //! - [`fallback`] — built-in "No site found" page
 mod admission;
+mod site;
+pub use site::SiteSnapshot;
 pub mod fallback;
 pub mod handler;
 pub mod mime;
@@ -44,10 +46,9 @@ use tokio::{
     reason = "Listener state groups related booleans used by every connection handler."
 )]
 struct ServerContext {
-    canonical_root: Arc<Path>,
+    site_watch: watch::Receiver<Arc<SiteSnapshot>>,
     data_dir: Arc<Path>,
     log_dir: Arc<Path>,
-    favicon: Arc<handler::FaviconConfig>,
     index_file: Arc<str>,
     csp_header: Arc<str>,
     state: SharedState,
@@ -55,8 +56,6 @@ struct ServerContext {
     dir_list: bool,
     expose_dots: bool,
     spa_routing: bool,
-    error_404_page: Option<Arc<handler::CustomErrorPage>>,
-    error_503_page: Option<Arc<handler::CustomErrorPage>>,
     redirects: Arc<Vec<crate::config::RedirectRule>>,
     semaphore: Arc<Semaphore>,
     per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
@@ -88,50 +87,17 @@ impl ServerContext {
         semaphore: Arc<Semaphore>,
         per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
         options: ListenerOptions,
-    ) -> Option<Self> {
-        let site_root = data_dir.join(&config.site.directory);
-        let canonical_root: Arc<Path> = match site_root.canonicalize() {
-            Ok(p) => Arc::from(p.as_path()),
-            Err(e) => {
-                log::error!(
-                    "Site root {} cannot be resolved: {e}. \
-                     Check that [site] directory exists.",
-                    site_root.display()
-                );
-                return None;
-            }
-        };
+        site_watch: watch::Receiver<Arc<SiteSnapshot>>,
+    ) -> Self {
         let max_conns = config.server.max_connections as usize;
-        let site_dir = data_dir.join(&config.site.directory);
         let log_path = data_dir.join(&config.logging.file);
         let log_dir = log_path
             .parent()
             .map_or_else(|| data_dir.to_path_buf(), Path::to_path_buf);
-        let error_404_page = config.site.error_404.as_deref().and_then(|p| {
-            handler::load_custom_error_page(
-                canonical_root.as_ref(),
-                &site_dir.join(p),
-                "error_404",
-                hyper::StatusCode::NOT_FOUND,
-            )
-        });
-        let error_503_page = config.site.error_503.as_deref().and_then(|p| {
-            handler::load_custom_error_page(
-                canonical_root.as_ref(),
-                &site_dir.join(p),
-                "error_503",
-                hyper::StatusCode::SERVICE_UNAVAILABLE,
-            )
-        });
-        Some(Self {
-            canonical_root: Arc::clone(&canonical_root),
+        Self {
+            site_watch,
             data_dir: Arc::from(data_dir),
             log_dir: Arc::from(log_dir.as_path()),
-            favicon: Arc::new(handler::FaviconConfig {
-                path: site_dir.join(&config.site.favicon),
-                site_root: Arc::clone(&canonical_root),
-                enable_png: config.site.enable_png_favicon,
-            }),
             index_file: Arc::from(config.site.index_file.as_str()),
             csp_header: Arc::from(config.server.csp_level.as_header_value()),
             state,
@@ -139,8 +105,6 @@ impl ServerContext {
             dir_list: config.site.enable_directory_listing,
             expose_dots: config.site.expose_dotfiles,
             spa_routing: config.site.spa_routing,
-            error_404_page,
-            error_503_page,
             redirects: Arc::new(config.redirects.clone()),
             semaphore,
             per_ip_map,
@@ -149,7 +113,7 @@ impl ServerContext {
             // When empty, X-Forwarded-For is ignored on every connection.
             trusted_proxies: Arc::new(config.server.trusted_proxies.clone().unwrap_or_default()),
             ingress: options.ingress,
-        })
+        }
     }
     /// Attempt to spawn a handler task for one accepted connection.
     ///
@@ -180,13 +144,11 @@ impl ServerContext {
                     return true;
                 }
             };
-        let site = Arc::clone(&self.canonical_root);
         let idx = Arc::clone(&self.index_file);
         let met = Arc::clone(metrics);
         let handler_config = handler::HandlerConfig {
             peer_addr: peer,
-            canonical_root: site,
-            favicon: Arc::clone(&self.favicon),
+            site_watch: self.site_watch.clone(),
             index_file: idx,
             flags: handler::FeatureFlags {
                 dir_listing: self.dir_list,
@@ -201,8 +163,6 @@ impl ServerContext {
                 log_dir: Arc::clone(&self.log_dir),
             },
             csp: Arc::clone(&self.csp_header),
-            error_404_page: self.error_404_page.clone(),
-            error_503_page: self.error_503_page.clone(),
             redirects: Arc::clone(&self.redirects),
             trusted_proxies: Arc::clone(&self.trusted_proxies),
             ingress: self.ingress,
@@ -243,7 +203,7 @@ pub async fn run(
     data_dir: PathBuf,
     mut shutdown: watch::Receiver<bool>,
     port_tx: oneshot::Sender<std::result::Result<u16, String>>,
-    mut root_watch: watch::Receiver<Arc<Path>>,
+    root_watch: watch::Receiver<Arc<SiteSnapshot>>,
     shared_semaphore: Arc<Semaphore>,
     shared_per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
 ) {
@@ -266,7 +226,7 @@ pub async fn run(
     if bound_port != base_port {
         log::warn!("Configured port {base_port} was in use; bound to {bound_port} instead.");
     }
-    let Some(mut ctx) = ServerContext::with_shared(
+    let ctx = ServerContext::with_shared(
         &config,
         Arc::clone(&state),
         &data_dir,
@@ -277,9 +237,8 @@ pub async fn run(
             keep_alive: true,
             ingress: handler::RequestIngress::Http,
         },
-    ) else {
-        return;
-    };
+        root_watch,
+    );
     {
         let mut s = state.write().await;
         s.actual_port = bound_port;
@@ -289,13 +248,11 @@ pub async fn run(
     log::info!("HTTP server listening on {bind_addr}:{bound_port}");
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
-    loop {
-        // Apply site-root updates pushed by the reload handler without blocking
-        // the accept loop.
-        if root_watch.has_changed().unwrap_or(false) {
-            let new_root = Arc::clone(&root_watch.borrow_and_update());
-            log::info!("Site root refreshed: {}", new_root.display());
-            ctx.canonical_root = new_root;
+    while !*shutdown.borrow() {
+        while let Some(result) = join_set.try_join_next() {
+            if let Err(e) = result {
+                log::debug!("Connection task ended: {e}");
+            }
         }
         tokio::select! {
             result = listener.accept() => {
@@ -330,17 +287,16 @@ pub async fn run(
                     log::debug!("HTTP connection task join error: {e}");
                 }
             }
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() { break; }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
             }
         }
     }
     state.write().await.server_running = false;
     log::info!("HTTP server stopped accepting; draining in-flight connections…");
-    let drain = async { while join_set.join_next().await.is_some() {} };
-    let _ = tokio::time::timeout(
+    drain_connections(
+        &mut join_set,
         Duration::from_secs(config.server.shutdown_grace_secs),
-        drain,
     )
     .await;
     log::info!("HTTP server drained.");
@@ -383,7 +339,7 @@ pub async fn run_https(
     port_tx: oneshot::Sender<std::result::Result<u16, String>>,
     shared_semaphore: Arc<Semaphore>,
     shared_per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
-    mut root_watch: watch::Receiver<Arc<Path>>,
+    root_watch: watch::Receiver<Arc<SiteSnapshot>>,
 ) {
     let bind_addr = config.server.bind;
     let port = config.tls.port.get();
@@ -418,7 +374,7 @@ pub async fn run_https(
             return;
         }
     };
-    let Some(mut ctx) = ServerContext::with_shared(
+    let ctx = ServerContext::with_shared(
         &config,
         Arc::clone(&state),
         &data_dir,
@@ -429,9 +385,8 @@ pub async fn run_https(
             keep_alive: true,
             ingress: handler::RequestIngress::Https,
         },
-    ) else {
-        return;
-    };
+        root_watch,
+    );
     {
         let mut s = state.write().await;
         s.tls_running = true;
@@ -441,13 +396,11 @@ pub async fn run_https(
     log::info!("HTTPS server listening on {bind_addr}:{port}");
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
-    loop {
-        // Mirror the [R] reload path from run(): non-blocking check for a new
-        // canonical_root so both listeners serve the same directory after reload.
-        if root_watch.has_changed().unwrap_or(false) {
-            let new_root = Arc::clone(&root_watch.borrow_and_update());
-            log::info!("HTTPS: site root refreshed: {}", new_root.display());
-            ctx.canonical_root = new_root;
+    while !*shutdown.borrow() {
+        while let Some(result) = join_set.try_join_next() {
+            if let Err(e) = result {
+                log::debug!("Connection task ended: {e}");
+            }
         }
         tokio::select! {
             result = listener.accept() => {
@@ -489,7 +442,7 @@ pub async fn run_https(
                                 continue;
                             }
                         };
-                        let site = Arc::clone(&ctx.canonical_root);
+                        let site_watch = ctx.site_watch.clone();
                         let idx = Arc::clone(&ctx.index_file);
                         let met = Arc::clone(&metrics);
                         let state = Arc::clone(&ctx.state);
@@ -498,7 +451,6 @@ pub async fn run_https(
                             log_dir: Arc::clone(&ctx.log_dir),
                         };
                         let csp = Arc::clone(&ctx.csp_header);
-                        let favicon = Arc::clone(&ctx.favicon);
                         let flags = handler::FeatureFlags {
                             dir_listing: ctx.dir_list,
                             expose_dotfiles: ctx.expose_dots,
@@ -506,83 +458,30 @@ pub async fn run_https(
                             is_https: true,
                             keep_alive: ctx.keep_alive,
                         };
-                        let e404 = ctx.error_404_page.clone();
-                        let e503 = ctx.error_503_page.clone();
                         let redirects = Arc::clone(&ctx.redirects);
                         let trusted_proxies = Arc::clone(&ctx.trusted_proxies);
                         let ingress = ctx.ingress;
                         join_set.spawn(async move {
-                            // Items must appear before any statements (clippy::items_after_statements).
-                            use tokio_util::compat::{
-                                FuturesAsyncReadCompatExt as _, TokioAsyncReadCompatExt as _,
-                            };
-                            trait TlsStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
-                            impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TlsStream for T {}
-
                             let _admission = admission;
-                            // Perform the TLS handshake. The two acceptor variants
-                            // produce different concrete stream types, so we erase them
-                            // behind a boxed trait object for the generic handler.
-                            //
-                            // Rust does not allow `dyn TraitA + TraitB` when both traits
-                            // are non-auto traits, so we define a combined supertrait that
-                            // the compiler can use as a single vtable target.
-                            //
-                            // The ACME acceptor uses futures-io traits (not tokio traits).
-                            // We bridge in both directions with tokio-util's compat layer:
-                            // • TcpStream tokio→futures via TokioAsyncReadCompatExt
-                            // • TLS stream futures→tokio via FuturesAsyncReadCompatExt
-                            let tls_stream: Box<dyn TlsStream> = match acceptor {
-                                Acceptor::Static(a) => {
-                                    match a.accept(tcp_stream).await {
-                                        Ok(s) => Box::new(s),
-                                        Err(e) => {
-                                            log::debug!("TLS handshake failed from {peer}: {e}");
-                                            return;
-                                        }
-                                    }
-                                }
-                                Acceptor::Acme(a, server_cfg) => {
-                                    // AcmeAcceptor::accept needs futures-io AsyncRead/AsyncWrite,
-                                    // so adapt the tokio TcpStream before passing it in.
-                                    let compat_stream = tcp_stream.compat();
-                                    match a.accept(compat_stream).await {
-                                        Ok(Some(handshake)) => {
-                                            match handshake.into_stream(server_cfg).await {
-                                                // compat() flips the resulting futures-io
-                                                // TLS stream back to tokio traits.
-                                                Ok(s) => Box::new(s.compat()),
-                                                Err(e) => {
-                                                    log::debug!("ACME TLS handshake failed from {peer}: {e}");
-                                                    return;
-                                                }
-                                            }
-                                        }
-                                        // None means rustls-acme consumed this connection
-                                        // internally to complete a TLS-ALPN-01 challenge.
-                                        // No application data to serve — return cleanly.
-                                        Ok(None) => {
-                                            log::debug!("ACME challenge connection handled for {peer}");
-                                            return;
-                                        }
-                                        Err(e) => {
-                                            log::debug!("ACME accept error from {peer}: {e}");
-                                            return;
-                                        }
-                                    }
+                            let tls_stream = match tokio::time::timeout(
+                                TLS_HANDSHAKE_TIMEOUT,
+                                accept_tls_stream(tcp_stream, acceptor, peer),
+                            ).await {
+                                Ok(Some(stream)) => stream,
+                                Ok(None) => return,
+                                Err(_) => {
+                                    log::debug!("TLS handshake timed out from {peer}");
+                                    return;
                                 }
                             };
                             let handler_config = handler::HandlerConfig {
                                 peer_addr: peer,
-                                canonical_root: site,
-                                favicon,
+                                site_watch,
                                 index_file: idx,
                                 flags,
                                 state,
                                 readiness,
                                 csp,
-                                error_404_page: e404,
-                                error_503_page: e503,
                                 redirects,
                                 trusted_proxies,
                                 ingress,
@@ -610,20 +509,72 @@ pub async fn run_https(
                     log::debug!("HTTPS connection task join error: {e}");
                 }
             }
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() { break; }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
             }
         }
     }
     state.write().await.tls_running = false;
     log::info!("HTTPS server stopped accepting; draining in-flight connections…");
-    let drain = async { while join_set.join_next().await.is_some() {} };
-    let _ = tokio::time::timeout(
+    drain_connections(
+        &mut join_set,
         Duration::from_secs(config.server.shutdown_grace_secs),
-        drain,
     )
     .await;
     log::info!("HTTPS server drained.");
+}
+
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+trait TlsStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TlsStream for T {}
+
+/// Both ACME negotiation and the subsequent TLS handshake share one deadline.
+async fn accept_tls_stream(
+    tcp_stream: tokio::net::TcpStream,
+    acceptor: Acceptor,
+    peer: std::net::SocketAddr,
+) -> Option<Box<dyn TlsStream>> {
+    use tokio_util::compat::{FuturesAsyncReadCompatExt as _, TokioAsyncReadCompatExt as _};
+    let stream: Box<dyn TlsStream> = match acceptor {
+        Acceptor::Static(a) => match a.accept(tcp_stream).await {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                log::debug!("TLS handshake failed from {peer}: {e}");
+                return None;
+            }
+        },
+        Acceptor::Acme(a, server_cfg) => {
+            // AcmeAcceptor::accept needs futures-io AsyncRead/AsyncWrite,
+            // so adapt the tokio TcpStream before passing it in.
+            let compat_stream = tcp_stream.compat();
+            match a.accept(compat_stream).await {
+                Ok(Some(handshake)) => {
+                    match handshake.into_stream(server_cfg).await {
+                        // compat() flips the resulting futures-io
+                        // TLS stream back to tokio traits.
+                        Ok(s) => Box::new(s.compat()),
+                        Err(e) => {
+                            log::debug!("ACME TLS handshake failed from {peer}: {e}");
+                            return None;
+                        }
+                    }
+                }
+                // None means rustls-acme consumed this connection
+                // internally to complete a TLS-ALPN-01 challenge.
+                // No application data to serve — return cleanly.
+                Ok(None) => {
+                    log::debug!("ACME challenge connection handled for {peer}");
+                    return None;
+                }
+                Err(e) => {
+                    log::debug!("ACME accept error from {peer}: {e}");
+                    return None;
+                }
+            }
+        }
+    };
+    Some(stream)
 }
 
 /// Start a loopback-only HTTP listener used exclusively by the Tor proxy.
@@ -645,7 +596,7 @@ pub async fn run_tor_ingress(
     mut shutdown: watch::Receiver<bool>,
     port_tx: oneshot::Sender<std::result::Result<u16, String>>,
     shared_semaphore: Arc<Semaphore>,
-    root_watch: watch::Receiver<Arc<Path>>,
+    root_watch: watch::Receiver<Arc<SiteSnapshot>>,
 ) {
     let bind_addr = tor_loopback_addr(config.server.bind);
     let bind_socket = std::net::SocketAddr::new(bind_addr, 0);
@@ -674,7 +625,7 @@ pub async fn run_tor_ingress(
             return;
         }
     };
-    let Some(mut ctx) = ServerContext::with_shared(
+    let ctx = ServerContext::with_shared(
         &config,
         state,
         &data_dir,
@@ -685,19 +636,17 @@ pub async fn run_tor_ingress(
             keep_alive: false,
             ingress: handler::RequestIngress::Tor,
         },
-    ) else {
-        return;
-    };
+        root_watch,
+    );
     let _ = port_tx.send(Ok(bound_port));
     log::info!("Tor ingress server listening on {bind_addr}:{bound_port}");
     let mut join_set: JoinSet<()> = JoinSet::new();
-    let mut root_watch = root_watch;
     let mut backoff_ms: u64 = 1;
-    loop {
-        if root_watch.has_changed().unwrap_or(false) {
-            let new_root = Arc::clone(&root_watch.borrow_and_update());
-            log::info!("Tor ingress: site root refreshed: {}", new_root.display());
-            ctx.canonical_root = new_root;
+    while !*shutdown.borrow() {
+        while let Some(result) = join_set.try_join_next() {
+            if let Err(e) = result {
+                log::debug!("Connection task ended: {e}");
+            }
         }
         tokio::select! {
             result = listener.accept() => {
@@ -731,16 +680,15 @@ pub async fn run_tor_ingress(
                     log::debug!("Tor ingress connection task join error: {e}");
                 }
             }
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() { break; }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
             }
         }
     }
     log::info!("Tor ingress server stopped accepting; draining in-flight connections…");
-    let drain = async { while join_set.join_next().await.is_some() {} };
-    let _ = tokio::time::timeout(
+    drain_connections(
+        &mut join_set,
         Duration::from_secs(config.server.shutdown_grace_secs),
-        drain,
     )
     .await;
     log::info!("Tor ingress server drained.");
@@ -835,6 +783,13 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
         false
     }
 }
+/// Return only after the grace period and cancellation have released all guards.
+async fn drain_connections(tasks: &mut JoinSet<()>, grace: Duration) {
+    let _ = tokio::time::timeout(grace, async { while tasks.join_next().await.is_some() {} }).await;
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
 // ─── Site scanner ─────────────────────────────────────────────────────────────
 /// Maximum directory depth `scan_site` will traverse.
 ///
@@ -844,12 +799,12 @@ fn is_fd_exhaustion(e: &std::io::Error) -> bool {
 const MAX_SCAN_DEPTH: usize = 64;
 /// Recursively count files and total bytes in `site_root` (BFS traversal).
 ///
-/// Unreadable directories are skipped with a warning so one bad subtree does
-/// not prevent the rest of the site from being counted.
+/// Symlinks are excluded. Failed reads or traversal limits fail the scan so a
+/// reload cannot publish statistics from an incomplete tree.
 ///
 /// # Errors
 ///
-/// Returns [`AppError::Io`] only if the initial traversal setup itself fails.
+/// Returns [`AppError::Io`] for filesystem failures or traversal limits.
 ///
 /// # Panics
 ///
@@ -866,37 +821,24 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
     // map or recursive call stack.
     let mut queue: std::collections::VecDeque<(PathBuf, usize)> = std::collections::VecDeque::new();
     queue.push_back((site_root.to_path_buf(), 0));
-    // Track visited inodes to detect and break symlink cycles.
-    // Without cycle detection a directory symlink loop (e.g. site/loop -> site/)
-    // grows the BFS queue unboundedly and the function never returns, permanently
-    // consuming a spawn_blocking thread.
+    // Symlinks are excluded; device/inode pairs also avoid recounting aliases
+    // such as bind mounts, without confusing inodes on different filesystems.
     #[cfg(unix)]
-    let mut visited_inodes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut visited_inodes: std::collections::HashSet<(u64, u64)> =
+        std::collections::HashSet::new();
+    let mut scanned_entries = 0usize;
     while let Some((dir, depth)) = queue.pop_front() {
-        // Depth-bound check — emit a warning and skip rather than abort or panic.
         if depth >= MAX_SCAN_DEPTH {
-            log::warn!(
-                "scan_site: depth limit ({MAX_SCAN_DEPTH}) reached at {}; subdirectories below this point will not be counted",
-                dir.display()
-            );
-            continue;
+            return Err(std::io::Error::other("site scan exceeds depth limit").into());
         }
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) => {
-                // Skip unreadable directories with a per-directory warning.
-                // Do NOT abort the entire scan — the rest of the tree may be readable.
-                log::warn!("Skipping unreadable directory {}: {e}", dir.display());
-                continue;
+        let entries = std::fs::read_dir(&dir)?;
+        for entry in entries {
+            scanned_entries += 1;
+            if scanned_entries > 1_000_000 {
+                return Err(std::io::Error::other("site scan exceeds one million entries").into());
             }
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            // Inspect the link itself first so directory symlinks cannot walk
-            // outside the site root during a background metrics scan.
-            let Ok(link_meta) = std::fs::symlink_metadata(&path) else {
-                continue;
-            };
+            let path = entry?.path();
+            let link_meta = std::fs::symlink_metadata(&path)?;
             if link_meta.file_type().is_symlink() {
                 log::warn!("Skipping symlink during site scan: {}", path.display());
                 continue;
@@ -909,7 +851,7 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
                 {
                     use std::os::unix::fs::MetadataExt as _;
                     let ino = link_meta.ino();
-                    if !visited_inodes.insert(ino) {
+                    if !visited_inodes.insert((link_meta.dev(), ino)) {
                         log::warn!(
                             "Directory cycle detected at {} (inode {ino}), skipping",
                             path.display()
@@ -917,9 +859,35 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
                         continue;
                     }
                 }
+                if queue.len() >= 4096 {
+                    return Err(
+                        std::io::Error::other("site scan exceeds pending directory limit").into(),
+                    );
+                }
                 queue.push_back((path, depth.saturating_add(1)));
             }
         }
     }
     Ok((count, bytes))
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn expired_drain_joins_cancelled_tasks_and_releases_admission() -> Result<()> {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&semaphore)
+            .try_acquire_owned()
+            .map_err(std::io::Error::other)?;
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+        drain_connections(&mut tasks, Duration::from_secs(10)).await;
+        assert!(tasks.is_empty());
+        assert_eq!(semaphore.available_permits(), 1);
+        Ok(())
+    }
 }

@@ -286,6 +286,9 @@ impl LogFile {
     /// boundary to correct for any external writes (e.g. logrotate copy-then-
     /// truncate).
     fn write_line(&mut self, line: &str) {
+        let line_bytes = u64::try_from(line.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
         self.writes_since_check = self.writes_since_check.wrapping_add(1);
 
         if self.writes_since_check >= ROTATION_CHECK_INTERVAL {
@@ -294,9 +297,13 @@ impl LogFile {
             if let Ok(meta) = self.file.metadata() {
                 self.cached_size = meta.len();
             }
-            if self.cached_size >= MAX_LOG_BYTES {
+            if self.cached_size.saturating_add(line_bytes) > MAX_LOG_BYTES {
                 self.rotate();
             }
+        }
+
+        if self.cached_size.saturating_add(line_bytes) > MAX_LOG_BYTES {
+            return;
         }
 
         if writeln!(self.file, "{line}").is_ok() {
@@ -317,6 +324,8 @@ impl LogFile {
     /// `.log.1` → `.log.2`, current `.log` → `.log.1`, then a fresh file
     /// is opened. Rotation stays best-effort, but unexpected failures are
     /// logged for diagnosis.
+    // This runs while the application logger holds its file mutex. Diagnostics
+    // must bypass log! to avoid recursively acquiring that same mutex.
     fn rotate(&mut self) {
         const MAX_LOG_BACKUPS: u32 = 5;
 
@@ -324,7 +333,11 @@ impl LogFile {
         let oldest = self.path.with_extension(format!("log.{MAX_LOG_BACKUPS}"));
         if let Err(e) = std::fs::remove_file(&oldest) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("Could not remove old log backup {}: {e}", oldest.display());
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Could not remove old log backup {}: {e}",
+                    oldest.display()
+                );
             }
         }
 
@@ -336,7 +349,8 @@ impl LogFile {
                 .with_extension(format!("log.{}", n.saturating_add(1)));
             if from.exists() {
                 if let Err(e) = std::fs::rename(&from, &to) {
-                    log::warn!(
+                    let _ = writeln!(
+                        std::io::stderr(),
                         "Could not rotate log backup {} -> {}: {e}",
                         from.display(),
                         to.display()
@@ -348,7 +362,8 @@ impl LogFile {
         // Move the current log to .log.1.
         let backup = self.path.with_extension("log.1");
         if let Err(e) = std::fs::rename(&self.path, &backup) {
-            log::warn!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "Could not rotate active log {} -> {}: {e}",
                 self.path.display(),
                 backup.display()
@@ -377,7 +392,11 @@ impl LogFile {
                 self.cached_size = 0;
             }
             Err(e) => {
-                log::warn!("Could not reopen rotated log {}: {e}", self.path.display());
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Could not reopen rotated log {}: {e}",
+                    self.path.display()
+                );
             }
         }
     }
@@ -570,26 +589,26 @@ pub fn init(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
                 //   (OI) = object inherit, (CI) = container inherit, F = full control.
                 let grant_arg = format!("{userdomain}\\{username}:(OI)(CI)F");
                 let path_str = parent.to_string_lossy();
-                let icacls_output = std::process::Command::new("icacls")
-                    .args([
+                let status = crate::process::run_bounded(
+                    std::process::Command::new("icacls").args([
                         path_str.as_ref(),
                         "/inheritance:r",
                         "/grant:r",
                         grant_arg.as_str(),
-                    ])
-                    .output()
-                    .map_err(|e| {
-                        AppError::LogInit(format!(
-                            "could not run icacls for {}: {e}",
-                            parent.display()
-                        ))
-                    })?;
-                if !icacls_output.status.success() {
+                    ]),
+                    std::time::Duration::from_secs(5),
+                )
+                .map_err(|e| {
+                    AppError::LogInit(format!(
+                        "could not run icacls for {}: {e}",
+                        parent.display()
+                    ))
+                })?;
+                if !status.success() {
                     return Err(AppError::LogInit(format!(
-                        "icacls failed for {} (exit {:?}): {}",
+                        "icacls failed for {} (exit {:?})",
                         parent.display(),
-                        icacls_output.status.code(),
-                        String::from_utf8_lossy(&icacls_output.stderr).trim()
+                        status.code()
                     )));
                 }
             }
@@ -678,6 +697,75 @@ mod tests {
         config::Config,
         logging::{init_access_log, log_access, shutdown_access_log, AccessRecord},
     };
+
+    #[test]
+    fn failed_rotation_does_not_grow_active_log() -> std::io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("test.log");
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&path)?;
+        file.set_len(super::MAX_LOG_BYTES)?;
+        for n in 1..=5 {
+            let backup = path.with_extension(format!("log.{n}"));
+            std::fs::create_dir(&backup)?;
+            std::fs::write(backup.join("block"), b"x")?;
+        }
+        let mut log = super::LogFile {
+            file,
+            path: path.clone(),
+            writes_since_check: 0,
+            cached_size: super::MAX_LOG_BYTES,
+        };
+        for _ in 0..super::ROTATION_CHECK_INTERVAL * 2 {
+            log.write_line("must not grow");
+        }
+        assert_eq!(std::fs::metadata(path)?.len(), super::MAX_LOG_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_failure_does_not_deadlock_logger() -> Result<(), Box<dyn std::error::Error>> {
+        const CHILD_ENV: &str = "RUSTHOST_ROTATION_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let tmp = tempfile::tempdir()?;
+            let config = Config::default().logging;
+            let path = tmp.path().join(&config.file);
+            std::fs::create_dir_all(path.parent().ok_or("log parent")?)?;
+            std::fs::File::create(&path)?.set_len(super::MAX_LOG_BYTES)?;
+            // A directory at the backup path forces rotation to fail on every OS.
+            std::fs::create_dir(path.with_extension("log.5"))?;
+            super::init(&config, tmp.path())?;
+            for _ in 0..super::ROTATION_CHECK_INTERVAL {
+                log::warn!("rotation regression test");
+            }
+            return Ok(());
+        }
+
+        // Isolate the process-global logger and bound a potential deadlock.
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "logging::tests::rotation_failure_does_not_deadlock_logger",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                assert!(status.success(), "rotation test child failed: {status}");
+                return Ok(());
+            }
+            if started.elapsed() > std::time::Duration::from_secs(5) {
+                child.kill()?;
+                child.wait()?;
+                return Err("logger deadlocked during failed rotation".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     fn validate_windows_name(s: &str) -> std::io::Result<()> {
         crate::windows_identity::validate_windows_identity_name_component(s, &['&'])

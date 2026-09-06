@@ -195,6 +195,14 @@ index_file = "index.html"
 - HTTPS is optional. When enabled, it supports self-signed localhost certs, manual PEM files, and ACME-managed certificates.
 - `redirect_http = true` requires TLS to be enabled. When active, the HTTP listener redirects rather than serves files.
 
+### Persistence, reloads, and resource limits
+
+Development TLS stores its certificate and private key together in `runtime/tls/dev/self-signed.pem`. Renewal retains `self-signed.previous.pem`; valid older `.crt`/`.key` pairs are imported without changing identity. These bundles contain private keys. Malformed state without a valid backup requires operator repair; RustHost does not silently replace a persisted identity. Application-owned settings, bundles, ACME cache entries, and Doctor reports use atomic publication. Unix writes sync file contents and directory metadata; Windows rename durability still needs platform testing.
+
+`R` and SIGHUP rescan the site, including its favicon path and configured error pages. Settings, listeners, TLS, and Tor configuration still require a restart. Each request selects one complete site generation, including requests on existing keep-alive connections. Failed preparation retains the previous generation. Keep old deployment directories available until in-flight requests finish; editing files in place is not a filesystem snapshot. Scans fail on unreadable entries or limits of 64 directory levels, one million entries, or 4,096 queued directories.
+
+Visitor counting retains at most 65,536 hashes for the process lifetime; `65536+` is a lower bound. No visitor identifiers are persisted. Transfers track progress in both directions: clearnet HTTP/HTTPS retain a five-second inactivity limit, while Tor relay and ingress allow 60 seconds. Headers have a separate five-second deadline, TLS handshakes ten seconds, and HTTP drivers/Tor relays have a 24-hour maximum lifetime even with trickle traffic. A blocked write, flush, or shutdown has a 60-second deadline; shorter connection inactivity limits may expire first. Logs stop accepting file writes at 100 MiB if rotation fails, continuing periodic rotation attempts. See the [second-pass robustness audit](docs/robustness-audit-2026-09-06.md) for validation and remaining upstream/platform limitations.
+
 ### Tor
 
 RustHost uses [Arti](https://gitlab.torproject.org/tpo/core/arti) in-process — no external `tor` binary needed. Tor state and cache are stored under `runtime/`. The same site can be accessible over HTTP/HTTPS and `.onion` simultaneously.

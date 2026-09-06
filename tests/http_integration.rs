@@ -56,7 +56,7 @@ struct TestServer {
     /// Dropping this would put the receiver into a "sender gone" state, which
     /// causes any `root_rx.changed().await` inside `server::run` to return an
     /// error immediately.
-    _root_tx: watch::Sender<Arc<Path>>,
+    root_tx: watch::Sender<Arc<rusthost::server::SiteSnapshot>>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -92,12 +92,11 @@ impl TestServer {
         let data_dir = site_root.parent().unwrap_or(site_root).to_path_buf();
 
         // Build the canonical site root path and seed the root watch channel.
-        // _root_tx is stored in TestServer so the channel stays open for the
+        // root_tx is stored in TestServer so the channel stays open for the
         // entire lifetime of the server task.  If it were dropped here the
         // receiver would enter a "sender gone" state and any
         // `root_rx.changed().await` inside server::run would return an error.
-        let joined: std::path::PathBuf = data_dir.join(&config.site.directory);
-        let site_root_arc: Arc<Path> = Arc::from(joined.as_path());
+        let site_root_arc = rusthost::server::SiteSnapshot::prepare(&config, &data_dir)?;
         let (root_tx, root_rx) = watch::channel(site_root_arc);
 
         // Connection-count limiter: capacity matches config.server.max_connections
@@ -145,7 +144,7 @@ impl TestServer {
             addr,
             state,
             shutdown_tx,
-            _root_tx: root_tx,
+            root_tx,
             handle: Some(handle),
         })
     }
@@ -291,7 +290,7 @@ struct HttpsTestServer {
     addr: SocketAddr,
     cert_path: std::path::PathBuf,
     shutdown_tx: watch::Sender<bool>,
-    _root_tx: watch::Sender<Arc<Path>>,
+    _root_tx: watch::Sender<Arc<rusthost::server::SiteSnapshot>>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -322,8 +321,7 @@ impl HttpsTestServer {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let data_dir = site_root.parent().unwrap_or(site_root).to_path_buf();
-        let joined = data_dir.join(&config.site.directory);
-        let site_root_arc: Arc<Path> = Arc::from(joined.as_path());
+        let site_root_arc = rusthost::server::SiteSnapshot::prepare(&config, &data_dir)?;
         let (root_tx, root_rx) = watch::channel(site_root_arc);
 
         let conn_semaphore: Arc<Semaphore> =
@@ -341,7 +339,7 @@ impl HttpsTestServer {
 
         let config = Arc::new(config);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let cert_path = data_dir.join("runtime/tls/dev/self-signed.crt");
+        let cert_path = data_dir.join("runtime/tls/dev/self-signed.pem");
         let (tls_port_tx, _tls_port_rx) = tokio::sync::oneshot::channel::<Result<u16, String>>();
         let handle = tokio::spawn(async move {
             rusthost::server::run_https(
@@ -1647,7 +1645,7 @@ async fn occupied_http_port_reports_actionable_bind_error() -> Result<(), Box<dy
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (port_tx, port_rx) = tokio::sync::oneshot::channel::<Result<u16, String>>();
     let data_dir = site.parent().unwrap_or(&site).to_path_buf();
-    let site_root_arc: Arc<Path> = Arc::from(data_dir.join(&config.site.directory).as_path());
+    let site_root_arc = rusthost::server::SiteSnapshot::prepare(&config, &data_dir)?;
     let (root_tx, root_rx) = watch::channel(site_root_arc);
     let conn_semaphore: Arc<Semaphore> =
         Arc::new(Semaphore::new(config.server.max_connections as usize));
@@ -1855,5 +1853,218 @@ async fn redirect_server_ignores_x_forwarded_host_spoofing(
         header_value(&response, "location")?.as_deref(),
         Some("https://localhost:8443/")
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn idle_tls_handshake_is_closed() -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let server = HttpsTestServer::start(&site).await?;
+    let mut idle = TcpStream::connect(server.addr).await?;
+    let mut byte = [0];
+    let result = tokio::time::timeout(Duration::from_secs(12), idle.read(&mut byte)).await;
+    server.stop().await;
+    assert!(
+        matches!(result, Ok(Ok(0))),
+        "idle TLS connection was not closed: {result:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn forbidden_gzip_sidecar_is_not_selected_for_brotli(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp, site) = make_site(&[("app.js", b"short"), ("app.js.gz", b"gzip-sidecar")])?;
+    let server = TestServer::start_with_config(&site, |_| {}).await?;
+    let response = server
+        .send(b"GET /app.js HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: br, gzip;q=0\r\n\r\n")
+        .await?;
+    server.stop().await;
+    assert_eq!(status_code(&response)?, 200);
+    assert_eq!(header_value(&response, "content-encoding")?, None);
+    assert_eq!(
+        header_value(&response, "vary")?.as_deref(),
+        Some("Accept-Encoding")
+    );
+    assert!(response.ends_with(b"short"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn directory_redirect_encodes_path_and_preserves_query(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp, site) = make_site(&[("index.html", b"ok")])?;
+    std::fs::create_dir(site.join("a #?%"))?;
+    std::fs::create_dir(site.join("example.com"))?;
+    let server = TestServer::start_with_config(&site, |_| {}).await?;
+    for (path, expected) in [
+        ("/a%20%23%3F%25?q=1", "/a%20%23%3F%25/?q=1"),
+        ("/%2Fexample.com", "/example.com/"),
+    ] {
+        let response = server
+            .send(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await?;
+        assert_eq!(status_code(&response)?, 301);
+        assert_eq!(
+            header_value(&response, "location")?.as_deref(),
+            Some(expected)
+        );
+    }
+    server.stop().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn conditional_range_returns_full_file_and_oversized_end_is_clamped(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp, site) = make_site(&[("index.html", b"0123456789")])?;
+    let server = TestServer::start_with_config(&site, |_| {}).await?;
+    let conditional = server.send(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\nRange: bytes=5-9\r\nIf-Range: \"old-version\"\r\n\r\n").await?;
+    let clamped = server
+        .send(b"GET /index.html HTTP/1.1\r\nHost: localhost\r\nRange: bytes=5-999\r\n\r\n")
+        .await?;
+    server.stop().await;
+    assert_eq!(status_code(&conditional)?, 200);
+    assert!(conditional.ends_with(b"0123456789"));
+    assert_eq!(status_code(&clamped)?, 206);
+    assert_eq!(
+        header_value(&clamped, "content-range")?.as_deref(),
+        Some("bytes 5-9/10")
+    );
+    assert!(clamped.ends_with(b"56789"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropped_shutdown_sender_stops_listener() -> Result<(), Box<dyn std::error::Error>> {
+    let (_tmp, site) = make_site(&[("index.html", b"ok")])?;
+    let mut server = TestServer::start_with_config(&site, |_| {}).await?;
+    let (replacement, _rx) = watch::channel(false);
+    drop(std::mem::replace(&mut server.shutdown_tx, replacement));
+    let mut handle = server.handle.take().ok_or("server handle")?;
+    if tokio::time::timeout(Duration::from_secs(2), &mut handle)
+        .await
+        .is_err()
+    {
+        handle.abort();
+        let _ = handle.await;
+        return Err("listener did not exit after shutdown sender was dropped".into());
+    }
+    assert!(!server.state.read().await.server_running);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reload_switches_keep_alive_root_favicon_and_error_page_together(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir()?;
+    for name in ["old", "new"] {
+        let root = tmp.path().join(name);
+        std::fs::create_dir(&root)?;
+        std::fs::write(root.join("index.html"), format!("index-{name}"))?;
+        std::fs::write(root.join("favicon.ico"), format!("icon-{name}"))?;
+        std::fs::write(root.join("404.html"), format!("missing-{name}"))?;
+    }
+    let site = tmp.path().join("site");
+    symlink("old", &site)?;
+    let server = TestServer::start_with_config(&site, |config| {
+        config.site.error_404 = Some("404.html".into());
+    })
+    .await?;
+    let mut config = build_test_config(&site, IpAddr::V4(Ipv4Addr::LOCALHOST), server.addr.port())?;
+    config.site.error_404 = Some("404.html".into());
+    let mut connection = TcpStream::connect(server.addr).await?;
+    connection
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    assert!(response_to_str(&read_one_response(&mut connection).await?)?.ends_with("index-old"));
+    symlink("new", tmp.path().join("next"))?;
+    std::fs::rename(tmp.path().join("next"), &site)?;
+    // Until publication, the favicon also stays pinned to the old physical root.
+    assert!(response_to_str(
+        &server
+            .send(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await?
+    )?
+    .ends_with("icon-old"));
+    rusthost::runtime::events::reload_site(
+        &config,
+        Arc::clone(&server.state),
+        tmp.path().to_owned(),
+        &server.root_tx,
+    )
+    .await?;
+    for (path, expected) in [
+        ("/", "index-new"),
+        ("/favicon.ico", "icon-new"),
+        ("/absent", "missing-new"),
+    ] {
+        connection
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await?;
+        assert!(response_to_str(&read_one_response(&mut connection).await?)?.ends_with(expected));
+    }
+    // A malformed next generation cannot replace the working snapshot.
+    std::fs::remove_file(tmp.path().join("new/404.html"))?;
+    rusthost::runtime::events::reload_site(
+        &config,
+        Arc::clone(&server.state),
+        tmp.path().to_owned(),
+        &server.root_tx,
+    )
+    .await?;
+    assert!(server
+        .state
+        .read()
+        .await
+        .visible_status_message()
+        .is_some_and(|s| s.contains("Reload failed")));
+    connection
+        .write_all(b"GET /absent HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    assert!(response_to_str(&read_one_response(&mut connection).await?)?.ends_with("missing-new"));
+    drop(connection);
+    server.stop().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn large_favicon_streams_past_read_idle_window() -> Result<(), Box<dyn std::error::Error>> {
+    const BODY_BYTES: usize = 16 * 1024 * 1024;
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("site");
+    std::fs::create_dir(&root)?;
+    std::fs::File::create(root.join("favicon.ico"))?.set_len(BODY_BYTES as u64)?;
+    let server = TestServer::start_with_config(&root, |_| {}).await?;
+    let mut stream = TcpStream::connect(server.addr).await?;
+    stream
+        .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await?;
+    // Read exactly the header so no body bytes are lost while pacing the reader.
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        header.push(stream.read_u8().await?);
+        assert!(header.len() < 16 * 1024);
+    }
+    assert_eq!(status_code(&header)?, 200);
+    let mut received = 0usize;
+    let mut buffer = vec![0; 128 * 1024];
+    let transfer = async {
+        loop {
+            let count = stream.read(&mut buffer).await?;
+            if count == 0 {
+                break;
+            }
+            received += count;
+            assert!(received <= BODY_BYTES);
+            tokio::time::sleep(Duration::from_millis(75)).await;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    tokio::time::timeout(Duration::from_secs(30), transfer).await??;
+    assert_eq!(received, BODY_BYTES);
+    server.stop().await;
     Ok(())
 }

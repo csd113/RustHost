@@ -42,7 +42,6 @@ multiple_crate_versions = "allow"
 
 rustls-pemfile = "2"         # PEM parsing — used in mod.rs
 x509-cert      = "0.3"      # cert expiry parsing — used in self_signed.rs
-pem-rfc7468    = { version = "1.0", features = ["alloc"] }  # PEM decode for the expiry check
 time           = "0.3"      # OffsetDateTime for rcgen cert params
 
 # TLS / HTTPS support.
@@ -131,6 +130,7 @@ async-compression = { version = "0.4", features = ["tokio", "brotli", "gzip"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.dev.package."*"]
 opt-level = 1  # dependency builds: faster compile, smaller debug symbols

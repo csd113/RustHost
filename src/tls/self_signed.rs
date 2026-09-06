@@ -20,8 +20,11 @@ const CERT_SANS: &[&str] = &["localhost", "127.0.0.1", "::1"];
 /// Return a [`TlsAcceptor`] backed by a self-signed `localhost` certificate.
 ///
 /// If a valid, non-expiring cert already exists in `<data_dir>/runtime/tls/dev/` it
-/// is reused; otherwise a fresh one is generated with `rcgen` and written to
-/// disk (mode `0600` on Unix).
+/// is reused. A single `self-signed.pem` bundle holds both certificate and key;
+/// renewal retains a validated `self-signed.previous.pem` for recovery. Valid
+/// legacy `.crt`/`.key` pairs are imported without altering the original files.
+/// Files use mode `0600` on Unix. Malformed state without a usable backup fails
+/// explicitly rather than silently changing the development identity.
 ///
 /// **This is intended for local development only.** Never use a self-signed
 /// cert in production — configure `[tls.acme]` or `[tls.manual_cert]`
@@ -47,62 +50,87 @@ pub async fn generate_or_load(data_dir: &Path) -> Result<Arc<TlsAcceptor>> {
         .map_err(|e| AppError::Tls(format!("TLS setup task panicked: {e}")))?
 }
 
-fn generate_or_load_blocking(data_dir: &Path) -> Result<Arc<TlsAcceptor>> {
-    let dir = data_dir.join("runtime/tls/dev");
-    let cert_path = dir.join("self-signed.crt");
-    let key_path = dir.join("self-signed.key");
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        AppError::Tls(format!(
-            "failed to create TLS dev directory {}: {e}",
-            dir.display()
-        ))
-    })?;
+const BUNDLE_NAME: &str = "self-signed.pem";
+const BACKUP_NAME: &str = "self-signed.previous.pem";
+const MAX_PEM_BYTES: u64 = 1024 * 1024;
 
-    if needs_regeneration(&cert_path) {
-        log::info!("TLS: generating self-signed certificate for {CERT_SANS:?}");
-        write_self_signed_cert(&cert_path, &key_path)?;
-    } else {
-        log::debug!(
-            "TLS: reusing existing self-signed certificate at {}",
-            cert_path.display()
-        );
+fn generate_or_load_blocking(data_dir: &Path) -> Result<Arc<TlsAcceptor>> {
+    let path = data_dir.join("runtime/tls/dev");
+    let mut dir = crate::persistence::Directory::open(&path)?;
+    let current = load_bundle(&path.join(BUNDLE_NAME));
+    let existing = match current {
+        Ok(Some(bundle)) => Some(bundle),
+        Ok(None) => match load_bundle(&path.join(BACKUP_NAME))? {
+            Some(previous) => Some(previous),
+            None => load_legacy(&path)?,
+        },
+        Err(error) => {
+            if let Some(previous) = load_bundle(&path.join(BACKUP_NAME))? {
+                log::warn!(
+                    "TLS: current development bundle invalid ({error}); recovering previous pair"
+                );
+                Some(previous)
+            } else {
+                return Err(AppError::Tls(format!(
+                    "development TLS bundle is invalid and no valid previous pair exists: {error}"
+                )));
+            }
+        }
+    };
+    if let Some(bundle) = existing {
+        if remaining_validity_days(&bundle).is_some_and(|days| days >= REGENERATE_BEFORE_DAYS) {
+            // Also completes a legacy import or recovery without changing identity.
+            if crate::persistence::read_bounded(&path.join(BUNDLE_NAME), MAX_PEM_BYTES)
+                .ok()
+                .as_deref()
+                != Some(bundle.as_slice())
+            {
+                dir.write(BUNDLE_NAME, &bundle, true)?;
+            }
+            return super::pem_as_acceptor(&bundle, &bundle);
+        }
+        // Sync a complete, validated previous pair before replacing the current one.
+        dir.write(BACKUP_NAME, &bundle, true)?;
     }
-    super::load_pem_as_acceptor(&cert_path, &key_path).map_err(|e| {
-        AppError::Tls(format!(
-            "failed to load TLS acceptor from {}: {e}",
-            cert_path.display()
-        ))
-    })
+    let bundle = generate_bundle()?;
+    let acceptor = super::pem_as_acceptor(&bundle, &bundle)?;
+    dir.write(BUNDLE_NAME, &bundle, true)?;
+    Ok(acceptor)
 }
 
-// ---------------------------------------------------------------------------
-// Generation
-// ---------------------------------------------------------------------------
-fn write_self_signed_cert(cert_path: &Path, key_path: &Path) -> Result<()> {
+fn load_bundle(path: &Path) -> Result<Option<Vec<u8>>> {
+    let bundle = match crate::persistence::read_bounded(path, MAX_PEM_BYTES) {
+        Ok(bundle) => bundle,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    super::pem_as_acceptor(&bundle, &bundle)?;
+    Ok(Some(bundle))
+}
+
+fn load_legacy(path: &Path) -> Result<Option<Vec<u8>>> {
+    let cert = path.join("self-signed.crt");
+    let key = path.join("self-signed.key");
+    if !cert.try_exists()? && !key.try_exists()? {
+        return Ok(None);
+    }
+    let mut bundle = crate::persistence::read_bounded(&cert, MAX_PEM_BYTES)?;
+    let key = crate::persistence::read_bounded(&key, MAX_PEM_BYTES)?;
+    super::pem_as_acceptor(&bundle, &key)?;
+    bundle.push(b'\n');
+    bundle.extend_from_slice(&key);
+    Ok(Some(bundle))
+}
+
+fn generate_bundle() -> Result<Vec<u8>> {
+    log::info!("TLS: generating self-signed certificate for {CERT_SANS:?}");
     let params = build_cert_params()?;
     let key_pair = rcgen::KeyPair::generate()
         .map_err(|e| AppError::Tls(format!("rcgen key generation failed: {e}")))?;
-
-    // Serialize the private key *before* consuming key_pair into self_signed.
-    let key_pem = key_pair.serialize_pem();
     let cert = params
         .self_signed(&key_pair)
         .map_err(|e| AppError::Tls(format!("rcgen self-sign failed: {e}")))?;
-    let cert_pem = cert.pem();
-
-    // Write the key first. If the cert write fails subsequently,
-    // the key file exists and needs_regeneration() will return true on the
-    // next startup (cert absent), so both files will be cleanly rewritten.
-    // The reverse order left an orphaned cert with no matching key, causing
-    // an unrecoverable state that required manual file deletion to resolve.
-    write_private_file(key_path, key_pem.as_bytes())?;
-    write_private_file(cert_path, cert_pem.as_bytes())?;
-
-    log::info!(
-        "TLS: wrote self-signed certificate to {}",
-        cert_path.display()
-    );
-    Ok(())
+    Ok(format!("{}{}", cert.pem(), key_pair.serialize_pem()).into_bytes())
 }
 
 // The cast `i64::from(CERT_VALIDITY_DAYS)` is a widening u32→i64 conversion
@@ -195,42 +223,15 @@ fn san_for(s: &str) -> Result<rcgen::SanType> {
 // ---------------------------------------------------------------------------
 // Expiry check
 // ---------------------------------------------------------------------------
-/// Return `true` if the cert file is absent, unreadable, or will expire
-/// within [`REGENERATE_BEFORE_DAYS`] days.
-fn needs_regeneration(cert_path: &Path) -> bool {
-    remaining_validity_days(cert_path).is_none_or(|rem| rem < REGENERATE_BEFORE_DAYS)
-}
-
-/// Parse the `notAfter` field of a PEM certificate and return how many whole
-/// days remain until expiry, or `None` on any failure.
-//
-// Each failure point emits a debug log before returning None. Operators can
-// now distinguish "file missing" (expected on first run)
-// from "cert is corrupted" or "system clock is wrong", all of which
-// previously produced identical silent regeneration with no diagnostic trail.
-fn remaining_validity_days(cert_path: &Path) -> Option<u64> {
+/// Parse the first certificate in a validated bundle to check its expiry.
+fn remaining_validity_days(pem_bytes: &[u8]) -> Option<u64> {
     use x509_cert::der::Decode as _;
-
-    let pem_bytes = std::fs::read(cert_path)
-        .map_err(|e| {
-            log::debug!("TLS: could not read cert {}: {e}", cert_path.display());
-        })
-        .ok()?;
-
-    // Extract the first certificate from the PEM bundle.
-    let (_, pem) = pem_rfc7468::decode_vec(&pem_bytes)
-        .map_err(|e| {
-            log::debug!("TLS: failed to decode PEM in {}: {e}", cert_path.display());
-        })
-        .ok()?;
+    let pem = rustls_pemfile::certs(&mut &*pem_bytes).next()?.ok()?;
 
     // Parse the DER-encoded certificate to reach the validity fields.
     let cert = x509_cert::Certificate::from_der(&pem)
         .map_err(|e| {
-            log::debug!(
-                "TLS: failed to parse certificate DER in {}: {e}",
-                cert_path.display()
-            );
+            log::debug!("TLS: failed to parse development certificate DER: {e}");
         })
         .ok()?;
 
@@ -239,50 +240,11 @@ fn remaining_validity_days(cert_path: &Path) -> Option<u64> {
     let remaining = not_after
         .duration_since(SystemTime::now())
         .map_err(|e| {
-            log::debug!(
-                "TLS: cert {} has already expired or clock skew detected: {e}",
-                cert_path.display()
-            );
+            log::debug!("TLS: development certificate expired or clock skew detected: {e}");
         })
         .ok()?;
 
     Some(remaining.as_secs() / 86_400)
-}
-
-// ---------------------------------------------------------------------------
-// Secure file write
-// ---------------------------------------------------------------------------
-/// Write `contents` to `path`, creating or truncating the file, and set
-/// restrictive permissions (Unix `0600`) so the private key is not world-
-/// readable. On non-Unix platforms the write still succeeds but no
-/// permission change is attempted.
-///
-/// On Unix, the file is opened with mode `0600` atomically so key material is
-/// never written under a broader umask-derived permission set.
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::Write as _;
-
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt as _;
-    #[cfg(unix)]
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| AppError::Tls(format!("cannot open {} for writing: {e}", path.display())))?;
-    #[cfg(not(unix))]
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|e| AppError::Tls(format!("cannot open {} for writing: {e}", path.display())))?;
-
-    file.write_all(contents)
-        .map_err(|e| AppError::Tls(format!("failed to write {}: {e}", path.display())))
 }
 
 // ---------------------------------------------------------------------------
@@ -306,14 +268,13 @@ mod tests {
     async fn generates_cert_on_first_call() {
         ensure_crypto_provider();
         let tmp = TempDir::new().unwrap();
-        let cert = tmp.path().join("runtime/tls/dev/self-signed.crt");
-        let key = tmp.path().join("runtime/tls/dev/self-signed.key");
+        let cert = tmp.path().join("runtime/tls/dev/self-signed.pem");
         assert!(!cert.exists());
         generate_or_load(tmp.path())
             .await
             .expect("generate_or_load failed");
         assert!(cert.exists(), "cert file should exist after first call");
-        assert!(key.exists(), "key file should exist after first call");
+        assert!(load_bundle(&cert).expect("read persisted pair").is_some());
     }
 
     #[tokio::test]
@@ -321,7 +282,7 @@ mod tests {
         ensure_crypto_provider();
         let tmp = TempDir::new().unwrap();
         generate_or_load(tmp.path()).await.unwrap();
-        let cert_path = tmp.path().join("runtime/tls/dev/self-signed.crt");
+        let cert_path = tmp.path().join("runtime/tls/dev/self-signed.pem");
         let mtime_1 = std::fs::metadata(&cert_path).unwrap().modified().unwrap();
         // Small sleep to ensure mtime would differ if the file were rewritten.
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -331,8 +292,35 @@ mod tests {
     }
 
     #[test]
-    fn needs_regeneration_returns_true_for_missing_file() {
-        assert!(needs_regeneration(Path::new("/nonexistent/path/cert.pem")));
+    fn recovers_previous_bundle_without_changing_identity() -> Result<()> {
+        ensure_crypto_provider();
+        let tmp = TempDir::new()?;
+        generate_or_load_blocking(tmp.path())?;
+        let dir = tmp.path().join("runtime/tls/dev");
+        let previous = std::fs::read(dir.join(BUNDLE_NAME))?;
+        std::fs::write(dir.join(BACKUP_NAME), &previous)?;
+        std::fs::write(dir.join(BUNDLE_NAME), b"truncated")?;
+        generate_or_load_blocking(tmp.path())?;
+        assert_eq!(std::fs::read(dir.join(BUNDLE_NAME))?, previous);
+        Ok(())
+    }
+
+    #[test]
+    fn imports_legacy_pair_and_rejects_mismatched_keys() -> Result<()> {
+        ensure_crypto_provider();
+        let tmp = TempDir::new()?;
+        let dir = tmp.path().join("runtime/tls/dev");
+        std::fs::create_dir_all(&dir)?;
+        let bundle = generate_bundle()?;
+        std::fs::write(dir.join("self-signed.crt"), &bundle)?;
+        std::fs::write(dir.join("self-signed.key"), generate_bundle()?)?;
+        assert!(generate_or_load_blocking(tmp.path()).is_err());
+        assert!(!dir.join(BUNDLE_NAME).exists());
+        std::fs::write(dir.join("self-signed.key"), &bundle)?;
+        generate_or_load_blocking(tmp.path())?;
+        let imported = std::fs::read(dir.join(BUNDLE_NAME))?;
+        assert!(imported.starts_with(&bundle));
+        Ok(())
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //!    and writes it to stdout in a single flush.
 //! 2. **Input task** — runs in `tokio::task::spawn_blocking` (since
 //!    crossterm key reading is blocking), polls for key events, and sends
-//!    them over an unbounded channel to the event dispatch loop in
+//!    them over a bounded channel to the event dispatch loop in
 //!    [`crate::runtime::lifecycle`].
 
 pub mod dashboard;
@@ -65,7 +65,7 @@ pub fn start(
     metrics: SharedMetrics,
     mut shutdown: watch::Receiver<bool>,
     data_dir: PathBuf,
-) -> Result<tokio::sync::mpsc::UnboundedReceiver<KeyEvent>> {
+) -> Result<tokio::sync::mpsc::Receiver<KeyEvent>> {
     // crossterm 0.27+ enables Windows VT (Virtual Terminal) processing
     // automatically — no manual call needed.
 
@@ -87,7 +87,7 @@ pub fn start(
     .map_err(|e| AppError::Console(format!("Failed to clear screen: {e}")))?;
 
     // ── Key event channel ─────────────────────────────────────────────────────
-    let (key_tx, key_rx) = tokio::sync::mpsc::unbounded_channel::<KeyEvent>();
+    let (key_tx, key_rx) = tokio::sync::mpsc::channel::<KeyEvent>(64);
 
     // ── Input task (blocking thread) ──────────────────────────────────────────
     input::spawn(key_tx, shutdown.clone());
@@ -105,8 +105,8 @@ pub fn start(
                         log::debug!("Render error: {e}");
                     }
                 }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { break; }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
                 }
             }
         }

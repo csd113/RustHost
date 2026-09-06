@@ -39,59 +39,63 @@ pub enum KeyEvent {
     Other,
 }
 
-/// Reload site stats and refresh the canonical site root used by listeners.
+/// Prepare and publish one site generation shared by all listeners.
 ///
 /// # Errors
 ///
-/// Returns [`AppError`] only if spawning the blocking rescan task fails at the
-/// Tokio task level. Filesystem scan failures are logged and degraded to a
-/// no-op so operators can retry reload without crashing the service.
+/// Preparation failures are reported through logs and status; the active site
+/// is preserved. The result remains `Ok(())` so operators can retry without
+/// terminating the service.
 pub async fn reload_site(
     config: &Config,
     state: SharedState,
     data_dir: PathBuf,
-    root_tx: &tokio::sync::watch::Sender<std::sync::Arc<std::path::Path>>,
+    root_tx: &tokio::sync::watch::Sender<std::sync::Arc<crate::server::SiteSnapshot>>,
 ) -> Result<()> {
-    let site_root = data_dir.join(&config.site.directory);
-    let scan_root = site_root.clone();
-    let (count, bytes) =
-        match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                log::warn!("Site rescan failed: {e}");
-                state.write().await.status_message =
-                    Some(StatusMessage::persistent(format!("Reload failed: {e}")));
-                return Ok(());
-            }
-            Err(e) => {
-                log::warn!("Site rescan task panicked: {e}");
-                state.write().await.status_message = Some(StatusMessage::persistent(
-                    "Reload failed: scan task stopped",
-                ));
-                return Ok(());
-            }
-        };
-    {
-        let mut s = state.write().await;
-        s.site_file_count = count;
-        s.site_total_bytes = bytes;
-        s.status_message = Some(StatusMessage::temporary(
+    let previous = Arc::clone(&root_tx.borrow());
+    let config = config.clone();
+    let prepared =
+        tokio::task::spawn_blocking(move || server::SiteSnapshot::prepare(&config, &data_dir))
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|result| result.map_err(|e| e.to_string()));
+    let next = match prepared {
+        Ok(next) => next,
+        Err(message) => {
+            log::warn!("Site reload failed: {message}");
+            state.write().await.status_message = Some(StatusMessage::persistent(format!(
+                "Reload failed: {message}"
+            )));
+            return Ok(());
+        }
+    };
+    let mut state = state.write().await;
+    // A concurrently completed reload must not be overwritten by older work.
+    // Cancellation before this synchronous publication leaves the old site intact.
+    let published = root_tx.send_if_modified(|current| {
+        if !Arc::ptr_eq(current, &previous) {
+            return false;
+        }
+        *current = Arc::clone(&next);
+        true
+    });
+    if published {
+        state.site_file_count = next.file_count;
+        state.site_total_bytes = next.total_bytes;
+        state.status_message = Some(StatusMessage::temporary(
             format!(
                 "Reload complete: {} files, {}",
-                count,
-                crate::runtime::state::format_bytes(bytes)
+                next.file_count,
+                crate::runtime::state::format_bytes(next.total_bytes)
             ),
             RELOAD_STATUS_DURATION,
         ));
+    } else {
+        state.status_message = Some(StatusMessage::persistent(
+            "Reload superseded by another completed reload",
+        ));
     }
-    if let Ok(new_root) = site_root.canonicalize() {
-        let _ = root_tx.send(Arc::from(new_root.as_path()));
-    }
-    log::info!(
-        "Site reloaded — {} files, {}",
-        count,
-        crate::runtime::state::format_bytes(bytes)
-    );
+    drop(state);
     Ok(())
 }
 
@@ -557,7 +561,7 @@ pub async fn handle(
     _metrics: SharedMetrics,
     data_dir: PathBuf,
     settings_path: Option<PathBuf>,
-    root_tx: &tokio::sync::watch::Sender<std::sync::Arc<std::path::Path>>,
+    root_tx: &tokio::sync::watch::Sender<std::sync::Arc<crate::server::SiteSnapshot>>,
 ) -> Result<bool> {
     if let Some(quit) = handle_diagnostics_page_event(
         event,
@@ -649,11 +653,17 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::{watch, RwLock};
 
+    fn test_site(root: &std::path::Path) -> Arc<crate::server::SiteSnapshot> {
+        let mut config = Config::default();
+        config.site.directory = ".".into();
+        crate::server::SiteSnapshot::prepare(&config, root).expect("test site snapshot")
+    }
+
     async fn handle_key(
         event: KeyEvent,
         state: SharedState,
         data_dir: std::path::PathBuf,
-        root_tx: &watch::Sender<Arc<std::path::Path>>,
+        root_tx: &watch::Sender<Arc<crate::server::SiteSnapshot>>,
     ) -> bool {
         handle(
             event,
@@ -672,7 +682,7 @@ mod tests {
         page: Page,
         state: SharedState,
         data_dir: std::path::PathBuf,
-        root_tx: &watch::Sender<Arc<std::path::Path>>,
+        root_tx: &watch::Sender<Arc<crate::server::SiteSnapshot>>,
     ) {
         {
             let mut snapshot = state.write().await;
@@ -695,7 +705,9 @@ mod tests {
         let config = Config::default();
         let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
         let metrics = Arc::new(Metrics::new());
-        let (root_tx, _root_rx) = watch::channel(Arc::from(data_dir.join("site").as_path()));
+        let (root_tx, _root_rx) = watch::channel(
+            crate::server::SiteSnapshot::prepare(&config, &data_dir).expect("site snapshot"),
+        );
 
         let quit = handle(
             KeyEvent::Reload,
@@ -726,7 +738,7 @@ mod tests {
         let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
         state.write().await.console_mode = ConsoleMode::ConfirmQuit;
         let metrics = Arc::new(Metrics::new());
-        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+        let (root_tx, _root_rx) = watch::channel(test_site(tmp.path()));
 
         let quit = handle(
             KeyEvent::Confirm,
@@ -758,7 +770,7 @@ mod tests {
     async fn menu_opens_from_dashboard_and_navigation_updates_selection() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
-        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+        let (root_tx, _root_rx) = watch::channel(test_site(tmp.path()));
 
         let quit = handle_key(
             KeyEvent::Menu,
@@ -793,7 +805,7 @@ mod tests {
     async fn enter_opens_selected_menu_page_and_escape_returns() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
-        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+        let (root_tx, _root_rx) = watch::channel(test_site(tmp.path()));
 
         handle_key(
             KeyEvent::Menu,
@@ -852,7 +864,7 @@ mod tests {
     async fn logs_key_still_opens_existing_log_view() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
-        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+        let (root_tx, _root_rx) = watch::channel(test_site(tmp.path()));
 
         handle_key(
             KeyEvent::ToggleLogs,
@@ -868,7 +880,7 @@ mod tests {
     async fn quit_is_limited_to_dashboard_and_top_level_menu() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
-        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+        let (root_tx, _root_rx) = watch::channel(test_site(tmp.path()));
 
         let quit = handle_key(
             KeyEvent::Quit,
@@ -970,7 +982,7 @@ mod tests {
     async fn diagnostics_page_controls_are_page_local() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
-        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+        let (root_tx, _root_rx) = watch::channel(test_site(tmp.path()));
 
         {
             let mut snapshot = state.write().await;
@@ -1019,7 +1031,7 @@ mod tests {
     async fn menu_placeholder_items_open_matching_placeholder_pages() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
-        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+        let (root_tx, _root_rx) = watch::channel(test_site(tmp.path()));
 
         for (selected, page) in Page::ALL.iter().copied().enumerate() {
             {
@@ -1063,7 +1075,7 @@ mod tests {
     async fn new_nested_menu_pages_escape_back_and_do_not_quit() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
-        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+        let (root_tx, _root_rx) = watch::channel(test_site(tmp.path()));
 
         for page in [
             Page::Tor,
@@ -1103,7 +1115,7 @@ mod tests {
     async fn tor_restart_action_is_non_mutating() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state: SharedState = Arc::new(RwLock::new(crate::runtime::state::AppState::new()));
-        let (root_tx, _root_rx) = watch::channel(Arc::from(tmp.path()));
+        let (root_tx, _root_rx) = watch::channel(test_site(tmp.path()));
 
         {
             let mut snapshot = state.write().await;

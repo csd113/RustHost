@@ -27,6 +27,7 @@ use tokio::{
 use crate::runtime::state::SharedState;
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
+const HEADER_READ_LIMIT: u64 = 16 * 1024 + 1;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct RedirectServerConfig {
@@ -117,7 +118,12 @@ pub async fn run_redirect_server(
     let mut join_set: JoinSet<()> = JoinSet::new();
     let mut backoff_ms: u64 = 1;
 
-    loop {
+    while !*shutdown.borrow() {
+        while let Some(result) = join_set.try_join_next() {
+            if let Err(e) = result {
+                log::debug!("Connection task ended: {e}");
+            }
+        }
         tokio::select! {
             result = listener.accept() => {
                 match result {
@@ -172,14 +178,13 @@ pub async fn run_redirect_server(
                     log::debug!("Redirect connection task join error: {e}");
                 }
             }
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() { break; }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
             }
         }
     }
 
-    let drain = async { while join_set.join_next().await.is_some() {} };
-    let _ = tokio::time::timeout(drain_timeout, drain).await;
+    super::drain_connections(&mut join_set, drain_timeout).await;
     state.write().await.server_running = false;
     log::info!("HTTP-redirect server stopped.");
 }
@@ -195,13 +200,14 @@ async fn handle_redirect_connection(
     https_port: u16,
     allowed_hosts: &[String],
 ) {
-    use tokio::io::AsyncBufReadExt as _;
     use tokio::io::BufReader;
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
 
     let read_result = tokio::time::timeout(HEADER_READ_TIMEOUT, async {
         // Scope the BufReader so the &mut borrow of stream is released before
         // the write below. Rust's borrow checker requires this.
-        let mut reader = BufReader::new(&mut *stream);
+        // Bound the underlying read before read_line can grow its String.
+        let mut reader = BufReader::new((&mut *stream).take(HEADER_READ_LIMIT));
         let mut total = 0usize;
         let mut host = HostHeader::Missing;
 
@@ -227,7 +233,7 @@ async fn handle_redirect_connection(
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line).await {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => return ReadOutcome::Malformed,
                 Ok(n) => {
                     total = total.saturating_add(n);
                     if total > MAX_HEADER_BYTES {
@@ -399,12 +405,46 @@ async fn write_status_response(
     }
     response.push_str("\r\n");
 
-    stream.write_all(response.as_bytes()).await?;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        stream.write_all(response.as_bytes()),
+    )
+    .await
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))??;
     stream.flush().await
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn unterminated_lines_are_rejected_at_the_byte_limit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        for prefix in ["GET /", "GET / HTTP/1.1\r\nHost: localhost\r\nX-Large: "] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let mut client = tokio::net::TcpStream::connect(listener.local_addr()?).await?;
+            let (mut server, peer) = listener.accept().await?;
+            let task = tokio::spawn(async move {
+                super::handle_redirect_connection(&mut server, peer.ip(), peer.ip(), 443, &[])
+                    .await;
+            });
+            let mut request = prefix.as_bytes().to_vec();
+            request.resize(super::MAX_HEADER_BYTES + 1, b'a');
+            client.write_all(&request).await?;
+            let mut response = [0; 12];
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.read_exact(&mut response),
+            )
+            .await;
+            task.abort();
+            let _ = task.await;
+            read??;
+            assert_eq!(&response, b"HTTP/1.1 431");
+        }
+        Ok(())
+    }
+
     use std::net::IpAddr;
 
     use super::{

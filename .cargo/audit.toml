@@ -1,4 +1,5 @@
 # cargo-audit configuration for rusthost
+# Loaded automatically from .cargo/audit.toml; --file selects Cargo.lock.
 #
 # previously this file contained a bare `ignore` entry with no
 # rationale, creating a silent suppression that future developers could not

@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
-    fs::OpenOptions,
     net::{IpAddr, SocketAddr, TcpListener},
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -922,27 +921,15 @@ fn connect_with_timeout(addr: SocketAddr, timeout: Duration) -> std::io::Result<
 }
 
 fn write_log_file(path: &Path, text: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?
-        .write_all_text(text)
-}
-
-trait WriteAllText {
-    fn write_all_text(self, text: &str) -> std::io::Result<()>;
-}
-
-impl WriteAllText for std::fs::File {
-    fn write_all_text(mut self, text: &str) -> std::io::Result<()> {
-        use std::io::Write as _;
-        self.write_all(text.as_bytes())?;
-        self.flush()
-    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid report path")
+    })?;
+    crate::persistence::Directory::open(parent)?.write(name, text.as_bytes(), true)?;
+    Ok(())
 }
 
 fn set_log_write_status(

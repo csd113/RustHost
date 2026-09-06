@@ -24,6 +24,19 @@ pub(super) struct BackgroundTasks {
     pub(super) acme_guard: Option<tls::acme::AcmeInitGuard>,
 }
 
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        // Dropping a JoinHandle detaches its task. Cancel owned services if
+        // startup is cancelled or exits before the normal shutdown path.
+        for task in [&self.https, &self.redirect, &self.tor_ingress, &self.acme]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
+        }
+    }
+}
+
 struct HttpsTaskArgs<'a> {
     config: &'a Arc<Config>,
     state: &'a SharedState,
@@ -31,7 +44,7 @@ struct HttpsTaskArgs<'a> {
     shutdown_rx: &'a watch::Receiver<bool>,
     data_dir: &'a Path,
     budget: &'a SharedConnectionBudget,
-    root_tx: &'a watch::Sender<Arc<std::path::Path>>,
+    root_tx: &'a watch::Sender<Arc<server::SiteSnapshot>>,
 }
 
 pub(super) async fn wait_for_bind_port(
@@ -63,7 +76,7 @@ pub(super) async fn setup_tls(
     shutdown_rx: &watch::Receiver<bool>,
     data_dir: &Path,
     budget: &SharedConnectionBudget,
-    root_tx: &watch::Sender<Arc<std::path::Path>>,
+    root_tx: &watch::Sender<Arc<server::SiteSnapshot>>,
 ) -> Result<BackgroundTasks> {
     let mut tasks = BackgroundTasks::default();
 
@@ -308,50 +321,34 @@ pub(super) async fn graceful_shutdown(
 
     let http_budget = Duration::from_secs(config.server.shutdown_grace_secs);
 
-    if let Some(server_handle) = server_handle {
-        if tokio::time::timeout(http_budget, server_handle)
-            .await
-            .is_err()
-        {
-            let secs = http_budget.as_secs();
-            log::warn!(
-                "HTTP drain did not complete within {secs} s; \
-                 some connections may be abruptly closed",
-            );
-        }
-    }
-
-    if let Some(handle) = tor_handle {
-        let tor_budget = Duration::from_secs(config.tor.shutdown_grace_secs);
-        if tokio::time::timeout(tor_budget, handle).await.is_err() {
-            log::warn!(
-                "Tor circuit teardown did not complete within {} s; \
-                 active Tor streams will be forcibly closed",
-                tor_budget.as_secs(),
-            );
-        }
-    }
+    wait_for_background_task(server_handle, http_budget, "HTTP server").await;
+    wait_for_background_task(
+        tor_handle,
+        Duration::from_secs(config.tor.shutdown_grace_secs),
+        "Tor service",
+    )
+    .await;
 
     wait_for_background_task(
-        background_tasks.redirect,
+        background_tasks.redirect.take(),
         Duration::from_secs(config.server.shutdown_grace_secs.saturating_add(2)),
         "HTTP redirect server",
     )
     .await;
     wait_for_background_task(
-        background_tasks.tor_ingress,
+        background_tasks.tor_ingress.take(),
         Duration::from_secs(config.server.shutdown_grace_secs.saturating_add(2)),
         "Tor ingress server",
     )
     .await;
     wait_for_background_task(
-        background_tasks.https,
+        background_tasks.https.take(),
         Duration::from_secs(config.server.shutdown_grace_secs.saturating_add(2)),
         "HTTPS server",
     )
     .await;
     wait_for_background_task(
-        background_tasks.acme,
+        background_tasks.acme.take(),
         Duration::from_secs(5),
         "ACME event loop",
     )
@@ -384,6 +381,34 @@ pub(super) async fn wait_for_background_task(
                 timeout.as_secs()
             );
             handle.abort();
+            if let Err(e) = handle.await {
+                if !e.is_cancelled() {
+                    log::warn!("{label} failed while being aborted: {e}");
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_for_background_task;
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn timed_out_task_releases_resources_before_shutdown_returns() -> crate::Result<()> {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .map_err(std::io::Error::other)?;
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+        wait_for_background_task(Some(task), Duration::from_millis(10), "test worker").await;
+        assert_eq!(semaphore.available_permits(), 1);
+        Ok(())
     }
 }

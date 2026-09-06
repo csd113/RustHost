@@ -98,8 +98,8 @@ Created automatically — never commit these to version control.
             rusthost.log           ← append-only; survives restarts
         tls/
             dev/
-                self-signed.crt    ← local dev cert (if TLS enabled)
-                self-signed.key    ← local dev key (if TLS enabled)
+                self-signed.pem   ← atomic local dev certificate + private key bundle
+                self-signed.previous.pem ← previous validated bundle after renewal
             acme/                  ← ACME cache/state (if ACME enabled)
         tor/
             arti_state/            ← Tor identity + persistent state

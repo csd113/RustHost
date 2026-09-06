@@ -112,11 +112,13 @@ pub(super) fn resolve_path(opts: &ResolveOptions<'_>) -> Resolved {
         let Ok(canonical_dir) = candidate.canonicalize() else {
             return Resolved::Fallback;
         };
-        if !canonical_dir.starts_with(canonical_root) {
+        if !canonical_dir.starts_with(canonical_root)
+            || (!expose_dotfiles && resolved_path_has_dotfile(&canonical_dir, canonical_root))
+        {
             return Resolved::Forbidden;
         }
         if !url_path.ends_with('/') {
-            return Resolved::Redirect(format!("{url_path}/"));
+            return Resolved::Redirect(format!("{}/", encode_url_path(url_path)));
         }
         let idx = canonical_dir.join(index_file);
         if idx.exists() {
@@ -140,6 +142,7 @@ pub(super) fn resolve_path(opts: &ResolveOptions<'_>) -> Resolved {
                 canonical_root,
                 index_file,
                 spa_routing,
+                expose_dotfiles,
                 error_404_page.as_ref(),
             )
         } else {
@@ -162,18 +165,23 @@ fn resolve_not_found(
     canonical_root: &Path,
     index_file: &str,
     spa_routing: bool,
+    expose_dotfiles: bool,
     error_404_page: Option<&Arc<CustomErrorPage>>,
 ) -> Resolved {
     if spa_routing {
         let spa_index = canonical_root.join(index_file);
         if spa_index.exists() {
             match spa_index.canonicalize() {
-                Ok(resolved) if resolved.starts_with(canonical_root) => {
+                Ok(resolved)
+                    if resolved.starts_with(canonical_root)
+                        && (expose_dotfiles
+                            || !resolved_path_has_dotfile(&resolved, canonical_root)) =>
+                {
                     return Resolved::File(resolved);
                 }
                 Ok(resolved) => {
                     log::warn!(
-                        "Refusing SPA fallback outside the site root: {}",
+                        "Refusing SPA fallback outside the site root or into a hidden path: {}",
                         resolved.display()
                     );
                     return Resolved::Forbidden;
@@ -227,7 +235,8 @@ pub(super) fn build_directory_listing(dir: &Path, url_path: &str, expose_dotfile
             }
         }
 
-        let base = html_escape(url_path.trim_end_matches('/'));
+        let encoded_base = encode_url_path(url_path);
+        let base = html_escape(encoded_base.trim_end_matches('/'));
         for name in names {
             let encoded_name = percent_encode_path(&name);
             let escaped_name = html_escape(&name);
@@ -280,6 +289,21 @@ fn html_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Encode a decoded filesystem URL path with exactly one leading slash so it
+/// cannot become a scheme-relative redirect or reinterpret filename delimiters.
+fn encode_url_path(path: &str) -> String {
+    const ESCAPES: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~')
+        .remove(b'/');
+    format!(
+        "/{}",
+        percent_encoding::utf8_percent_encode(path.trim_start_matches('/'), ESCAPES)
+    )
 }
 
 fn percent_encode_path(s: &str) -> String {

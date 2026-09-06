@@ -3,21 +3,32 @@
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use tokio::sync::{mpsc::UnboundedSender, watch};
+use tokio::sync::{mpsc::Sender, watch};
 
 use crate::runtime::events::KeyEvent;
 
-pub fn spawn(tx: UnboundedSender<KeyEvent>, shutdown: watch::Receiver<bool>) {
+pub fn spawn(tx: Sender<KeyEvent>, shutdown: watch::Receiver<bool>) {
     tokio::task::spawn_blocking(move || loop {
-        if *shutdown.borrow() {
+        if *shutdown.borrow() || shutdown.has_changed().is_err() || tx.is_closed() {
             break;
         }
 
         match event::poll(Duration::from_millis(50)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) => {
-                    if tx.send(map_key(key.code, key.modifiers)).is_err() {
-                        break;
+                    let mut pending = map_key(key.code, key.modifiers);
+                    loop {
+                        match tx.try_send(pending) {
+                            Ok(()) => break,
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                                pending = event;
+                            }
+                        }
+                        if *shutdown.borrow() || shutdown.has_changed().is_err() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
                     }
                 }
                 Ok(_) => {}
