@@ -2,7 +2,7 @@
 name = "rusthost"
 version = "1.0.0"
 edition = "2021"
-# Arti 0.45 and its Tor crates require Rust 1.91.
+# Arti 0.46 and its Tor crates require Rust 1.91.
 rust-version = "1.91"
 description = "Single-binary, zero-setup static site hosting appliance with Tor support"
 license = "MIT"
@@ -65,14 +65,14 @@ tokio = { version = "1", features = [
 
 # default-features = false removes the implicit "native-tls" default that
 # would otherwise pull in openssl-sys and break cross-compilation.
-arti-client = { version = "0.45", default-features = false, features = [
+arti-client = { version = "0.46", default-features = false, features = [
     "tokio",
     "rustls",
     "onion-service-service",
 ] }
-tor-hsservice = { version = "0.45", default-features = false }
-tor-cell      = { version = "0.45", default-features = false }
-tor-rtcompat  = { version = "0.45", default-features = false, features = ["tokio", "rustls"] }
+tor-hsservice = { version = "0.46", default-features = false }
+tor-cell      = { version = "0.46", default-features = false }
+tor-rtcompat  = { version = "0.46", default-features = false, features = ["tokio", "rustls"] }
 futures       = "0.3"
 
 # Terminal auto-launcher: TTY detection uses std::io::IsTerminal
@@ -99,7 +99,7 @@ libc = "0.2"
 # arti-client pulls rusqlite transitively; declaring it here unifies the feature
 # across the whole dep tree so cross-compiling to Linux/Windows works without a
 # system sqlite3 library present on the host Mac.
-# Arti 0.45's tor-dirmgr requires rusqlite < 0.40.  Keeping the newest
+# Arti 0.46's tor-dirmgr requires rusqlite < 0.40.  Keeping the newest
 # compatible 0.39 line here also enables bundled SQLite for the whole graph.
 rusqlite = { version = "0.39", features = ["bundled"] }
 
