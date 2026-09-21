@@ -49,6 +49,9 @@ impl<S> ProgressStream<S> {
         let timer = self.write_deadlines[operation]
             .get_or_insert_with(|| Box::pin(tokio::time::sleep(self.write_timeout)));
         if timer.as_mut().poll(cx).is_ready() {
+            // Clear the spent timer so a caller that retries after a transient
+            // timeout gets a fresh deadline instead of failing immediately.
+            self.write_deadlines[operation] = None;
             Poll::Ready(Err(timed_out()))
         } else {
             Poll::Pending

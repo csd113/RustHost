@@ -166,11 +166,13 @@ pub fn render_help() -> String {
         ui::bold("[O]")
     );
     let _ = writeln!(out, " {} Toggle log view\r", ui::bold("[L]"));
+    let _ = writeln!(out, " {} Open the menu\r", ui::bold("[M]"));
+    let _ = writeln!(out, " {} Quit RustHost\r", ui::bold("[Q]"));
     out.push_str("\r\n");
     let _ = writeln!(
         out,
         "{}\r",
-        ui::dim("Press any key to return to the dashboard.")
+        ui::dim("Press Esc to return to the dashboard.")
     );
     let _ = writeln!(out, "{}\r", ui::RULE);
     out
@@ -222,12 +224,13 @@ fn strip_timestamp(line: &str) -> &str {
 }
 
 fn clean_log_line(line: &str) -> String {
-    line.replace("╔═══════════════════════════════════════════════════╗", "")
-        .replace("╠═══════════════════════════════════════════════════╣", "")
-        .replace("╚═══════════════════════════════════════════════════╝", "")
-        .replace('║', "")
-        .trim()
-        .to_owned()
+    // Single pass: drop box-drawing border characters, then trim. Avoids the
+    // four intermediate `String::replace` allocations per line per frame.
+    let filtered: String = line
+        .chars()
+        .filter(|c| !matches!(c, '╔' | '═' | '╗' | '╠' | '╣' | '╚' | '╝' | '║'))
+        .collect();
+    filtered.trim().to_owned()
 }
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 fn render_visitors(out: &mut String, count: usize) {

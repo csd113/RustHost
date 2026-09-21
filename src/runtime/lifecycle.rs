@@ -120,62 +120,23 @@ pub async fn run(args: CliArgs) -> Result<()> {
 /// Builds a `Config` in memory with sensible defaults, skips first-run setup,
 /// and calls [`normal_run`].
 async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bool) -> Result<()> {
-    use crate::config::{
-        ConsoleConfig, CspLevel, IdentityConfig, LogLevel, LoggingConfig, ServerConfig, SiteConfig,
-        TorConfig,
-    };
     use std::num::NonZeroU16;
 
     let (data_dir, site_dir) = one_shot_paths(&dir)?;
 
-    let config = Arc::new(crate::config::Config {
-        server: ServerConfig {
-            port: NonZeroU16::new(port).unwrap_or(NonZeroU16::MIN),
-            bind: "127.0.0.1"
-                .parse()
-                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-            auto_port_fallback: false,
-            open_browser_on_start: false,
-            max_connections: 256,
-            max_connections_per_ip: 16,
-            shutdown_grace_secs: 30,
-            csp_level: CspLevel::Off,
-            trusted_proxies: None,
-        },
-        site: SiteConfig {
-            directory: site_dir,
-            index_file: "index.html".into(),
-            favicon: "favicon.ico".into(),
-            enable_png_favicon: false,
-            enable_directory_listing: true,
-            expose_dotfiles: false,
-            spa_routing: false,
-            error_404: None,
-            error_503: None,
-        },
-        tor: TorConfig {
-            enabled: tor_enabled,
-            shutdown_grace_secs: 30,
-        },
-        logging: LoggingConfig {
-            enabled: false,
-            level: LogLevel::Info,
-            file: "rusthost.log".into(),
-            filter_dependencies: true,
-        },
-        console: ConsoleConfig {
-            interactive: !headless,
-            refresh_rate_ms: 500,
-            show_timestamps: false,
-        },
-        identity: IdentityConfig {
-            instance_name: "RustHost".into(),
-        },
-        redirects: Vec::new(),
-        tls: crate::config::TlsConfig::default(),
-    });
+    // Start from the standard defaults and change only what `--serve` needs, so
+    // this path cannot silently drift from `Config::default()`.
+    let mut config = Config::default();
+    config.server.port = NonZeroU16::new(port).unwrap_or(NonZeroU16::MIN);
+    config.server.bind = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    config.site.directory = site_dir;
+    config.site.enable_directory_listing = true;
+    config.tor.enabled = tor_enabled;
+    config.tor.shutdown_grace_secs = 30;
+    config.logging.enabled = false;
+    config.console.interactive = !headless;
 
-    normal_run_with_config(data_dir, None, config).await
+    normal_run_with_config(data_dir, None, Arc::new(config)).await
 }
 
 /// Resolve before creating runtime files, and never substitute the parent for
@@ -466,7 +427,9 @@ async fn normal_run_with_config(
         Some(server_handle)
     };
 
-    // 6b. TLS / HTTPS — optional, non-fatal.
+    // 6b. TLS / HTTPS — optional. If TLS is disabled this is a no-op; if it is
+    // enabled but initialisation or binding fails, the failure is fatal and the
+    // already-started HTTP listener is torn down by the shutdown path below.
     let background_tasks = setup_tls(
         &config,
         &state,
@@ -547,9 +510,9 @@ async fn normal_run_with_config(
     }
 
     // 8. Start console UI.
-    let key_rx =
+    let console_session =
         match start_console(&config, &state, &metrics, shutdown_rx.clone(), &data_dir).await {
-            Ok(rx) => rx,
+            Ok(session) => session,
             Err(err) => {
                 graceful_shutdown(
                     &config,
@@ -571,7 +534,7 @@ async fn normal_run_with_config(
     // 10. Event dispatch loop.  Always continue into the single shutdown path
     // so listener/background cleanup runs even if event handling fails.
     let event_result = event_loop(
-        key_rx,
+        console_session,
         &config,
         &state,
         &metrics,
@@ -662,16 +625,16 @@ async fn start_console(
     metrics: &SharedMetrics,
     shutdown: watch::Receiver<bool>,
     data_dir: &Path,
-) -> Result<Option<mpsc::Receiver<events::KeyEvent>>> {
+) -> Result<Option<(mpsc::Receiver<events::KeyEvent>, Arc<tokio::sync::Notify>)>> {
     if config.console.interactive {
-        let rx = console::start(
+        let session = console::start(
             Arc::clone(config),
             Arc::clone(state),
             Arc::clone(metrics),
             shutdown,
             data_dir.to_path_buf(),
         )?;
-        Ok(Some(rx))
+        Ok(Some(session))
     } else {
         let snapshot = state.read().await.clone();
         let mut stdout = std::io::stdout();
@@ -775,7 +738,7 @@ async fn next_sigterm() {
 }
 
 async fn event_loop(
-    key_rx: Option<mpsc::Receiver<events::KeyEvent>>,
+    session: Option<(mpsc::Receiver<events::KeyEvent>, Arc<tokio::sync::Notify>)>,
     config: &Arc<Config>,
     state: &SharedState,
     metrics: &SharedMetrics,
@@ -784,7 +747,10 @@ async fn event_loop(
     root_tx: watch::Sender<Arc<server::SiteSnapshot>>,
 ) -> Result<()> {
     // 2.8 — mutable so we can set to None when the channel closes.
-    let mut key_rx = key_rx;
+    let (mut key_rx, render_notify) = match session {
+        Some((rx, notify)) => (Some(rx), Some(notify)),
+        None => (None, None),
+    };
 
     // Pin ctrl_c so it can be polled repeatedly inside select! without moving.
     let ctrl_c = tokio::signal::ctrl_c();
@@ -851,6 +817,11 @@ async fn event_loop(
                         settings_path.clone(),
                         &root_tx,
                     ).await?;
+                    // Repaint immediately so key-driven state changes are
+                    // visible without waiting for the next refresh tick.
+                    if let Some(notify) = &render_notify {
+                        notify.notify_one();
+                    }
                     if quit { break; }
                 } else {
                     log::warn!(

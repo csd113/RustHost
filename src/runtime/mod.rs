@@ -37,8 +37,15 @@ pub fn open_browser(url: &str) {
         }
     };
 
-    if let Err(e) = result {
-        log::warn!("Could not open browser at {url}: {e}");
+    match result {
+        Ok(mut child) => {
+            // Reap the short-lived launcher so Unix does not accumulate a
+            // zombie; the browser process itself outlives it.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => log::warn!("Could not open browser at {url}: {e}"),
     }
 }
 

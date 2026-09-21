@@ -339,16 +339,22 @@ where
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
-        let prefix = this.prefix.get_ref();
-        let pos = usize::try_from(this.prefix.position()).unwrap_or(prefix.len());
+        let prefix_len = this.prefix.get_ref().len();
+        let pos = usize::try_from(this.prefix.position()).unwrap_or(prefix_len);
 
-        if pos < prefix.len() {
-            let remaining = &prefix[pos..];
+        if pos < prefix_len {
+            let remaining = &this.prefix.get_ref()[pos..];
             let to_copy = remaining.len().min(buf.remaining());
             buf.put_slice(&remaining[..to_copy]);
             this.prefix
                 .set_position(u64::try_from(pos.saturating_add(to_copy)).unwrap_or(u64::MAX));
             return std::task::Poll::Ready(Ok(()));
+        }
+
+        // Prefix fully consumed: release the up-to-16 KB pre-read buffer so it
+        // is not pinned for the lifetime of a keep-alive connection.
+        if prefix_len != 0 {
+            this.prefix = Cursor::new(Vec::new());
         }
 
         std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
@@ -600,14 +606,9 @@ async fn route(
         );
     }
 
-    record_unique_visitor(
-        &req,
-        cfg.peer_addr,
-        &cfg.trusted_proxies,
-        cfg.ingress,
-        metrics,
-    );
-
+    // Count unique visitors for real site traffic only. Operational probes
+    // (`/health`, `/ready`) are infrastructure traffic, not visitors, and
+    // skipping them keeps the per-request visitor lock off the probe path.
     if let Some(endpoint) = OperationalEndpoint::from_path(req.uri().path()) {
         let resp = route_operational_endpoint(&req, cfg, metrics, endpoint).await?;
         log_request(
@@ -621,6 +622,14 @@ async fn route(
             inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await,
         );
     }
+
+    record_unique_visitor(
+        &req,
+        cfg.peer_addr,
+        &cfg.trusted_proxies,
+        cfg.ingress,
+        metrics,
+    );
 
     match req.method() {
         &Method::OPTIONS => {
@@ -692,10 +701,22 @@ async fn route(
         }
     }
 
-    match resolve_favicon_request(&decoded, &cfg.site.favicon) {
+    // Favicon resolution touches the filesystem. Run it on the blocking pool,
+    // but only for favicon paths so ordinary requests pay no extra hop.
+    let favicon_resolution = if requested_favicon_kind(&decoded).is_some() {
+        let favicon = Arc::clone(&cfg.site.favicon);
+        let decoded_for_favicon = decoded.clone();
+        tokio::task::spawn_blocking(move || resolve_favicon_request(&decoded_for_favicon, &favicon))
+            .await
+            .map_err(|e| std::io::Error::other(format!("favicon resolution task panicked: {e}")))?
+    } else {
+        FaviconResolution::NotFavicon
+    };
+
+    match favicon_resolution {
         FaviconResolution::File(abs_path) => {
             metrics.add_request();
-            let resp = serve_favicon(&abs_path, is_head, &cfg.csp, &decoded).await?;
+            let resp = serve_favicon(&abs_path, &req, is_head, &cfg.csp, &decoded).await?;
             log_request(
                 &req,
                 resp.status().as_u16(),
@@ -1185,22 +1206,45 @@ fn resolve_favicon_candidate(
 
 async fn serve_favicon(
     abs_path: &Path,
+    req: &Request<Incoming>,
     is_head: bool,
     csp: &str,
     url_path: &str,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
-    let file = open_regular_file(abs_path).await?;
-    let length = file.metadata().await?.len();
+    let (file, metadata) = open_regular_file(abs_path).await?;
+    let length = metadata.len();
     let extension = abs_path
         .extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("");
     let content_type = mime::for_extension(extension);
+    let cache_control = cache_control_for(content_type, url_path);
+    let etag = weak_etag(&metadata);
+    let last_modified = last_modified_header(&metadata);
+
+    // Favicons are re-requested on nearly every page load; honour conditional
+    // requests so a cached copy is revalidated with a cheap 304.
+    if selected_representation_not_modified(req, &etag, &metadata) {
+        let mut builder = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", &etag)
+            .header("Cache-Control", cache_control);
+        if let Some(last_modified) = last_modified.as_deref() {
+            builder = builder.header(header::LAST_MODIFIED, last_modified);
+        }
+        builder = security_headers(builder, csp, content_type);
+        return Ok(builder.body(empty_body()).unwrap_or_default());
+    }
+
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, length)
-        .header("Cache-Control", cache_control_for(content_type, url_path));
+        .header("Cache-Control", cache_control)
+        .header("ETag", &etag);
+    if let Some(last_modified) = last_modified.as_deref() {
+        builder = builder.header(header::LAST_MODIFIED, last_modified);
+    }
     builder = security_headers(builder, csp, content_type);
     let body = if is_head {
         empty_body()
@@ -1215,19 +1259,23 @@ async fn serve_favicon(
 /// Open only regular files. On Unix, `O_NONBLOCK` prevents a FIFO replacement
 /// from pinning a filesystem worker; `O_NOFOLLOW` rejects a replaced leaf symlink.
 /// Ancestor-directory replacement still requires platform-specific containment.
-async fn open_regular_file(path: &Path) -> std::io::Result<tokio::fs::File> {
+///
+/// Returns the open handle together with its metadata so callers do not need a
+/// second (blocking-pool) `fstat` on the same descriptor.
+async fn open_regular_file(path: &Path) -> std::io::Result<(tokio::fs::File, std::fs::Metadata)> {
     let mut options = tokio::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
     let file = options.open(path).await?;
-    if !file.metadata().await?.is_file() {
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "only regular files can be served",
         ));
     }
-    Ok(file)
+    Ok((file, metadata))
 }
 
 /// Serve a file, honoring conditional requests, ranges, and compression.
@@ -1239,8 +1287,8 @@ async fn serve_file(
     abs_path: &std::path::Path,
     ctx: &RequestContext<'_>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
-    let file = match open_regular_file(abs_path).await {
-        Ok(file) => file,
+    let (file, metadata) = match open_regular_file(abs_path).await {
+        Ok(pair) => pair,
         Err(e) => {
             return Ok(open_error_response(
                 abs_path,
@@ -1250,19 +1298,6 @@ async fn serve_file(
                 ctx.is_head,
                 ctx.error_503_page,
             ))
-        }
-    };
-
-    let metadata = match file.metadata().await {
-        Ok(metadata) => metadata,
-        Err(e) => {
-            log::warn!("Failed to read metadata for {}: {e}", abs_path.display());
-            ctx.metrics.add_error();
-            return Ok(internal_error_response(
-                ctx.csp,
-                ctx.is_head,
-                ctx.error_503_page,
-            ));
         }
     };
 
@@ -1417,20 +1452,17 @@ async fn open_precompressed_variant(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        let file = match open_regular_file(&canonical_variant).await {
-            Ok(file) => file,
+        let (file, metadata) = match open_regular_file(&canonical_variant).await {
+            Ok(pair) => pair,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        let metadata = file.metadata().await?;
-        if metadata.is_file() {
-            return Ok(Some(PrecompressedVariant {
-                file,
-                metadata,
-                content_encoding,
-                encoding_token: suffix,
-            }));
-        }
+        return Ok(Some(PrecompressedVariant {
+            file,
+            metadata,
+            content_encoding,
+            encoding_token: suffix,
+        }));
     }
 
     Ok(None)
@@ -1763,9 +1795,6 @@ fn parse_range<B>(req: &Request<B>, file_len: u64) -> Option<std::result::Result
 
 // ─── Response builders ───────────────────────────────────────────────────────
 
-/// Apply the full security-header set to a response builder.
-///
-/// Single definition of the security headers.
 /// Mutate a completed response to add transport-dependent security headers.
 ///
 /// Called once per request in [`route`] after the full response is built so
@@ -1778,10 +1807,8 @@ fn parse_range<B>(req: &Request<B>, file_len: u64) -> Option<std::result::Result
 /// | `X-Content-Type-Options`   | always     | `nosniff`                                      |
 /// | `X-Frame-Options`          | always     | `SAMEORIGIN`                                   |
 ///
-/// `X-Content-Type-Options` and `X-Frame-Options` are also added by the lower-level
-/// [`security_headers`] builder helper for most response paths, making them
-/// doubly-inserted on those paths.  `insert` overwrites duplicates, so the net
-/// result is always exactly one copy of each header.
+/// This is the single place the transport-independent headers are inserted;
+/// [`security_headers`] only handles the content-type-dependent CSP header.
 async fn inject_security_headers(
     mut resp: Response<BoxBody>,
     req: &Request<Incoming>,
@@ -1844,6 +1871,8 @@ async fn onion_location_header_value(
         return None;
     }
 
+    // Clone the (short) onion address rather than holding the read guard across
+    // header formatting.
     let onion_address = state.read().await.onion_address.clone()?;
     let path_and_query = req
         .uri()
@@ -1903,19 +1932,17 @@ fn valid_host_port(raw: &str) -> bool {
     raw.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
+/// Apply response headers that depend on the content type at build time.
+///
+/// Only the CSP header is set here; the transport-independent security headers
+/// (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`,
+/// `Permissions-Policy`) are added once by [`inject_security_headers`] after the
+/// response is built, so they are not inserted twice per response.
 fn security_headers(
     mut builder: hyper::http::response::Builder,
     csp: &str,
     content_type: &str,
 ) -> hyper::http::response::Builder {
-    builder = builder
-        .header("X-Content-Type-Options", "nosniff")
-        .header("X-Frame-Options", "SAMEORIGIN")
-        .header("Referrer-Policy", "no-referrer")
-        .header(
-            "Permissions-Policy",
-            "camera=(), microphone=(), geolocation=()",
-        );
     // An empty `csp` string is the sentinel value produced by `CspLevel::Off`
     // (see `CspLevel::as_header_value`).  In that case we must not emit any
     // `Content-Security-Policy` header at all — not even a "safe" default —

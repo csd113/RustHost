@@ -65,19 +65,26 @@ pub fn start(
     metrics: SharedMetrics,
     mut shutdown: watch::Receiver<bool>,
     data_dir: PathBuf,
-) -> Result<tokio::sync::mpsc::Receiver<KeyEvent>> {
+) -> Result<(
+    tokio::sync::mpsc::Receiver<KeyEvent>,
+    Arc<tokio::sync::Notify>,
+)> {
     // crossterm 0.27+ enables Windows VT (Virtual Terminal) processing
     // automatically — no manual call needed.
 
     terminal::enable_raw_mode()
         .map_err(|e| AppError::Console(format!("Failed to enable raw mode: {e}")))?;
+    // Mark raw mode active before any fallible terminal escape so `cleanup`
+    // can always restore the terminal if we bail out below.
+    RAW_MODE_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Err(e) = execute!(stdout(), terminal::EnterAlternateScreen, cursor::Hide) {
+        let _ = execute!(stdout(), cursor::Show);
         let _ = terminal::disable_raw_mode();
+        RAW_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
         return Err(AppError::Console(format!(
             "Failed to enter alternate screen: {e}"
         )));
     }
-    RAW_MODE_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
 
     execute!(
         stdout(),
@@ -89,30 +96,46 @@ pub fn start(
     // ── Key event channel ─────────────────────────────────────────────────────
     let (key_tx, key_rx) = tokio::sync::mpsc::channel::<KeyEvent>(64);
 
+    // Render wake-up: pulsed after a handled key event and on terminal resize
+    // so the screen reflects input immediately instead of waiting for the tick.
+    let render_notify = Arc::new(tokio::sync::Notify::new());
+
     // ── Input task (blocking thread) ──────────────────────────────────────────
-    input::spawn(key_tx, shutdown.clone());
+    input::spawn(key_tx, shutdown.clone(), Arc::clone(&render_notify));
 
     // ── Render task ───────────────────────────────────────────────────────────
     let rate = config.console.refresh_rate_ms;
+    let task_notify = Arc::clone(&render_notify);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(rate));
         let mut last_rendered = String::new();
+        let mut last_size: Option<(u16, u16)> = None;
 
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    if let Err(e) = render(&config, &state, &metrics, &data_dir, &mut last_rendered).await {
-                        log::debug!("Render error: {e}");
-                    }
-                }
+                _ = interval.tick() => {}
+                () = task_notify.notified() => {}
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() { break; }
+                    continue;
                 }
+            }
+            if let Err(e) = render(
+                &config,
+                &state,
+                &metrics,
+                &data_dir,
+                &mut last_rendered,
+                &mut last_size,
+            )
+            .await
+            {
+                log::debug!("Render error: {e}");
             }
         }
     });
 
-    Ok(key_rx)
+    Ok((key_rx, render_notify))
 }
 
 // ─── Render ───────────────────────────────────────────────────────────────────
@@ -123,32 +146,41 @@ async fn render(
     metrics: &SharedMetrics,
     data_dir: &std::path::Path,
     last_rendered: &mut String,
+    last_size: &mut Option<(u16, u16)>,
 ) -> Result<()> {
-    // Acquire the lock ONCE and extract everything needed for this frame.
-    // Previously this function locked twice: once to read `console_mode`, then
-    // a second time inside the Dashboard branch to read the full state snapshot.
-    // The two-lock pattern is a TOCTOU hazard — `console_mode` could change
-    // between the first and second acquire — and also holds the lock for longer
-    // than necessary.
-    let (mode, state_snapshot) = {
-        let s = state.read().await;
-        (s.console_mode.clone(), s.clone())
+    // Format the frame while holding a single read guard, then release it
+    // before any terminal I/O. Cloning the whole `AppState` (including cached
+    // page reports) per frame is wasteful, and holding the lock across stdout
+    // writes would block key handling behind terminal I/O.
+    let output = {
+        let snapshot = state.read().await;
+        match &snapshot.console_mode {
+            ConsoleMode::Dashboard => {
+                let metrics = metrics.snapshot();
+                dashboard::render_dashboard(&snapshot, metrics, config, data_dir)
+            }
+            ConsoleMode::Menu => menu::render(&snapshot.menu, config, &snapshot, data_dir),
+            ConsoleMode::LogView => dashboard::render_log_view(config.console.show_timestamps),
+            ConsoleMode::Help => dashboard::render_help(),
+            ConsoleMode::ConfirmQuit => dashboard::render_confirm_quit(),
+            ConsoleMode::ShuttingDown => dashboard::render_shutdown(config.tor.enabled),
+        }
     };
 
-    let output = match mode {
-        ConsoleMode::Dashboard => {
-            let metrics = metrics.snapshot();
-            dashboard::render_dashboard(&state_snapshot, metrics, config, data_dir)
-        }
-        ConsoleMode::Menu => menu::render(&state_snapshot.menu, config, &state_snapshot, data_dir),
-        ConsoleMode::LogView => dashboard::render_log_view(config.console.show_timestamps),
-        ConsoleMode::Help => dashboard::render_help(),
-        ConsoleMode::ConfirmQuit => dashboard::render_confirm_quit(),
-        ConsoleMode::ShuttingDown => dashboard::render_shutdown(config.tor.enabled),
-    };
+    // A cleanup racing this tick must not write escape sequences over the
+    // restored terminal.
+    if !RAW_MODE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    // Force a repaint when the terminal size changed: the frame string may be
+    // identical, but previously drawn content can be reflowed or stale.
+    let size = terminal::size().ok();
+    let resized = size.is_some() && *last_size != size;
+    *last_size = size;
 
     // Skip terminal I/O when the frame is unchanged to avoid needless redraws.
-    if output == *last_rendered {
+    if !resized && output == *last_rendered {
         return Ok(());
     }
     last_rendered.clone_from(&output);

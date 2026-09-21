@@ -129,6 +129,9 @@ pub async fn run_redirect_server(
                 match result {
                     Ok((mut stream, peer)) => {
                         backoff_ms = 1;
+                        // Match the other listeners: disable Nagle so the small
+                        // redirect response is not delayed by delayed-ACK.
+                        let _ = stream.set_nodelay(true);
                         log::debug!("Redirect connection from {peer}");
                         let peer_ip = peer.ip();
                         let admission = match admit_connection(

@@ -289,16 +289,7 @@ pub(super) async fn maybe_open_browser(config: &Config, state: &SharedState) {
         return;
     }
     let port = state.read().await.actual_port;
-    let url = match config.server.bind {
-        std::net::IpAddr::V4(a) if a.is_unspecified() => {
-            format!("http://127.0.0.1:{port}")
-        }
-        std::net::IpAddr::V6(a) if a.is_unspecified() => {
-            format!("http://[::1]:{port}")
-        }
-        std::net::IpAddr::V6(a) => format!("http://[{a}]:{port}"),
-        std::net::IpAddr::V4(a) => format!("http://{a}:{port}"),
-    };
+    let url = crate::console::ui::local_http_url(config.server.bind, port);
     super::super::open_browser(&url);
 }
 

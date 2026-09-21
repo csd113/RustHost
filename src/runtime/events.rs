@@ -223,35 +223,47 @@ fn handle_menu_open_selected(state: &mut AppState) {
     }
 }
 
-fn initialize_menu_page(
+/// Return the active menu page if it still needs its cached report built.
+fn page_needing_initialization(snapshot: &AppState) -> Option<Page> {
+    let page = snapshot.menu.active_page()?;
+    let needs_report = match page {
+        Page::Doctor => snapshot.menu.doctor().report().is_none(),
+        Page::Diagnostics => snapshot.menu.diagnostics().report().is_none(),
+        Page::Network => snapshot.menu.network().report().is_none(),
+        Page::Site => snapshot.menu.site().report().is_none(),
+        Page::Home | Page::Logs | Page::Tor | Page::Settings | Page::Help => false,
+    };
+    needs_report.then_some(page)
+}
+
+/// Build the cached report for `page`.
+///
+/// These checks perform synchronous filesystem scans and bounded TCP probes, so
+/// callers run this on the blocking pool rather than an async worker.
+fn build_page_initialization(
+    page: Page,
     config: &Config,
     snapshot: &AppState,
     data_dir: &std::path::Path,
     settings_path: Option<&std::path::Path>,
 ) -> Option<PageInitialization> {
-    let page = snapshot.menu.active_page()?;
     match page {
-        Page::Doctor if snapshot.menu.doctor().report().is_none() => {
-            let live = live_doctor_state(snapshot);
-            Some(PageInitialization::Doctor(run_tui_fast_doctor(
-                config,
-                data_dir,
-                settings_path,
-                live,
-            )))
-        }
-        Page::Diagnostics if snapshot.menu.diagnostics().report().is_none() => {
-            Some(PageInitialization::Diagnostics(
-                menu::diagnostics::build_report(config, snapshot, data_dir, settings_path),
-            ))
-        }
-        Page::Network if snapshot.menu.network().report().is_none() => Some(
-            PageInitialization::Network(menu::network::collect_report(config, snapshot, data_dir)),
-        ),
-        Page::Site if snapshot.menu.site().report().is_none() => Some(PageInitialization::Site(
-            menu::site::collect_report(data_dir, config),
+        Page::Doctor => Some(PageInitialization::Doctor(run_tui_fast_doctor(
+            config,
+            data_dir,
+            settings_path,
+            live_doctor_state(snapshot),
+        ))),
+        Page::Diagnostics => Some(PageInitialization::Diagnostics(
+            menu::diagnostics::build_report(config, snapshot, data_dir, settings_path),
         )),
-        _ => None,
+        Page::Network => Some(PageInitialization::Network(menu::network::collect_report(
+            config, snapshot, data_dir,
+        ))),
+        Page::Site => Some(PageInitialization::Site(menu::site::collect_report(
+            data_dir, config,
+        ))),
+        Page::Home | Page::Logs | Page::Tor | Page::Settings | Page::Help => None,
     }
 }
 
@@ -318,22 +330,42 @@ async fn handle_doctor_page_event(
 
     match event {
         KeyEvent::Reload => {
-            let report = run_tui_fast_doctor(config, data_dir, settings_path, live);
+            let config = config.clone();
+            let data_dir = data_dir.to_path_buf();
+            let settings_path = settings_path.map(std::path::Path::to_path_buf);
+            let report = match tokio::task::spawn_blocking(move || {
+                run_tui_fast_doctor(&config, &data_dir, settings_path.as_deref(), live)
+            })
+            .await
+            {
+                Ok(report) => report,
+                Err(e) => {
+                    log::warn!("Doctor report task failed: {e}");
+                    return Some(false);
+                }
+            };
             state.write().await.menu.set_doctor_report(report);
             Some(false)
         }
         KeyEvent::RunDoctorDeep => {
-            let deep = menu::doctor::run_deep_checks(config, data_dir, live);
-            let needs_report = {
-                let snapshot = state.read().await;
-                let needs_report = snapshot.menu.doctor().report().is_none();
-                drop(snapshot);
-                needs_report
-            };
-            let seed_report = if needs_report {
-                Some(run_tui_fast_doctor(config, data_dir, settings_path, live))
-            } else {
-                None
+            let needs_report = state.read().await.menu.doctor().report().is_none();
+            let config = config.clone();
+            let data_dir = data_dir.to_path_buf();
+            let settings_path = settings_path.map(std::path::Path::to_path_buf);
+            let (deep, seed_report) = match tokio::task::spawn_blocking(move || {
+                let deep = menu::doctor::run_deep_checks(&config, &data_dir, live);
+                let seed = needs_report.then(|| {
+                    run_tui_fast_doctor(&config, &data_dir, settings_path.as_deref(), live)
+                });
+                (deep, seed)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    log::warn!("Deep doctor task failed: {e}");
+                    return Some(false);
+                }
             };
             let mut snapshot = state.write().await;
             if let Some(report) = seed_report {
@@ -380,8 +412,25 @@ async fn handle_diagnostics_page_event(
             Some(false)
         }
         KeyEvent::Reload => {
-            let report =
-                menu::diagnostics::build_report(config, &snapshot, data_dir, settings_path);
+            let config = config.clone();
+            let data_dir = data_dir.to_path_buf();
+            let settings_path = settings_path.map(std::path::Path::to_path_buf);
+            let report = match tokio::task::spawn_blocking(move || {
+                menu::diagnostics::build_report(
+                    &config,
+                    &snapshot,
+                    &data_dir,
+                    settings_path.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(report) => report,
+                Err(e) => {
+                    log::warn!("Diagnostics report task failed: {e}");
+                    return Some(false);
+                }
+            };
             let mut snapshot = state.write().await;
             snapshot.menu.set_diagnostics_report(report);
             snapshot
@@ -406,22 +455,32 @@ async fn handle_extra_menu_page_event(
     data_dir: &std::path::Path,
     settings_path: Option<&std::path::Path>,
 ) -> Option<bool> {
-    let snapshot = {
+    let page = {
         let snapshot = state.read().await;
         if snapshot.console_mode != ConsoleMode::Menu {
             return None;
         }
-        snapshot.clone()
+        snapshot.menu.active_page()?
     };
 
-    match snapshot.menu.active_page()? {
+    // Pages handled by the dedicated dispatchers above; do not clone the whole
+    // AppState for them.
+    if matches!(
+        page,
+        Page::Home | Page::Logs | Page::Doctor | Page::Diagnostics
+    ) {
+        return None;
+    }
+
+    let snapshot = state.read().await.clone();
+    match page {
         Page::Tor => {
-            handle_tor_page_event(event, config, state, &snapshot, data_dir, settings_path).await
+            handle_tor_page_event(event, config, state, snapshot, data_dir, settings_path).await
         }
-        Page::Network => handle_network_page_event(event, config, state, &snapshot, data_dir).await,
+        Page::Network => handle_network_page_event(event, config, state, snapshot, data_dir).await,
         Page::Site => handle_site_page_event(event, config, state, data_dir).await,
         Page::Settings => {
-            handle_settings_page_event(event, config, state, &snapshot, data_dir, settings_path)
+            handle_settings_page_event(event, config, state, snapshot, data_dir, settings_path)
                 .await
         }
         Page::Help => handle_help_page_event(event, state).await,
@@ -433,7 +492,7 @@ async fn handle_tor_page_event(
     event: KeyEvent,
     config: &Config,
     state: SharedState,
-    snapshot: &AppState,
+    snapshot: AppState,
     data_dir: &std::path::Path,
     settings_path: Option<&std::path::Path>,
 ) -> Option<bool> {
@@ -455,11 +514,29 @@ async fn handle_tor_page_event(
                 .set_status("Restart Tor: not supported yet");
         }
         TorAction::CopyOnion => {
-            let status = menu::tor::copy_onion_status(snapshot);
+            let status = menu::tor::copy_onion_status(&snapshot);
             state.write().await.menu.tor_mut().set_status(status);
         }
         TorAction::Diagnostics => {
-            let report = menu::diagnostics::build_report(config, snapshot, data_dir, settings_path);
+            let config = config.clone();
+            let data_dir = data_dir.to_path_buf();
+            let settings_path = settings_path.map(std::path::Path::to_path_buf);
+            let report = match tokio::task::spawn_blocking(move || {
+                menu::diagnostics::build_report(
+                    &config,
+                    &snapshot,
+                    &data_dir,
+                    settings_path.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(report) => report,
+                Err(e) => {
+                    log::warn!("Diagnostics report task failed: {e}");
+                    return Some(false);
+                }
+            };
             let mut snapshot = state.write().await;
             snapshot.menu.set_diagnostics_report(report);
             snapshot.menu.open_page(Page::Diagnostics);
@@ -478,13 +555,25 @@ async fn handle_network_page_event(
     event: KeyEvent,
     config: &Config,
     state: SharedState,
-    snapshot: &AppState,
+    snapshot: AppState,
     data_dir: &std::path::Path,
 ) -> Option<bool> {
     if event != KeyEvent::Reload {
         return None;
     }
-    let report = menu::network::collect_report(config, snapshot, data_dir);
+    let config = config.clone();
+    let data_dir = data_dir.to_path_buf();
+    let report = match tokio::task::spawn_blocking(move || {
+        menu::network::collect_report(&config, &snapshot, &data_dir)
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(e) => {
+            log::warn!("Network report task failed: {e}");
+            return Some(false);
+        }
+    };
     state.write().await.menu.set_network_report(report);
     Some(false)
 }
@@ -498,7 +587,18 @@ async fn handle_site_page_event(
     if event != KeyEvent::Reload {
         return None;
     }
-    let report = menu::site::collect_report(data_dir, config);
+    let config = config.clone();
+    let data_dir = data_dir.to_path_buf();
+    let report =
+        match tokio::task::spawn_blocking(move || menu::site::collect_report(&data_dir, &config))
+            .await
+        {
+            Ok(report) => report,
+            Err(e) => {
+                log::warn!("Site report task failed: {e}");
+                return Some(false);
+            }
+        };
     state.write().await.menu.set_site_report(report);
     Some(false)
 }
@@ -507,7 +607,7 @@ async fn handle_settings_page_event(
     event: KeyEvent,
     config: &Config,
     state: SharedState,
-    snapshot: &AppState,
+    snapshot: AppState,
     data_dir: &std::path::Path,
     settings_path: Option<&std::path::Path>,
 ) -> Option<bool> {
@@ -517,15 +617,26 @@ async fn handle_settings_page_event(
     if event != KeyEvent::CopyDiagnostics {
         return None;
     }
-    let mut snapshot_for_write = state.write().await;
-    menu::settings::copy_diagnostics(
-        snapshot_for_write.menu.settings_mut(),
-        config,
-        snapshot,
-        data_dir,
-        settings_path,
-    );
-    drop(snapshot_for_write);
+    let config = config.clone();
+    let data_dir = data_dir.to_path_buf();
+    let settings_path = settings_path.map(std::path::Path::to_path_buf);
+    let report = match tokio::task::spawn_blocking(move || {
+        menu::diagnostics::build_report(&config, &snapshot, &data_dir, settings_path.as_deref())
+    })
+    .await
+    {
+        Ok(report) => report,
+        Err(e) => {
+            log::warn!("Diagnostics report task failed: {e}");
+            return Some(false);
+        }
+    };
+    state
+        .write()
+        .await
+        .menu
+        .settings_mut()
+        .set_diagnostics_text(report.text().to_owned());
     Some(false)
 }
 
@@ -607,31 +718,51 @@ pub async fn handle(
 
         KeyEvent::Open => {
             let port = state.read().await.actual_port;
-            // Use the actual bind address so IPv6-only listeners still open correctly.
-            let url = match config.server.bind {
-                std::net::IpAddr::V4(a) if a.is_unspecified() => {
-                    format!("http://127.0.0.1:{port}")
-                }
-                std::net::IpAddr::V6(a) if a.is_unspecified() => {
-                    format!("http://[::1]:{port}")
-                }
-                std::net::IpAddr::V6(a) => format!("http://[{a}]:{port}"),
-                std::net::IpAddr::V4(a) => format!("http://{a}:{port}"),
-            };
+            // Match the active bind address so IPv6-only listeners still open.
+            let url = crate::console::ui::local_http_url(config.server.bind, port);
             super::open_browser(&url);
         }
         state_event => {
-            let mut snapshot = state.write().await;
-            let quit = handle_console_state(state_event, &mut snapshot);
-            let initialization = if snapshot.console_mode == ConsoleMode::Menu {
-                initialize_menu_page(config, &snapshot, &data_dir, settings_path.as_deref())
-            } else {
-                None
-            };
-            drop(snapshot);
-            if let Some(initialization) = initialization {
+            // Apply the console-mode transition under a short write lock.
+            let quit = {
                 let mut snapshot = state.write().await;
-                apply_page_initialization(&mut snapshot, initialization);
+                handle_console_state(state_event, &mut snapshot)
+            };
+
+            // Opening a menu page may need a report built from synchronous
+            // filesystem/network probes. Decide that under a short read lock,
+            // then build it on the blocking pool — never while holding the
+            // state lock, which would stall rendering and event handling.
+            let pending = {
+                let snapshot = state.read().await;
+                if snapshot.console_mode == ConsoleMode::Menu {
+                    page_needing_initialization(&snapshot).map(|page| (page, snapshot.clone()))
+                } else {
+                    None
+                }
+            };
+
+            if let Some((page, snapshot)) = pending {
+                let config = config.clone();
+                let data_dir = data_dir.clone();
+                let settings_path = settings_path.clone();
+                let initialization = tokio::task::spawn_blocking(move || {
+                    build_page_initialization(
+                        page,
+                        &config,
+                        &snapshot,
+                        &data_dir,
+                        settings_path.as_deref(),
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    crate::AppError::ConfigLoad(format!("page initialization task failed: {e}"))
+                })?;
+                if let Some(initialization) = initialization {
+                    let mut snapshot = state.write().await;
+                    apply_page_initialization(&mut snapshot, initialization);
+                }
             }
             return Ok(quit);
         }

@@ -12,6 +12,7 @@
 //! to produce the `'static` reference required by `log::set_logger`.
 
 use std::{
+    borrow::Cow,
     collections::VecDeque,
     fs::{File, OpenOptions},
     io::Write as _,
@@ -58,15 +59,11 @@ impl std::fmt::Display for AccessRecord<'_> {
         let method = escape_clf_field(self.method);
         let path = escape_clf_field(self.path);
         let protocol = escape_clf_field(self.protocol);
-        let ua = self
-            .user_agent
-            .map_or_else(|| "-".to_owned(), escape_clf_field);
-        let referer = self
-            .referer
-            .map_or_else(|| "-".to_owned(), escape_clf_field);
+        let ua = self.user_agent.map_or(Cow::Borrowed("-"), escape_clf_field);
+        let referer = self.referer.map_or(Cow::Borrowed("-"), escape_clf_field);
         let bytes_sent = self
             .bytes_sent
-            .map_or_else(|| "-".to_owned(), |n| n.to_string());
+            .map_or_else(|| Cow::Borrowed("-"), |n| Cow::Owned(n.to_string()));
         write!(
             f,
             "{} - - [{now}] \"{} {} {}\" {} {} \"{}\" \"{}\"",
@@ -193,18 +190,21 @@ pub fn init_access_log(config: &LoggingConfig, data_dir: &Path) -> Result<()> {
 /// No-op if [`init_access_log`] has not been called.  Thread-safe; acquires
 /// the file mutex for the duration of the write only.
 pub fn log_access(record: &AccessRecord<'_>) {
-    if let Some(log) = ACCESS_LOG.get() {
-        if let Ok(guard) = log.lock() {
-            if let Some(state) = guard.as_ref() {
-                match state
-                    .tx
-                    .try_send(AccessLogCommand::Line(record.to_string()))
-                {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                        let _ = ACCESS_LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+    let Some(log) = ACCESS_LOG.get() else {
+        return;
+    };
+    // Format the line outside the lock: `Display` reads the wall clock and
+    // performs several small allocations. Doing that under a global mutex
+    // would serialize every request thread on formatting work.
+    let line = record.to_string();
+    let Ok(guard) = log.lock() else {
+        return;
+    };
+    if let Some(state) = guard.as_ref() {
+        match state.tx.try_send(AccessLogCommand::Line(line)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                let _ = ACCESS_LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -308,13 +308,7 @@ impl LogFile {
 
         if writeln!(self.file, "{line}").is_ok() {
             // Approximate the new size: line length + newline.
-            // u64::try_from is infallible on 64-bit targets but pedantic requires
-            // an explicit conversion.
-            self.cached_size = self.cached_size.saturating_add(
-                u64::try_from(line.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(1),
-            );
+            self.cached_size = self.cached_size.saturating_add(line_bytes);
         }
     }
 
@@ -431,8 +425,13 @@ fn access_log_worker(rx: Receiver<AccessLogCommand>, mut file: LogFile) {
 }
 
 fn stop_access_log_worker(state: AccessLogState) {
-    let _ = state.tx.send(AccessLogCommand::Shutdown);
-    if state.handle.join().is_err() {
+    let AccessLogState { tx, handle, .. } = state;
+    // Prefer a clean shutdown command, but never block shutdown on a full
+    // queue. Dropping the sender closes the channel, so the worker still
+    // drains its backlog and exits instead of hanging the shutdown path.
+    let _ = tx.try_send(AccessLogCommand::Shutdown);
+    drop(tx);
+    if handle.join().is_err() {
         log::warn!("Access log worker thread panicked during shutdown");
     }
 }
@@ -675,7 +674,15 @@ const fn level_label(level: Level) -> &'static str {
     }
 }
 
-fn escape_clf_field(s: &str) -> String {
+fn escape_clf_field(s: &str) -> Cow<'_, str> {
+    // Most requests carry clean, printable fields; skip the allocation unless
+    // an escape or control character actually needs rewriting.
+    if !s
+        .bytes()
+        .any(|b| b == b'"' || b == b'\\' || b.is_ascii_control())
+    {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -685,7 +692,7 @@ fn escape_clf_field(s: &str) -> String {
             c => out.push(c),
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -826,6 +833,19 @@ mod tests {
         assert!(rendered.contains("\\\\"));
         assert!(!rendered.contains('\n'));
         assert!(!rendered.contains('\r'));
+    }
+
+    #[test]
+    fn escape_clf_field_borrows_clean_input() {
+        // Clean fields must not allocate; fields needing escapes must.
+        assert!(matches!(
+            super::escape_clf_field("GET"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            super::escape_clf_field("a\"b"),
+            std::borrow::Cow::Owned(_)
+        ));
     }
 
     #[test]

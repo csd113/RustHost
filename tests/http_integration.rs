@@ -1522,6 +1522,33 @@ async fn site_root_serves_default_ico_favicon() -> Result<(), Box<dyn std::error
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn favicon_conditional_request_returns_304() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp, site) = make_site(&[("index.html", b"ok")])?;
+    std::fs::write(site.join("favicon.ico"), [0_u8, 0, 1, 0, 1, 0, 16, 16])?;
+
+    let Some(server) = start_server_or_skip(&site).await? else {
+        return Ok(());
+    };
+
+    let first = server
+        .send(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    assert_eq!(status_code(&first)?, 200);
+    let etag = header_value(&first, "etag")?
+        .ok_or("favicon response must include an ETag for conditional requests")?;
+
+    let request =
+        format!("GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\nIf-None-Match: {etag}\r\n\r\n");
+    let second = server.send(request.as_bytes()).await?;
+
+    server.stop().await;
+    let _ = tmp;
+
+    assert_eq!(status_code(&second)?, 304);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn missing_favicon_returns_404() -> Result<(), Box<dyn std::error::Error>> {
     let (tmp, site) = make_site(&[("index.html", b"ok")])?;
     let Some(server) = start_server_or_skip(&site).await? else {
