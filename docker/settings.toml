@@ -11,3 +11,9 @@ enabled = true
 
 [console]
 interactive = false
+
+[logging]
+enabled = true
+
+[identity]
+instance_name = "RustHost"
