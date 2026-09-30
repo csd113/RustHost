@@ -1,6 +1,6 @@
 //! Shared version/build helpers.
 
-const FALLBACK_VERSION: &str = "1.0.0";
+const FALLBACK_VERSION: &str = "1.1.0";
 const UNKNOWN_BUILD_METADATA: &str = "unknown";
 
 #[must_use]

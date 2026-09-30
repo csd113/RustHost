@@ -155,7 +155,7 @@ mod tests {
         let report = build_report(&Config::default(), &state, tmp.path(), None);
         let text = report.text();
 
-        assert!(text.contains("RustHost 1.0.0"));
+        assert!(text.contains(&format!("RustHost {}", env!("CARGO_PKG_VERSION"))));
         assert!(text.contains("Mode: interactive"));
         assert!(text.contains("HTTP: 127.0.0.1:8080"));
         assert!(text.contains("HTTPS: disabled"));

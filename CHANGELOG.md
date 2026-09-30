@@ -22,6 +22,7 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Made the diagnostics version assertion follow the package version and refreshed the fallback version for this release.
 - Included Windows build/runtime compatibility fixes and the accumulated startup, shutdown, TLS identity persistence, and diagnostics improvements since v1.0.0.
 
 ### Validation
