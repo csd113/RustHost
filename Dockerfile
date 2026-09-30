@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 rusthost \
     && useradd --uid 10001 --gid rusthost --no-create-home rusthost \
-    && install -d -m 0700 -o rusthost -g rusthost /data
+    && install -d -m 0700 -o rusthost -g rusthost /data /data/site
 COPY --from=builder /build/target/release/rusthost-cli /usr/local/bin/rusthost-cli
 COPY --chown=10001:10001 docker/settings.toml /data/settings.toml
 USER 10001:10001
