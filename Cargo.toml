@@ -1,6 +1,6 @@
 [package]
 name = "rusthost"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 # Arti 0.46 and its Tor crates require Rust 1.91.
 rust-version = "1.91"
@@ -50,7 +50,7 @@ tokio-util   = { version = "0.7",  features = ["compat", "io"] }  # futures-io â
 rustls       = { version = "0.23", features = ["ring"] }    # rustls TLS implementation
 rustls-acme  = { version = "0.15", default-features = false, features = ["tokio", "ring"] } # ACME / Let's Encrypt automation
 webpki-roots = "1.0"                                         # Mozilla root store for ACME client TLS
-rcgen        = "0.14.9"                                      # self-signed dev cert generation
+rcgen        = "0.14.10"                                      # self-signed dev cert generation
 
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -86,7 +86,7 @@ sha3          = "0.12"
 data-encoding = "2"
 thiserror     = "2"
 serde         = { version = "1",   features = ["derive"] }
-toml          = "1.1.4"
+toml          = "1.1.6"
 log           = "0.4"
 crossterm     = "0.29"
 chrono        = { version = "0.4", features = ["clock"] }

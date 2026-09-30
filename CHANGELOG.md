@@ -7,6 +7,29 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.1.0] — 2026-09-29
+
+### Added
+
+- Automatic GHCR Docker images for Linux AMD64 and ARM64, with release and main-branch tags, native builds, readiness smoke tests, SBOMs, and build provenance.
+- A multi-stage Dockerfile with a non-root runtime, persistent `/data` volume, container-ready settings, and readiness health check; documented deployment and volume permissions.
+
+### Changed
+
+- Upgraded the bundled Arti/Tor stack from the last release's 0.42 to the newest published 0.46.0; retained Rust 1.91 as the minimum supported toolchain.
+- Refreshed all direct dependency requirements and the lockfile to the newest resolvable stable releases, including rcgen 0.14.10, toml 1.1.6, and 23 transitive updates. SQLite remains on rusqlite 0.39 because Arti 0.46 requires `<0.40` and Cargo permits only one SQLite native-library version.
+- Included the accumulated application refactoring and robustness improvements since v1.0.0: atomic state publication, consistent site-generation reloads, bounded scans and visitor tracking, and explicit transfer deadlines.
+
+### Fixed
+
+- Included Windows build/runtime compatibility fixes and the accumulated startup, shutdown, TLS identity persistence, and diagnostics improvements since v1.0.0.
+
+### Validation
+
+- Enforced formatting, workspace tests, and strict Clippy across all targets/features with warnings, all, pedantic, nursery, and cargo lint groups denied.
+
+---
+
 ## [v1.0.0]
 
 ### Added

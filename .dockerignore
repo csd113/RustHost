@@ -1,0 +1,8 @@
+*
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src/
+!src/**
+!docker/
+!docker/settings.toml

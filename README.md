@@ -6,7 +6,7 @@
 [![Dependency Audit](https://github.com/csd113/RustHost/actions/workflows/audit.yml/badge.svg)](https://github.com/csd113/RustHost/actions/workflows/audit.yml)
 [![License: MIT](https://img.shields.io/github/license/csd113/RustHost)](LICENSE)
 [![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-v1.0.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v1.1.0-blue)](CHANGELOG.md)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-3b82f6)](.github/workflows/ci.yml)
 
 RustHost is a production-focused static file server written in Rust. Drop in a directory, configure `settings.toml`, and get HTTP, optional HTTPS (self-signed, manual, or ACME), and an in-process Tor onion service — all from one binary.
@@ -90,6 +90,23 @@ Tagged releases ship as platform-specific ZIP archives containing the `rusthost-
 | `aarch64-unknown-linux-gnu` | Linux ARM64 |
 | `aarch64-apple-darwin` | macOS Apple Silicon |
 | `x86_64-pc-windows-msvc` | Windows x86_64 |
+
+### Docker images
+
+Images are published automatically to `ghcr.io/csd113/rusthost` for Linux AMD64 and ARM64. Release tags publish `1.1.0`, `1.1`, and `latest`; main builds publish `edge`. Pull requests build and smoke-test both architectures without publishing.
+
+```bash
+docker run -d --name rusthost --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -v rusthost-data:/data \
+  ghcr.io/csd113/rusthost:1.1.0
+```
+
+Open `http://127.0.0.1:8080`. The named volume retains `settings.toml`, `site/`, and `runtime/`, including the Tor identity, across upgrades. Container defaults bind to `0.0.0.0:8080` internally, enable Tor, and run headlessly as UID/GID `10001`. The host port above is restricted to loopback; choose a public binding deliberately.
+
+Edit `/data/settings.toml` and populate `/data/site` in the volume, then restart for configuration changes. Bind mounts must already be writable by UID/GID `10001` and include a settings file with `server.bind = "0.0.0.0"`; empty bind mounts hide the image's default settings. HTTPS requires configuration and an additional port mapping. The image health check targets HTTP `/ready` on port 8080; override it if you change the listener or enable redirects.
+
+To build locally: `docker build -t rusthost:local .`.
 
 ---
 
