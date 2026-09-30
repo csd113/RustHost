@@ -20,7 +20,6 @@ mod pathing;
 
 use std::{
     fs::OpenOptions,
-    future::Future as _,
     io::Cursor,
     io::Write as _,
     path::{Path, PathBuf},
@@ -38,7 +37,6 @@ use httpdate::{fmt_http_date, parse_http_date};
 use hyper::{body::Incoming, header, Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
-use tokio::time::{Instant, Sleep};
 use tokio_util::io::ReaderStream;
 
 use super::{fallback, mime};
@@ -62,7 +60,9 @@ const MAX_REQUEST_BUFFER_BYTES: usize = 16 * 1024;
 const MAX_CUSTOM_ERROR_PAGE_BYTES: u64 = 64 * 1024;
 const IDENTITY_STREAM_CHUNK_BYTES: usize = 128 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
-const KEEP_ALIVE_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const REJECTED_HEADER_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_REJECTED_HEADER_DRAIN_BYTES: usize = 64 * 1024;
+
 static READINESS_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn full_body(data: impl Into<Bytes>) -> BoxBody {
     Full::new(data.into()).map_err(|e| match e {}).boxed()
@@ -119,15 +119,12 @@ pub(crate) enum RequestIngress {
 #[derive(Clone)]
 pub(crate) struct HandlerConfig {
     pub(crate) peer_addr: std::net::SocketAddr,
-    pub(crate) canonical_root: Arc<Path>,
-    pub(crate) favicon: Arc<FaviconConfig>,
+    pub(crate) site_watch: tokio::sync::watch::Receiver<Arc<super::SiteSnapshot>>,
     pub(crate) index_file: Arc<str>,
     pub(crate) flags: FeatureFlags,
     pub(crate) state: SharedState,
     pub(crate) readiness: ReadinessConfig,
     pub(crate) csp: Arc<str>,
-    pub(crate) error_404_page: Option<Arc<CustomErrorPage>>,
-    pub(crate) error_503_page: Option<Arc<CustomErrorPage>>,
     pub(crate) redirects: Arc<Vec<crate::config::RedirectRule>>,
     pub(crate) trusted_proxies: Arc<Vec<std::net::IpAddr>>,
     pub(crate) ingress: RequestIngress,
@@ -222,7 +219,7 @@ pub(crate) fn load_custom_error_page(
         }
     };
 
-    if metadata.len() > MAX_CUSTOM_ERROR_PAGE_BYTES {
+    if !metadata.is_file() || metadata.len() > MAX_CUSTOM_ERROR_PAGE_BYTES {
         log::warn!(
             "Ignoring [site] {label} path {} because it exceeds the {} byte limit",
             resolved.display(),
@@ -231,7 +228,7 @@ pub(crate) fn load_custom_error_page(
         return None;
     }
 
-    match std::fs::read(&resolved) {
+    match crate::persistence::read_bounded(&resolved, MAX_CUSTOM_ERROR_PAGE_BYTES) {
         Ok(body) => Some(Arc::new(CustomErrorPage {
             status,
             body: Bytes::from(body),
@@ -263,33 +260,27 @@ pub(crate) async fn handle<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let idle_timeout = if config.ingress == RequestIngress::Tor {
+        crate::io_timeout::TRANSFER_IDLE
+    } else {
+        Duration::from_secs(5)
+    };
     let peer_addr = config.peer_addr;
-    let mut stream = stream;
+    let progress = Arc::new(AtomicU64::new(0));
+    let mut stream = crate::io_timeout::ProgressStream::new(
+        stream,
+        Arc::clone(&progress),
+        crate::io_timeout::TRANSFER_IDLE,
+    );
     let Some(prefetched) = preflight_initial_headers(&mut stream, peer_addr).await? else {
         return Ok(());
     };
-    let cfg = Arc::new(RouteConfig {
-        canonical_root: config.canonical_root,
-        favicon: config.favicon,
-        index_file: config.index_file,
-        csp: config.csp,
-        flags: config.flags,
-        state: config.state,
-        readiness: config.readiness,
-        error_404_page: config.error_404_page,
-        error_503_page: config.error_503_page,
-        redirects: config.redirects,
-        peer_addr: config.peer_addr,
-        trusted_proxies: config.trusted_proxies,
-        ingress: config.ingress,
-    });
+    let cfg = Arc::new(config);
 
-    let io = TokioIo::new(IdleTimeoutStream::new(
-        PrefixedStream::new(prefetched, stream),
-        KEEP_ALIVE_IDLE_TIMEOUT,
-    ));
+    let io = TokioIo::new(PrefixedStream::new(prefetched, stream));
 
-    let result = hyper::server::conn::http1::Builder::new()
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    let connection = builder
         .keep_alive(cfg.flags.keep_alive)
         .header_read_timeout(HEADER_READ_TIMEOUT)
         .timer(TokioTimer::new())
@@ -297,12 +288,17 @@ where
         .serve_connection(
             io,
             hyper::service::service_fn(move |req| {
-                let cfg = Arc::clone(&cfg);
+                let cfg = RouteConfig::for_request(&cfg);
                 let met = Arc::clone(&metrics);
                 async move { route(req, &cfg, &met).await }
             }),
-        )
-        .await;
+        );
+    let result = tokio::time::timeout(
+        crate::io_timeout::MAX_CONNECTION_AGE,
+        crate::io_timeout::with_idle_timeout(connection, progress, idle_timeout),
+    )
+    .await
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))??;
 
     match result {
         Ok(()) => Ok(()),
@@ -343,16 +339,22 @@ where
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = self.as_mut().get_mut();
-        let prefix = this.prefix.get_ref();
-        let pos = usize::try_from(this.prefix.position()).unwrap_or(prefix.len());
+        let prefix_len = this.prefix.get_ref().len();
+        let pos = usize::try_from(this.prefix.position()).unwrap_or(prefix_len);
 
-        if pos < prefix.len() {
-            let remaining = &prefix[pos..];
+        if pos < prefix_len {
+            let remaining = &this.prefix.get_ref()[pos..];
             let to_copy = remaining.len().min(buf.remaining());
             buf.put_slice(&remaining[..to_copy]);
             this.prefix
                 .set_position(u64::try_from(pos.saturating_add(to_copy)).unwrap_or(u64::MAX));
             return std::task::Poll::Ready(Ok(()));
+        }
+
+        // Prefix fully consumed: release the up-to-16 KB pre-read buffer so it
+        // is not pinned for the lifetime of a keep-alive connection.
+        if prefix_len != 0 {
+            this.prefix = Cursor::new(Vec::new());
         }
 
         std::pin::Pin::new(&mut this.inner).poll_read(cx, buf)
@@ -383,86 +385,6 @@ where
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.as_mut().get_mut().inner).poll_shutdown(cx)
-    }
-}
-
-struct IdleTimeoutStream<S> {
-    inner: S,
-    timeout: Duration,
-    read_deadline: std::pin::Pin<Box<Sleep>>,
-}
-
-impl<S> IdleTimeoutStream<S> {
-    fn new(inner: S, timeout: Duration) -> Self {
-        Self {
-            inner,
-            timeout,
-            read_deadline: Box::pin(tokio::time::sleep(timeout)),
-        }
-    }
-
-    fn reset_deadline(&mut self) {
-        self.read_deadline
-            .as_mut()
-            .reset(Instant::now() + self.timeout);
-    }
-}
-
-impl<S> AsyncRead for IdleTimeoutStream<S>
-where
-    S: AsyncRead + Unpin,
-{
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let before = buf.filled().len();
-        match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
-            std::task::Poll::Ready(Ok(())) => {
-                if buf.filled().len() > before {
-                    self.reset_deadline();
-                }
-                std::task::Poll::Ready(Ok(()))
-            }
-            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
-            std::task::Poll::Pending => {
-                if self.read_deadline.as_mut().poll(cx).is_ready() {
-                    return std::task::Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "connection idle timeout",
-                    )));
-                }
-                std::task::Poll::Pending
-            }
-        }
-    }
-}
-
-impl<S> AsyncWrite for IdleTimeoutStream<S>
-where
-    S: AsyncWrite + Unpin,
-{
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -532,9 +454,47 @@ where
                 "Request Header Fields Too Large",
             )
             .await?;
+            drain_rejected_headers(stream, &buffered).await;
             return Ok(None);
         }
     }
+}
+
+/// Briefly consume the rest of a rejected header block after sending the 431.
+///
+/// Closing a Winsock connection with unread inbound bytes produces a TCP reset,
+/// which can discard the response before the client observes it. The strict
+/// time and byte bounds keep this best-effort drain from becoming a slow-client
+/// resource sink.
+async fn drain_rejected_headers<S>(stream: &mut S, buffered: &[u8])
+where
+    S: AsyncRead + Unpin,
+{
+    let tail_start = buffered.len().saturating_sub(3);
+    let mut scan = buffered[tail_start..].to_vec();
+    let mut staging = [0_u8; 4096];
+    let mut drained = 0_usize;
+
+    let drain = async {
+        while drained < MAX_REJECTED_HEADER_DRAIN_BYTES {
+            let remaining = MAX_REJECTED_HEADER_DRAIN_BYTES.saturating_sub(drained);
+            let read_len = remaining.min(staging.len());
+            let n = match stream.read(&mut staging[..read_len]).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            drained = drained.saturating_add(n);
+            scan.extend_from_slice(&staging[..n]);
+            if find_header_end(&scan).is_some() {
+                break;
+            }
+            if scan.len() > 3 {
+                scan.drain(..scan.len() - 3);
+            }
+        }
+    };
+
+    let _ = tokio::time::timeout(REJECTED_HEADER_DRAIN_TIMEOUT, drain).await;
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -582,22 +542,16 @@ struct FileResponseContext<'a> {
 
 // ─── Router ──────────────────────────────────────────────────────────────────
 
-/// Configuration that every request handler needs but that doesn't change
-/// between requests on the same connection.
-///
-/// Passed into [`route`] by value so each `service_fn` closure captures one
-/// `Arc<RouteConfig>` rather than many individual `Arc<str>` / `bool` fields.
+/// Immutable configuration for one request. A single site snapshot is selected
+/// before any await; a subsequent keep-alive request can use a new generation.
 #[derive(Clone)]
 struct RouteConfig {
-    canonical_root: Arc<Path>,
-    favicon: Arc<FaviconConfig>,
+    site: Arc<super::SiteSnapshot>,
     index_file: Arc<str>,
     csp: Arc<str>,
     flags: FeatureFlags,
     state: SharedState,
     readiness: ReadinessConfig,
-    error_404_page: Option<Arc<CustomErrorPage>>,
-    error_503_page: Option<Arc<CustomErrorPage>>,
     /// Operator redirect or rewrite rules checked before filesystem resolution.
     redirects: Arc<Vec<crate::config::RedirectRule>>,
     /// Real socket address of the accepted TCP connection.
@@ -609,6 +563,23 @@ struct RouteConfig {
     trusted_proxies: Arc<Vec<std::net::IpAddr>>,
     /// Listener path that accepted this request.
     ingress: RequestIngress,
+}
+
+impl RouteConfig {
+    fn for_request(config: &HandlerConfig) -> Self {
+        Self {
+            site: Arc::clone(&config.site_watch.borrow()),
+            index_file: Arc::clone(&config.index_file),
+            csp: Arc::clone(&config.csp),
+            flags: config.flags,
+            state: Arc::clone(&config.state),
+            readiness: config.readiness.clone(),
+            redirects: Arc::clone(&config.redirects),
+            peer_addr: config.peer_addr,
+            trusted_proxies: Arc::clone(&config.trusted_proxies),
+            ingress: config.ingress,
+        }
+    }
 }
 
 #[expect(
@@ -635,14 +606,9 @@ async fn route(
         );
     }
 
-    record_unique_visitor(
-        &req,
-        cfg.peer_addr,
-        &cfg.trusted_proxies,
-        cfg.ingress,
-        metrics,
-    );
-
+    // Count unique visitors for real site traffic only. Operational probes
+    // (`/health`, `/ready`) are infrastructure traffic, not visitors, and
+    // skipping them keeps the per-request visitor lock off the probe path.
     if let Some(endpoint) = OperationalEndpoint::from_path(req.uri().path()) {
         let resp = route_operational_endpoint(&req, cfg, metrics, endpoint).await?;
         log_request(
@@ -656,6 +622,14 @@ async fn route(
             inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await,
         );
     }
+
+    record_unique_visitor(
+        &req,
+        cfg.peer_addr,
+        &cfg.trusted_proxies,
+        cfg.ingress,
+        metrics,
+    );
 
     match req.method() {
         &Method::OPTIONS => {
@@ -727,10 +701,22 @@ async fn route(
         }
     }
 
-    match resolve_favicon_request(&decoded, &cfg.favicon) {
+    // Favicon resolution touches the filesystem. Run it on the blocking pool,
+    // but only for favicon paths so ordinary requests pay no extra hop.
+    let favicon_resolution = if requested_favicon_kind(&decoded).is_some() {
+        let favicon = Arc::clone(&cfg.site.favicon);
+        let decoded_for_favicon = decoded.clone();
+        tokio::task::spawn_blocking(move || resolve_favicon_request(&decoded_for_favicon, &favicon))
+            .await
+            .map_err(|e| std::io::Error::other(format!("favicon resolution task panicked: {e}")))?
+    } else {
+        FaviconResolution::NotFavicon
+    };
+
+    match favicon_resolution {
         FaviconResolution::File(abs_path) => {
             metrics.add_request();
-            let resp = serve_favicon(&abs_path, is_head, &cfg.csp, &decoded).await?;
+            let resp = serve_favicon(&abs_path, &req, is_head, &cfg.csp, &decoded).await?;
             log_request(
                 &req,
                 resp.status().as_u16(),
@@ -788,10 +774,10 @@ async fn route(
         FaviconResolution::NotFavicon => {}
     }
 
-    let canonical_root = Arc::clone(&cfg.canonical_root);
+    let canonical_root = Arc::clone(&cfg.site.canonical_root);
     let index_file = Arc::clone(&cfg.index_file);
     let decoded_for_resolve = decoded.clone();
-    let error_404_page = cfg.error_404_page.clone();
+    let error_404_page = cfg.site.error_404_page.clone();
     let dir_listing = cfg.flags.dir_listing;
     let expose_dotfiles = cfg.flags.expose_dotfiles;
     let spa_routing = cfg.flags.spa_routing;
@@ -817,11 +803,11 @@ async fn route(
             req: &req,
             is_head,
             metrics,
-            canonical_root: cfg.canonical_root.as_ref(),
+            canonical_root: cfg.site.canonical_root.as_ref(),
             csp: &cfg.csp,
             decoded: &decoded,
             expose_dotfiles: cfg.flags.expose_dotfiles,
-            error_503_page: cfg.error_503_page.as_deref(),
+            error_503_page: cfg.site.error_503_page.as_deref(),
         },
     )
     .await?;
@@ -880,7 +866,7 @@ async fn route_operational_endpoint(
         }
         OperationalEndpoint::Ready => {
             let readiness = cfg.readiness.clone();
-            let canonical_root = Arc::clone(&cfg.canonical_root);
+            let canonical_root = Arc::clone(&cfg.site.canonical_root);
             let runtime_ready = cfg.state.read().await.runtime_ready;
             let status = tokio::task::spawn_blocking(move || {
                 readiness_status(runtime_ready, canonical_root.as_ref(), &readiness)
@@ -1026,7 +1012,11 @@ async fn dispatch_resolved(
             ctx.metrics.add_request();
             text_response(StatusCode::NOT_FOUND, "Not Found", ctx.csp, "")
         }
-        Resolved::Redirect(location) => {
+        Resolved::Redirect(mut location) => {
+            if let Some(query) = ctx.req.uri().query() {
+                location.push('?');
+                location.push_str(query);
+            }
             let safe = sanitize_header_value(&location);
             ctx.metrics.add_request();
             redirect_response(&safe, ctx.csp)
@@ -1216,31 +1206,77 @@ fn resolve_favicon_candidate(
 
 async fn serve_favicon(
     abs_path: &Path,
+    req: &Request<Incoming>,
     is_head: bool,
     csp: &str,
     url_path: &str,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
-    let body_bytes = tokio::fs::read(abs_path).await?;
+    let (file, metadata) = open_regular_file(abs_path).await?;
+    let length = metadata.len();
     let extension = abs_path
         .extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("");
     let content_type = mime::for_extension(extension);
+    let cache_control = cache_control_for(content_type, url_path);
+    let etag = weak_etag(&metadata);
+    let last_modified = last_modified_header(&metadata);
+
+    // Favicons are re-requested on nearly every page load; honour conditional
+    // requests so a cached copy is revalidated with a cheap 304.
+    if selected_representation_not_modified(req, &etag, &metadata) {
+        let mut builder = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header("ETag", &etag)
+            .header("Cache-Control", cache_control);
+        if let Some(last_modified) = last_modified.as_deref() {
+            builder = builder.header(header::LAST_MODIFIED, last_modified);
+        }
+        builder = security_headers(builder, csp, content_type);
+        return Ok(builder.body(empty_body()).unwrap_or_default());
+    }
+
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, body_bytes.len())
-        .header("Cache-Control", cache_control_for(content_type, url_path));
+        .header(header::CONTENT_LENGTH, length)
+        .header("Cache-Control", cache_control)
+        .header("ETag", &etag);
+    if let Some(last_modified) = last_modified.as_deref() {
+        builder = builder.header(header::LAST_MODIFIED, last_modified);
+    }
     builder = security_headers(builder, csp, content_type);
     let body = if is_head {
         empty_body()
     } else {
-        full_body(body_bytes)
+        identity_reader_body(file.take(length))
     };
     finalize_response(builder, body, "favicon response")
 }
 
 // ─── File serving ─────────────────────────────────────────────────────────────
+
+/// Open only regular files. On Unix, `O_NONBLOCK` prevents a FIFO replacement
+/// from pinning a filesystem worker; `O_NOFOLLOW` rejects a replaced leaf symlink.
+/// Ancestor-directory replacement still requires platform-specific containment.
+///
+/// Returns the open handle together with its metadata so callers do not need a
+/// second (blocking-pool) `fstat` on the same descriptor.
+async fn open_regular_file(path: &Path) -> std::io::Result<(tokio::fs::File, std::fs::Metadata)> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    let file = options.open(path).await?;
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "only regular files can be served",
+        ));
+    }
+    Ok((file, metadata))
+}
 
 /// Serve a file, honoring conditional requests, ranges, and compression.
 #[expect(
@@ -1251,8 +1287,8 @@ async fn serve_file(
     abs_path: &std::path::Path,
     ctx: &RequestContext<'_>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
-    let file = match tokio::fs::File::open(abs_path).await {
-        Ok(file) => file,
+    let (file, metadata) = match open_regular_file(abs_path).await {
+        Ok(pair) => pair,
         Err(e) => {
             return Ok(open_error_response(
                 abs_path,
@@ -1262,19 +1298,6 @@ async fn serve_file(
                 ctx.is_head,
                 ctx.error_503_page,
             ))
-        }
-    };
-
-    let metadata = match file.metadata().await {
-        Ok(metadata) => metadata,
-        Err(e) => {
-            log::warn!("Failed to read metadata for {}: {e}", abs_path.display());
-            ctx.metrics.add_error();
-            return Ok(internal_error_response(
-                ctx.csp,
-                ctx.is_head,
-                ctx.error_503_page,
-            ));
         }
     };
 
@@ -1303,7 +1326,7 @@ async fn serve_file(
     )
     .await?
     {
-        let etag = strong_variant_etag(&sidecar.metadata, sidecar.encoding_token);
+        let etag = weak_variant_etag(&sidecar.metadata, sidecar.encoding_token);
         let last_modified = last_modified_header(&sidecar.metadata);
         if selected_representation_not_modified(ctx.req, &etag, &sidecar.metadata) {
             ctx.metrics.add_request();
@@ -1403,7 +1426,7 @@ async fn open_precompressed_variant(
     }
 
     let candidates: &[(&str, &str)] = match preferred {
-        Encoding::Brotli => &[("br", "br"), ("gz", "gzip")],
+        Encoding::Brotli => &[("br", "br")],
         Encoding::Gzip => &[("gz", "gzip")],
         Encoding::Identity => &[],
     };
@@ -1429,20 +1452,17 @@ async fn open_precompressed_variant(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        let file = match tokio::fs::File::open(&canonical_variant).await {
-            Ok(file) => file,
+        let (file, metadata) = match open_regular_file(&canonical_variant).await {
+            Ok(pair) => pair,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        let metadata = file.metadata().await?;
-        if metadata.is_file() {
-            return Ok(Some(PrecompressedVariant {
-                file,
-                metadata,
-                content_encoding,
-                encoding_token: suffix,
-            }));
-        }
+        return Ok(Some(PrecompressedVariant {
+            file,
+            metadata,
+            content_encoding,
+            encoding_token: suffix,
+        }));
     }
 
     Ok(None)
@@ -1472,6 +1492,7 @@ async fn build_range_response(
         )
         .header("Accept-Ranges", "bytes")
         .header("ETag", ctx.etag)
+        .header(header::VARY, "Accept-Encoding")
         .header(
             "Cache-Control",
             cache_control_for(ctx.content_type, ctx.path_str),
@@ -1503,6 +1524,7 @@ fn build_full_response(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ctx.content_type)
         .header("ETag", ctx.etag)
+        .header(header::VARY, "Accept-Encoding")
         .header(
             "Cache-Control",
             cache_control_for(ctx.content_type, ctx.path_str),
@@ -1515,9 +1537,7 @@ fn build_full_response(
     }
     builder = security_headers(builder, ctx.csp, ctx.content_type);
     if let Some(enc) = content_encoding {
-        builder = builder
-            .header("Content-Encoding", enc)
-            .header("Vary", "Accept-Encoding");
+        builder = builder.header("Content-Encoding", enc);
     } else {
         builder = builder.header(header::CONTENT_LENGTH, file_len);
     }
@@ -1540,9 +1560,9 @@ fn build_precompressed_response(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ctx.content_type)
         .header(header::CONTENT_ENCODING, variant.content_encoding)
-        .header(header::VARY, "Accept-Encoding")
         .header(header::CONTENT_LENGTH, content_length)
         .header("ETag", ctx.etag)
+        .header(header::VARY, "Accept-Encoding")
         .header(
             "Cache-Control",
             cache_control_for(ctx.content_type, ctx.path_str),
@@ -1597,7 +1617,7 @@ fn finalize_response(
 
 /// Compute a weak `ETag` from file metadata without reading file content.
 ///
-/// Format: `W/"<mtime_secs>-<size>"`.
+/// Format: `W/"<mtime_nanos>-<size>"`.
 /// Weak because mtime resolution means two different writes can share a value
 /// on some filesystems.  Sufficient for conditional `GET` — prevents unnecessary
 /// full transfers on subsequent page loads.
@@ -1607,18 +1627,18 @@ fn weak_etag(metadata: &std::fs::Metadata) -> String {
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs());
+        .map_or(0, |d| d.as_nanos());
     format!("W/\"{}-{}\"", mtime, metadata.len())
 }
 
-fn strong_variant_etag(metadata: &std::fs::Metadata, suffix: &str) -> String {
+fn weak_variant_etag(metadata: &std::fs::Metadata, suffix: &str) -> String {
     use std::time::UNIX_EPOCH;
     let mtime = metadata
         .modified()
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs());
-    format!("\"{}-{}-{suffix}\"", mtime, metadata.len())
+        .map_or(0, |d| d.as_nanos());
+    format!("W/\"{}-{}-{suffix}\"", mtime, metadata.len())
 }
 
 fn last_modified_header(metadata: &std::fs::Metadata) -> Option<String> {
@@ -1694,7 +1714,8 @@ fn not_modified_response(
     let mut builder = Response::builder()
         .status(StatusCode::NOT_MODIFIED)
         .header("ETag", etag)
-        .header("Cache-Control", cache_control_for(content_type, path_str));
+        .header("Cache-Control", cache_control_for(content_type, path_str))
+        .header(header::VARY, "Accept-Encoding");
     if let Some(last_modified) = last_modified {
         builder = builder.header(header::LAST_MODIFIED, last_modified);
     }
@@ -1735,6 +1756,12 @@ struct ByteRange {
 /// - `Some(Ok(range))` — valid single range.
 /// - `Some(Err(()))` — invalid / out-of-bounds / multi-range; respond with 416.
 fn parse_range<B>(req: &Request<B>, file_len: u64) -> Option<std::result::Result<ByteRange, ()>> {
+    // Metadata-derived validators are weak: we cannot safely establish that
+    // a resumed download still has identical bytes. Ignore conditional ranges
+    // and send the complete representation, which HTTP explicitly permits.
+    if req.method() != Method::GET || req.headers().contains_key(header::IF_RANGE) {
+        return None;
+    }
     let raw = req.headers().get(header::RANGE)?.to_str().ok()?;
     let bytes = raw.strip_prefix("bytes=")?;
 
@@ -1755,7 +1782,7 @@ fn parse_range<B>(req: &Request<B>, file_len: u64) -> Option<std::result::Result
         let end = if end_str.is_empty() {
             file_len.saturating_sub(1)
         } else {
-            end_str.parse().ok()?
+            end_str.parse::<u64>().ok()?.min(file_len.saturating_sub(1))
         };
         (start, end)
     };
@@ -1768,9 +1795,6 @@ fn parse_range<B>(req: &Request<B>, file_len: u64) -> Option<std::result::Result
 
 // ─── Response builders ───────────────────────────────────────────────────────
 
-/// Apply the full security-header set to a response builder.
-///
-/// Single definition of the security headers.
 /// Mutate a completed response to add transport-dependent security headers.
 ///
 /// Called once per request in [`route`] after the full response is built so
@@ -1783,10 +1807,8 @@ fn parse_range<B>(req: &Request<B>, file_len: u64) -> Option<std::result::Result
 /// | `X-Content-Type-Options`   | always     | `nosniff`                                      |
 /// | `X-Frame-Options`          | always     | `SAMEORIGIN`                                   |
 ///
-/// `X-Content-Type-Options` and `X-Frame-Options` are also added by the lower-level
-/// [`security_headers`] builder helper for most response paths, making them
-/// doubly-inserted on those paths.  `insert` overwrites duplicates, so the net
-/// result is always exactly one copy of each header.
+/// This is the single place the transport-independent headers are inserted;
+/// [`security_headers`] only handles the content-type-dependent CSP header.
 async fn inject_security_headers(
     mut resp: Response<BoxBody>,
     req: &Request<Incoming>,
@@ -1849,6 +1871,8 @@ async fn onion_location_header_value(
         return None;
     }
 
+    // Clone the (short) onion address rather than holding the read guard across
+    // header formatting.
     let onion_address = state.read().await.onion_address.clone()?;
     let path_and_query = req
         .uri()
@@ -1908,19 +1932,17 @@ fn valid_host_port(raw: &str) -> bool {
     raw.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
+/// Apply response headers that depend on the content type at build time.
+///
+/// Only the CSP header is set here; the transport-independent security headers
+/// (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`,
+/// `Permissions-Policy`) are added once by [`inject_security_headers`] after the
+/// response is built, so they are not inserted twice per response.
 fn security_headers(
     mut builder: hyper::http::response::Builder,
     csp: &str,
     content_type: &str,
 ) -> hyper::http::response::Builder {
-    builder = builder
-        .header("X-Content-Type-Options", "nosniff")
-        .header("X-Frame-Options", "SAMEORIGIN")
-        .header("Referrer-Policy", "no-referrer")
-        .header(
-            "Permissions-Policy",
-            "camera=(), microphone=(), geolocation=()",
-        );
     // An empty `csp` string is the sentinel value produced by `CspLevel::Off`
     // (see `CspLevel::as_header_value`).  In that case we must not emit any
     // `Content-Security-Policy` header at all — not even a "safe" default —
@@ -2106,6 +2128,57 @@ mod tests {
         std::fs::write(tmp.path().join("secret.txt"), b"secret").expect("write secret");
         let canonical_root = root.canonicalize().expect("canonicalize root");
         (tmp, canonical_root)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_symlink_targets_are_rejected_for_listings_and_spa_fallback() {
+        let (_tmp, root) = make_test_tree();
+        std::fs::create_dir(root.join(".hidden")).expect("hidden directory");
+        std::fs::write(root.join(".hidden/page.html"), b"private").expect("hidden file");
+        std::os::unix::fs::symlink(root.join(".hidden"), root.join("public"))
+            .expect("directory link");
+        std::os::unix::fs::symlink(root.join(".hidden/page.html"), root.join("spa.html"))
+            .expect("SPA link");
+        for path in ["/public/", "/missing"] {
+            let opts = super::ResolveOptions {
+                canonical_root: &root,
+                url_path: path,
+                index_file: "spa.html",
+                dir_listing: true,
+                expose_dotfiles: false,
+                spa_routing: true,
+                error_404_page: None,
+            };
+            assert_eq!(resolve_path(&opts), Resolved::Forbidden, "path={path}");
+        }
+    }
+
+    #[test]
+    fn directory_listing_encodes_parent_path_delimiters() {
+        let (_tmp, root) = make_test_tree();
+        let listing = super::build_directory_listing(&root, "/a #?%/", false);
+        assert!(listing.contains("href=\"/a%20%23%3F%25/index.html\""));
+        let listing = super::build_directory_listing(&root, "/", false);
+        assert!(listing.contains("href=\"/index.html\""));
+    }
+
+    #[test]
+    fn metadata_etags_distinguish_same_second_rewrites() {
+        let file = tempfile::tempfile().expect("tempfile");
+        let first_time =
+            std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 100_000_000);
+        file.set_modified(first_time).expect("first timestamp");
+        let first = file.metadata().expect("first metadata");
+        file.set_modified(first_time + std::time::Duration::from_millis(100))
+            .expect("second timestamp");
+        let second = file.metadata().expect("second metadata");
+        assert_ne!(super::weak_etag(&first), super::weak_etag(&second));
+        assert_ne!(
+            super::weak_variant_etag(&first, "br"),
+            super::weak_variant_etag(&second, "br")
+        );
+        assert!(super::weak_variant_etag(&second, "br").starts_with("W/"));
     }
 
     #[test]
@@ -2624,8 +2697,17 @@ mod range_tests {
 
     #[test]
     fn parse_range_out_of_bounds() {
-        let req = req_with_range("bytes=900-1100");
+        let req = req_with_range("bytes=1000-1100");
         assert!(parse_range(&req, 1000).expect("Some").is_err());
+    }
+
+    #[test]
+    fn parse_range_clamps_end_to_file_length() {
+        let req = req_with_range("bytes=900-1100");
+        let range = parse_range(&req, 1000)
+            .expect("Some")
+            .expect("satisfiable range");
+        assert_eq!((range.start, range.end), (900, 999));
     }
 
     #[test]
@@ -2789,5 +2871,18 @@ mod percent_decode_tests {
         // URL path segments: `+` is literal, not a space.
         // (Space in paths is always `%20`.)
         assert_eq!(percent_decode("a+b"), "a+b");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod regular_file_tests {
+    #[tokio::test]
+    async fn fifo_open_does_not_block_filesystem_worker() -> std::io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("pipe");
+        let status = std::process::Command::new("mkfifo").arg(&path).status()?;
+        assert!(status.success());
+        assert!(super::open_regular_file(&path).await.is_err());
+        Ok(())
     }
 }

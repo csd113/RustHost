@@ -120,73 +120,55 @@ pub async fn run(args: CliArgs) -> Result<()> {
 /// Builds a `Config` in memory with sensible defaults, skips first-run setup,
 /// and calls [`normal_run`].
 async fn one_shot_serve(dir: PathBuf, port: u16, tor_enabled: bool, headless: bool) -> Result<()> {
-    use crate::config::{
-        ConsoleConfig, CspLevel, IdentityConfig, LogLevel, LoggingConfig, ServerConfig, SiteConfig,
-        TorConfig,
-    };
     use std::num::NonZeroU16;
 
-    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-    // Use "." when the served path has no leaf name (for example `/`), so the
-    // resulting `data_dir.join(site.directory)` still resolves back to `dir`.
-    let site_dir = canonical_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map_or_else(|| ".".to_owned(), str::to_owned);
+    let (data_dir, site_dir) = one_shot_paths(&dir)?;
 
-    // Use the parent of `dir` as the data_dir so relative paths stay sane.
+    // Start from the standard defaults and change only what `--serve` needs, so
+    // this path cannot silently drift from `Config::default()`.
+    let mut config = Config::default();
+    config.server.port = NonZeroU16::new(port).unwrap_or(NonZeroU16::MIN);
+    config.server.bind = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    config.site.directory = site_dir;
+    config.site.enable_directory_listing = true;
+    config.tor.enabled = tor_enabled;
+    config.tor.shutdown_grace_secs = 30;
+    config.logging.enabled = false;
+    config.console.interactive = !headless;
+
+    normal_run_with_config(data_dir, None, Arc::new(config)).await
+}
+
+/// Resolve before creating runtime files, and never substitute the parent for
+/// a leaf that cannot be represented by the string-valued site configuration.
+fn one_shot_paths(dir: &Path) -> Result<(PathBuf, String)> {
+    let canonical_dir = dir.canonicalize().map_err(|e| {
+        crate::AppError::ConfigLoad(format!(
+            "Cannot resolve site directory {}: {e}",
+            dir.display()
+        ))
+    })?;
+    if !canonical_dir.is_dir() {
+        return Err(crate::AppError::ConfigLoad(format!(
+            "Site path {} is not a directory",
+            dir.display()
+        )));
+    }
+    let site_dir = match canonical_dir.file_name() {
+        Some(name) => name
+            .to_str()
+            .ok_or_else(|| {
+                crate::AppError::ConfigLoad(
+                    "The resolved site directory name must be valid UTF-8".into(),
+                )
+            })?
+            .to_owned(),
+        None => ".".to_owned(),
+    };
     let data_dir = canonical_dir
         .parent()
         .map_or_else(|| canonical_dir.clone(), Path::to_path_buf);
-
-    let config = Arc::new(crate::config::Config {
-        server: ServerConfig {
-            port: NonZeroU16::new(port).unwrap_or(NonZeroU16::MIN),
-            bind: "127.0.0.1"
-                .parse()
-                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-            auto_port_fallback: false,
-            open_browser_on_start: false,
-            max_connections: 256,
-            max_connections_per_ip: 16,
-            shutdown_grace_secs: 30,
-            csp_level: CspLevel::Off,
-            trusted_proxies: None,
-        },
-        site: SiteConfig {
-            directory: site_dir,
-            index_file: "index.html".into(),
-            favicon: "favicon.ico".into(),
-            enable_png_favicon: false,
-            enable_directory_listing: true,
-            expose_dotfiles: false,
-            spa_routing: false,
-            error_404: None,
-            error_503: None,
-        },
-        tor: TorConfig {
-            enabled: tor_enabled,
-            shutdown_grace_secs: 30,
-        },
-        logging: LoggingConfig {
-            enabled: false,
-            level: LogLevel::Info,
-            file: "rusthost.log".into(),
-            filter_dependencies: true,
-        },
-        console: ConsoleConfig {
-            interactive: !headless,
-            refresh_rate_ms: 500,
-            show_timestamps: false,
-        },
-        identity: IdentityConfig {
-            instance_name: "RustHost".into(),
-        },
-        redirects: Vec::new(),
-        tls: crate::config::TlsConfig::default(),
-    });
-
-    normal_run_with_config(data_dir, None, config).await
+    Ok((data_dir, site_dir))
 }
 
 /// Compute the default data directory (`<exe-dir>/rusthost-data/`).
@@ -233,15 +215,13 @@ fn first_run_setup(
     install_kind: InstallKind,
     headless: bool,
 ) -> Result<()> {
-    std::fs::create_dir_all(data_dir.join("site"))?;
-    std::fs::create_dir_all(runtime_root(data_dir))?;
-
-    config::defaults::write_default_config(settings_path)?;
+    crate::persistence::create_dir_all(&data_dir.join("site"))?;
+    crate::persistence::create_dir_all(&runtime_root(data_dir))?;
 
     let placeholder = data_dir.join("site/index.html");
-    if !placeholder.exists() {
-        std::fs::write(&placeholder, PLACEHOLDER_HTML)?;
-    }
+    crate::persistence::create_default(&placeholder, PLACEHOLDER_HTML.as_bytes())?;
+    // Publish settings last: interrupted first-run setup is safe to retry.
+    config::defaults::write_default_config(settings_path)?;
 
     if headless {
         let mut stdout = std::io::stdout();
@@ -357,36 +337,6 @@ const fn apply_managed_runtime_mode(config: &mut Config, mode: ManagedRunnerMode
 
 // ─── Extracted helpers for normal_run_with_config ─────────────────────────────
 
-/// Scan the site directory and populate initial file stats in shared state.
-fn schedule_initial_site_scan(config: &Arc<Config>, state: &SharedState, data_dir: &Path) {
-    if !config.console.interactive {
-        return;
-    }
-
-    let cfg = Arc::clone(config);
-    let st = Arc::clone(state);
-    let data_dir = data_dir.to_path_buf();
-    tokio::spawn(async move {
-        let site_root = data_dir.join(&cfg.site.directory);
-        let scan_root = site_root.clone();
-        let (count, bytes) =
-            match tokio::task::spawn_blocking(move || server::scan_site(&scan_root)).await {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    log::warn!("Could not scan site directory on startup: {e}");
-                    (0, 0)
-                }
-                Err(e) => {
-                    log::warn!("Site scan task panicked on startup: {e}");
-                    (0, 0)
-                }
-            };
-        let mut s = st.write().await;
-        s.site_file_count = count;
-        s.site_total_bytes = bytes;
-    });
-}
-
 // ─── Core startup ─────────────────────────────────────────────────────────────
 
 /// Core server startup given an already-built `Config`.
@@ -435,7 +385,14 @@ async fn normal_run_with_config(
         )),
         per_ip_map: std::sync::Arc::new(dashmap::DashMap::new()),
     };
-    let (root_tx, root_rx) = make_root_watch(&config, &data_dir);
+    let snapshot_config = Arc::clone(&config);
+    let snapshot_dir = data_dir.clone();
+    let (root_tx, root_rx) =
+        tokio::task::spawn_blocking(move || make_root_watch(&snapshot_config, &snapshot_dir))
+            .await
+            .map_err(|e| {
+                crate::AppError::ConfigLoad(format!("site preparation task failed: {e}"))
+            })??;
     let redirect_public_http = uses_redirect_public_http(&config);
     let server_handle = if redirect_public_http {
         None
@@ -470,7 +427,9 @@ async fn normal_run_with_config(
         Some(server_handle)
     };
 
-    // 6b. TLS / HTTPS — optional, non-fatal.
+    // 6b. TLS / HTTPS — optional. If TLS is disabled this is a no-op; if it is
+    // enabled but initialisation or binding fails, the failure is fatal and the
+    // already-started HTTP listener is torn down by the shutdown path below.
     let background_tasks = setup_tls(
         &config,
         &state,
@@ -480,11 +439,21 @@ async fn normal_run_with_config(
         &budget,
         &root_tx,
     )
-    .await
-    .inspect_err(|_| {
-        let _ = shutdown_tx.send(true);
-    })?;
-    let mut background_tasks = background_tasks;
+    .await;
+    let mut background_tasks = match background_tasks {
+        Ok(tasks) => tasks,
+        Err(err) => {
+            graceful_shutdown(
+                &config,
+                shutdown_tx,
+                server_handle,
+                None,
+                support::BackgroundTasks::default(),
+            )
+            .await;
+            return Err(err);
+        }
+    };
 
     // 7. Start Tor (if enabled).
     //    tor::init() spawns a Tokio task and returns its JoinHandle.
@@ -516,13 +485,8 @@ async fn normal_run_with_config(
             match wait_for_bind_port(tor_ingress_port_rx, "Tor ingress server").await {
                 Ok(port) => port,
                 Err(err) => {
-                    let _ = shutdown_tx.send(true);
-                    wait_for_background_task(
-                        background_tasks.tor_ingress.take(),
-                        Duration::from_secs(5),
-                        "Tor ingress server startup task",
-                    )
-                    .await;
+                    graceful_shutdown(&config, shutdown_tx, server_handle, None, background_tasks)
+                        .await;
                     return Err(err);
                 }
             };
@@ -539,10 +503,28 @@ async fn normal_run_with_config(
         None
     };
 
-    schedule_initial_site_scan(&config, &state, &data_dir);
+    {
+        let mut state = state.write().await;
+        state.site_file_count = root_tx.borrow().file_count;
+        state.site_total_bytes = root_tx.borrow().total_bytes;
+    }
 
     // 8. Start console UI.
-    let key_rx = start_console(&config, &state, &metrics, shutdown_rx.clone(), &data_dir).await?;
+    let console_session =
+        match start_console(&config, &state, &metrics, shutdown_rx.clone(), &data_dir).await {
+            Ok(session) => session,
+            Err(err) => {
+                graceful_shutdown(
+                    &config,
+                    shutdown_tx,
+                    server_handle,
+                    tor_handle,
+                    background_tasks,
+                )
+                .await;
+                return Err(err);
+            }
+        };
 
     // 9. Open browser (if configured).
     maybe_open_browser(&config, &state).await;
@@ -552,7 +534,7 @@ async fn normal_run_with_config(
     // 10. Event dispatch loop.  Always continue into the single shutdown path
     // so listener/background cleanup runs even if event handling fails.
     let event_result = event_loop(
-        key_rx,
+        console_session,
         &config,
         &state,
         &metrics,
@@ -577,7 +559,7 @@ async fn normal_run_with_config(
 }
 
 fn ensure_data_directories(data_dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(runtime_root(data_dir))?;
+    crate::persistence::create_dir_all(&runtime_root(data_dir))?;
     Ok(())
 }
 
@@ -599,7 +581,7 @@ fn spawn_server(
     shutdown: &watch::Receiver<bool>,
     port_tx: oneshot::Sender<ListenerReady>,
     data_dir: PathBuf,
-    root_rx: watch::Receiver<Arc<std::path::Path>>,
+    root_rx: watch::Receiver<Arc<server::SiteSnapshot>>,
     budget: SharedConnectionBudget,
 ) -> tokio::task::JoinHandle<()> {
     let server_config = Arc::clone(config);
@@ -622,19 +604,15 @@ fn spawn_server(
     })
 }
 
-fn make_root_watch(
-    config: &Config,
-    data_dir: &Path,
-) -> (
-    watch::Sender<Arc<std::path::Path>>,
-    watch::Receiver<Arc<std::path::Path>>,
-) {
-    let initial_root: Arc<std::path::Path> = {
-        let site_path = data_dir.join(&config.site.directory);
-        let resolved = site_path.canonicalize().unwrap_or(site_path);
-        Arc::from(resolved.as_path())
-    };
-    watch::channel(initial_root)
+type SiteWatch = (
+    watch::Sender<Arc<server::SiteSnapshot>>,
+    watch::Receiver<Arc<server::SiteSnapshot>>,
+);
+
+fn make_root_watch(config: &Config, data_dir: &Path) -> Result<SiteWatch> {
+    Ok(watch::channel(server::SiteSnapshot::prepare(
+        config, data_dir,
+    )?))
 }
 
 const fn uses_redirect_public_http(config: &Config) -> bool {
@@ -647,16 +625,16 @@ async fn start_console(
     metrics: &SharedMetrics,
     shutdown: watch::Receiver<bool>,
     data_dir: &Path,
-) -> Result<Option<mpsc::UnboundedReceiver<events::KeyEvent>>> {
+) -> Result<Option<(mpsc::Receiver<events::KeyEvent>, Arc<tokio::sync::Notify>)>> {
     if config.console.interactive {
-        let rx = console::start(
+        let session = console::start(
             Arc::clone(config),
             Arc::clone(state),
             Arc::clone(metrics),
             shutdown,
             data_dir.to_path_buf(),
         )?;
-        Ok(Some(rx))
+        Ok(Some(session))
     } else {
         let snapshot = state.read().await.clone();
         let mut stdout = std::io::stdout();
@@ -703,7 +681,7 @@ fn make_sighup_signal() -> Option<tokio::signal::unix::Signal> {
 }
 
 #[cfg(not(unix))]
-fn make_sighup_signal() -> Option<()> {
+const fn make_sighup_signal() -> Option<()> {
     None
 }
 
@@ -760,16 +738,19 @@ async fn next_sigterm() {
 }
 
 async fn event_loop(
-    key_rx: Option<mpsc::UnboundedReceiver<events::KeyEvent>>,
+    session: Option<(mpsc::Receiver<events::KeyEvent>, Arc<tokio::sync::Notify>)>,
     config: &Arc<Config>,
     state: &SharedState,
     metrics: &SharedMetrics,
     data_dir: PathBuf,
     settings_path: Option<PathBuf>,
-    root_tx: watch::Sender<Arc<std::path::Path>>,
+    root_tx: watch::Sender<Arc<server::SiteSnapshot>>,
 ) -> Result<()> {
     // 2.8 — mutable so we can set to None when the channel closes.
-    let mut key_rx = key_rx;
+    let (mut key_rx, render_notify) = match session {
+        Some((rx, notify)) => (Some(rx), Some(notify)),
+        None => (None, None),
+    };
 
     // Pin ctrl_c so it can be polled repeatedly inside select! without moving.
     let ctrl_c = tokio::signal::ctrl_c();
@@ -836,6 +817,11 @@ async fn event_loop(
                         settings_path.clone(),
                         &root_tx,
                     ).await?;
+                    // Repaint immediately so key-driven state changes are
+                    // visible without waiting for the next refresh tick.
+                    if let Some(notify) = &render_notify {
+                        notify.notify_one();
+                    }
                     if quit { break; }
                 } else {
                     log::warn!(
@@ -902,6 +888,33 @@ const PLACEHOLDER_HTML: &str = r#"<!DOCTYPE html>
 
 #[cfg(test)]
 mod tests {
+    // Linux filesystems permit non-UTF-8 names; macOS APFS rejects this fixture.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn one_shot_rejects_non_utf8_symlink_target_without_serving_parent() -> crate::Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let tmp = tempfile::tempdir()?;
+        let target = tmp.path().join(std::ffi::OsStr::from_bytes(b"site-\xff"));
+        std::fs::create_dir(&target)?;
+        let alias = tmp.path().join("public");
+        std::os::unix::fs::symlink(&target, &alias)?;
+        assert!(super::one_shot_paths(&alias).is_err());
+        assert!(!tmp.path().join("runtime").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn one_shot_requires_an_existing_directory() -> crate::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let file = tmp.path().join("file");
+        std::fs::write(&file, b"file")?;
+        assert!(super::one_shot_paths(&file).is_err());
+        assert!(super::one_shot_paths(&tmp.path().join("missing")).is_err());
+        let (data_dir, site_dir) = super::one_shot_paths(tmp.path())?;
+        assert_eq!(data_dir.join(site_dir), tmp.path().canonicalize()?);
+        Ok(())
+    }
+
     use super::{
         apply_managed_runtime_mode, detect_install_kind, ensure_data_directories,
         first_run_headless_message, first_run_interactive_message, first_run_setup,
@@ -992,7 +1005,7 @@ mod tests {
     fn missing_settings_with_existing_site_is_regeneration() -> crate::Result<()> {
         let tmp = tempfile::tempdir()?;
         let data_dir = tmp.path().join("rusthost-data");
-        std::fs::create_dir_all(data_dir.join("site"))?;
+        crate::persistence::create_dir_all(&data_dir.join("site"))?;
 
         assert_eq!(
             detect_install_kind(&data_dir),
@@ -1050,11 +1063,21 @@ mod tests {
         let headless = first_run_headless_message(data_dir, &settings_path, InstallKind::Fresh);
         let interactive = first_run_interactive_message(data_dir, InstallKind::Fresh);
 
-        assert!(headless.contains("Created default config: rusthost-data/settings.toml"));
-        assert!(headless.contains("Site directory: rusthost-data/site"));
-        assert!(headless.contains("Runtime directory: rusthost-data/runtime"));
-        assert!(interactive.contains("rusthost-data/site/"));
-        assert!(interactive.contains("rusthost-data/runtime/"));
+        let display_root = Path::new("rusthost-data");
+        assert!(headless.contains(&format!(
+            "Created default config: {}",
+            display_root.join("settings.toml").display()
+        )));
+        assert!(headless.contains(&format!(
+            "Site directory: {}",
+            display_root.join("site").display()
+        )));
+        assert!(headless.contains(&format!(
+            "Runtime directory: {}",
+            display_root.join("runtime").display()
+        )));
+        assert!(interactive.contains(&format!("{}/", display_root.join("site").display())));
+        assert!(interactive.contains(&format!("{}/", display_root.join("runtime").display())));
         assert!(!headless.contains("/Users/example/Desktop/rusthost-data"));
         assert!(!interactive.contains("/Users/example/Desktop/rusthost-data"));
     }

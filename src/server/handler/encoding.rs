@@ -66,7 +66,7 @@ fn parse_accept_encoding_part(part: &str) -> Option<(&str, u16)> {
 }
 
 fn parse_quality_value(raw: &str) -> Option<u16> {
-    let (whole, fractional) = raw.split_once('.').map_or((raw, ""), |parts| parts);
+    let (whole, fractional) = raw.split_once('.').unwrap_or((raw, ""));
     match whole {
         "0" => {
             let mut thousandths = 0u16;

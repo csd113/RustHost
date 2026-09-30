@@ -5,8 +5,8 @@
 [![CI](https://github.com/csd113/RustHost/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/RustHost/actions/workflows/ci.yml)
 [![Dependency Audit](https://github.com/csd113/RustHost/actions/workflows/audit.yml/badge.svg)](https://github.com/csd113/RustHost/actions/workflows/audit.yml)
 [![License: MIT](https://img.shields.io/github/license/csd113/RustHost)](LICENSE)
-[![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-orange)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-v1.0.0-blue)](CHANGELOG.md)
+[![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-v1.1.0-blue)](CHANGELOG.md)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-3b82f6)](.github/workflows/ci.yml)
 
 RustHost is a production-focused static file server written in Rust. Drop in a directory, configure `settings.toml`, and get HTTP, optional HTTPS (self-signed, manual, or ACME), and an in-process Tor onion service — all from one binary.
@@ -47,7 +47,7 @@ It is intentionally narrow in scope: no web framework, no CMS, no reverse proxy,
 
 ## Quick Start
 
-Requires Rust 1.90+.
+Requires Rust 1.91+.
 
 ```bash
 git clone https://github.com/csd113/RustHost.git
@@ -90,6 +90,23 @@ Tagged releases ship as platform-specific ZIP archives containing the `rusthost-
 | `aarch64-unknown-linux-gnu` | Linux ARM64 |
 | `aarch64-apple-darwin` | macOS Apple Silicon |
 | `x86_64-pc-windows-msvc` | Windows x86_64 |
+
+### Docker images
+
+Images are published automatically to `ghcr.io/csd113/rusthost` for Linux AMD64 and ARM64. Release tags publish `1.1.0`, `1.1`, and `latest`; main builds publish `edge`. Pull requests build and smoke-test both architectures without publishing.
+
+```bash
+docker run -d --name rusthost --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -v rusthost-data:/data \
+  ghcr.io/csd113/rusthost:1.1.0
+```
+
+Open `http://127.0.0.1:8080`. The named volume retains `settings.toml`, `site/`, and `runtime/`, including the Tor identity, across upgrades. Container defaults bind to `0.0.0.0:8080` internally, enable Tor, and run headlessly as UID/GID `10001`. The host port above is restricted to loopback; choose a public binding deliberately.
+
+Edit `/data/settings.toml` and populate `/data/site` in the volume, then restart for configuration changes. Bind mounts must already be writable by UID/GID `10001` and include a settings file with `server.bind = "0.0.0.0"`; empty bind mounts hide the image's default settings. HTTPS requires configuration and an additional port mapping. The image health check targets HTTP `/ready` on port 8080; override it if you change the listener or enable redirects.
+
+To build locally: `docker build -t rusthost:local .`.
 
 ---
 
@@ -194,6 +211,14 @@ index_file = "index.html"
 
 - HTTPS is optional. When enabled, it supports self-signed localhost certs, manual PEM files, and ACME-managed certificates.
 - `redirect_http = true` requires TLS to be enabled. When active, the HTTP listener redirects rather than serves files.
+
+### Persistence, reloads, and resource limits
+
+Development TLS stores its certificate and private key together in `runtime/tls/dev/self-signed.pem`. Renewal retains `self-signed.previous.pem`; valid older `.crt`/`.key` pairs are imported without changing identity. These bundles contain private keys. Malformed state without a valid backup requires operator repair; RustHost does not silently replace a persisted identity. Application-owned settings, bundles, ACME cache entries, and Doctor reports use atomic publication. Unix writes sync file contents and directory metadata; Windows rename durability still needs platform testing.
+
+`R` and SIGHUP rescan the site, including its favicon path and configured error pages. Settings, listeners, TLS, and Tor configuration still require a restart. Each request selects one complete site generation, including requests on existing keep-alive connections. Failed preparation retains the previous generation. Keep old deployment directories available until in-flight requests finish; editing files in place is not a filesystem snapshot. Scans fail on unreadable entries or limits of 64 directory levels, one million entries, or 4,096 queued directories.
+
+Visitor counting retains at most 65,536 hashes for the process lifetime; `65536+` is a lower bound. No visitor identifiers are persisted. Transfers track progress in both directions: clearnet HTTP/HTTPS retain a five-second inactivity limit, while Tor relay and ingress allow 60 seconds. Headers have a separate five-second deadline, TLS handshakes ten seconds, and HTTP drivers/Tor relays have a 24-hour maximum lifetime even with trickle traffic. A blocked write, flush, or shutdown has a 60-second deadline; shorter connection inactivity limits may expire first. Logs stop accepting file writes at 100 MiB if rotation fails, continuing periodic rotation attempts. See the [second-pass robustness audit](docs/robustness-audit-2026-09-06.md) for validation and remaining upstream/platform limitations.
 
 ### Tor
 

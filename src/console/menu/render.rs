@@ -22,26 +22,30 @@ pub fn render(menu: &MenuState, config: &Config, state: &AppState, data_dir: &Pa
 fn render_index(state: &MenuState) -> String {
     let selected_page = state.selected_page();
     let mut out = String::with_capacity(512);
-    let _ = writeln!(out, "RustHost Menu\r");
+    ui::push_header(&mut out, "RustHost Menu");
     out.push_str("\r\n");
 
     for (index, page) in Page::ALL.iter().enumerate() {
-        let marker = if index == state.selected_index() {
-            if pulse_visible() {
+        if index == state.selected_index() {
+            let marker = if pulse_visible() {
                 ui::bold(">")
             } else {
                 ui::dim(">")
-            }
+            };
+            let _ = writeln!(out, "{marker} {}\r", page.label());
         } else {
-            " ".to_owned()
-        };
-        let _ = writeln!(out, "{marker} {}\r", page.label());
+            // Two spaces keep the columns aligned without allocating a marker.
+            let _ = writeln!(out, "  {}\r", page.label());
+        }
     }
 
     out.push_str("\r\n");
     let _ = writeln!(out, "{}\r", selected_page.description());
     out.push_str("\r\n");
-    out.push_str("[↑↓] Navigate  [Enter] Open  [Esc] Back  [Q] Quit\r\n");
+    ui::push_controls_footer(
+        &mut out,
+        "[↑↓/jk] Navigate  [Enter] Open  [Esc] Back  [Q] Quit",
+    );
     out
 }
 
@@ -112,19 +116,20 @@ fn render_doctor(state: &MenuState) -> String {
 
             if doctor.expanded_section() == Some(index) {
                 for check in section.checks() {
-                    let status = color_status(check.status());
-                    let _ = writeln!(out, "    {:<7} {}\r", status, check.message());
+                    let status = color_status_padded(check.status(), 7);
+                    let _ = writeln!(out, "    {status} {}\r", check.message());
                 }
             }
         }
 
         out.push_str("\r\n");
-        let result = if report.has_failures() {
+        let has_failures = report.has_failures();
+        let result = if has_failures {
             color_status(DoctorStatus::Fail)
         } else {
             color_status(DoctorStatus::Pass)
         };
-        let message = if report.has_failures() {
+        let message = if has_failures {
             "RustHost is not ready to start."
         } else {
             "RustHost appears ready to start."
@@ -145,6 +150,15 @@ fn render_doctor(state: &MenuState) -> String {
 fn color_status(status: DoctorStatus) -> String {
     let (label, color) = status_style_label(status);
     format!("{color}{label}\x1b[0m")
+}
+
+/// Colour a status label padded to `width` visible columns.
+///
+/// The ANSI colour codes are emitted around the already-padded plain label so
+/// they are not counted as visible width (which would defeat `{:<width$}`).
+fn color_status_padded(status: DoctorStatus, width: usize) -> String {
+    let (label, color) = status_style_label(status);
+    format!("{color}{label:<width$}\x1b[0m")
 }
 
 #[cfg(test)]
@@ -170,7 +184,7 @@ mod tests {
         assert!(output.contains("Doctor"));
         assert!(output.contains("Diagnostics"));
         assert!(output.contains("Return to the main RustHost dashboard."));
-        assert!(output.contains("[↑↓] Navigate  [Enter] Open  [Esc] Back  [Q] Quit"));
+        assert!(output.contains("[↑↓/jk] Navigate  [Enter] Open  [Esc] Back  [Q] Quit"));
     }
 
     #[test]

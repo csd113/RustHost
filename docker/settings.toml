@@ -1,0 +1,19 @@
+# Container defaults: listen on the container interface and keep state in /data.
+[server]
+bind = "0.0.0.0"
+port = 8080
+
+[site]
+directory = "site"
+
+[tor]
+enabled = true
+
+[console]
+interactive = false
+
+[logging]
+enabled = true
+
+[identity]
+instance_name = "RustHost"

@@ -231,7 +231,7 @@ fn validate(cfg: &Config) -> Result<()> {
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(AppError::ConfigValidation(errors))
+        Err(AppError::config_validation(errors))
     }
 }
 

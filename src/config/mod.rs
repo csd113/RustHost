@@ -81,9 +81,6 @@ const fn default_tor_shutdown_grace_secs() -> u64 {
 const fn default_true() -> bool {
     true
 }
-const fn default_tor_enabled() -> bool {
-    true
-}
 
 /// Server defaults
 const fn default_server_port() -> NonZeroU16 {
@@ -111,9 +108,6 @@ fn default_favicon_path() -> String {
 }
 
 /// Logging defaults
-const fn default_logging_enabled() -> bool {
-    true
-}
 const fn default_logging_level() -> LogLevel {
     LogLevel::Info
 }
@@ -122,9 +116,6 @@ fn default_logging_file() -> String {
 }
 
 /// Console defaults
-const fn default_console_interactive() -> bool {
-    true
-}
 const fn default_console_refresh_rate() -> u64 {
     500
 }
@@ -415,7 +406,7 @@ pub struct SiteConfig {
 pub struct TorConfig {
     /// Master on/off switch. When `false`, Tor is never started and the
     /// onion address section of the dashboard is hidden.
-    #[serde(default = "default_tor_enabled")]
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Maximum time to allow active onion-service streams to drain during
@@ -427,7 +418,7 @@ pub struct TorConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
-    #[serde(default = "default_logging_enabled")]
+    #[serde(default = "default_true")]
     pub enabled: bool,
 
     /// Log level, parsed from a lowercase string (`"trace"` … `"error"`).
@@ -449,7 +440,7 @@ pub struct LoggingConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConsoleConfig {
-    #[serde(default = "default_console_interactive")]
+    #[serde(default = "default_true")]
     pub interactive: bool,
 
     #[serde(default = "default_console_refresh_rate")]
@@ -493,17 +484,17 @@ impl Default for Config {
                 error_503: None,
             },
             tor: TorConfig {
-                enabled: default_tor_enabled(),
+                enabled: default_true(),
                 shutdown_grace_secs: default_tor_shutdown_grace_secs(),
             },
             logging: LoggingConfig {
-                enabled: default_logging_enabled(),
+                enabled: default_true(),
                 level: default_logging_level(),
                 file: default_logging_file(),
                 filter_dependencies: true,
             },
             console: ConsoleConfig {
-                interactive: default_console_interactive(),
+                interactive: default_true(),
                 refresh_rate_ms: default_console_refresh_rate(),
                 show_timestamps: default_console_timestamps(),
             },

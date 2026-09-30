@@ -168,6 +168,9 @@ impl Default for AppState {
 
 // ─── Metrics ────────────────────────────────────────────────────────────────
 
+/// Maximum retained visitor hashes. At capacity the count is a lifetime lower bound.
+pub const MAX_TRACKED_VISITORS: usize = 65_536;
+
 /// Hot-path request counters. Updated via atomics so the HTTP handler
 /// never needs to acquire a lock on [`AppState`].
 pub struct Metrics {
@@ -175,7 +178,7 @@ pub struct Metrics {
     pub requests: AtomicU64,
     pub errors: AtomicU64,
     visitor_hasher: RandomState,
-    visitor_keys: dashmap::DashSet<u64>,
+    visitor_keys: std::sync::Mutex<std::collections::HashSet<u64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,7 +197,7 @@ impl Metrics {
             requests: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             visitor_hasher: RandomState::new(),
-            visitor_keys: dashmap::DashSet::new(),
+            visitor_keys: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -208,14 +211,24 @@ impl Metrics {
 
     pub fn add_unique_visitor(&self, identity: VisitorIdentity) {
         let key = self.visitor_hasher.hash_one(identity);
-        self.visitor_keys.insert(key);
+        let mut keys = self
+            .visitor_keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if keys.len() < MAX_TRACKED_VISITORS {
+            keys.insert(key);
+        }
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             requests: self.requests.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
-            unique_visitors: self.visitor_keys.len(),
+            unique_visitors: self
+                .visitor_keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
             uptime: self.started_at.elapsed(),
         }
     }
@@ -318,6 +331,27 @@ mod tests {
         thread,
         time::Duration,
     };
+
+    #[test]
+    fn visitor_capacity_is_strict_under_concurrent_ipv6_churn() {
+        let metrics = Metrics::new();
+        thread::scope(|scope| {
+            for worker in 0_u128..4 {
+                let metrics = &metrics;
+                scope.spawn(move || {
+                    for visitor in 0..super::MAX_TRACKED_VISITORS {
+                        metrics.add_unique_visitor(VisitorIdentity::Clearnet(IpAddr::V6(
+                            Ipv6Addr::from((worker << 64) | visitor as u128),
+                        )));
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            metrics.snapshot().unique_visitors,
+            super::MAX_TRACKED_VISITORS
+        );
+    }
 
     #[test]
     fn same_visitor_counted_once() {

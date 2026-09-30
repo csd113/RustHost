@@ -164,7 +164,7 @@ pub fn build_acme_acceptor(cfg: &AcmeConfig, data_dir: &Path) -> AcmeBuildResult
         cfg.staging
     );
 
-    let cache = rustls_acme::caches::DirCache::new(cache_dir);
+    let cache = super::cache::AtomicCache::new(cache_dir)?;
 
     // Modern builder API (rustls-acme ≥ 0.15+).
     // Note: `directory_lets_encrypt` takes a *production* bool (true = prod).
@@ -281,6 +281,16 @@ where
             Some(Ok(event)) => {
                 consecutive_errors = 0;
                 log::info!("TLS/ACME [{env_label}]: {event:?}");
+            }
+            Some(Err(
+                err @ (rustls_acme::EventError::AccountCacheLoad(_)
+                | rustls_acme::EventError::AccountCacheStore(_)
+                | rustls_acme::EventError::CertCacheLoad(_)),
+            )) => {
+                log::error!(
+                    "TLS/ACME: persistent identity unavailable; stopping issuance: {err:?}"
+                );
+                break;
             }
             Some(Err(err)) => {
                 // Back off on consecutive errors instead of immediately
@@ -716,10 +726,12 @@ mod tests {
 
         let (_acceptor, _server_cfg, task, guard) = build_acme_acceptor(&cfg, tmp.path())?;
         task.abort();
+        let _ = task.await;
         drop(guard);
 
         let (_acceptor, _server_cfg, task, _guard) = build_acme_acceptor(&cfg, tmp.path())?;
         task.abort();
+        let _ = task.await;
         Ok(())
     }
 }

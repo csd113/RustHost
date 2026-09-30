@@ -195,7 +195,12 @@ pub fn render(page: &NetworkPageState) -> String {
     let _ = writeln!(out, "{}\r", ui::bold("Checks"));
     out.push_str("\r\n");
     for check in &report.checks {
-        let _ = writeln!(out, "{:<7} {}\r", color_status(check.status), check.message);
+        let _ = writeln!(
+            out,
+            "{} {}\r",
+            color_status_padded(check.status, 7),
+            check.message
+        );
     }
 
     out.push_str("\r\n");
@@ -362,9 +367,11 @@ fn listener_status_label(status: ListenerStatus) -> String {
     }
 }
 
-fn color_status(status: DoctorStatus) -> String {
+/// Colour a status label padded to `width` visible columns; the ANSI codes must
+/// wrap the padded plain text, not the other way around.
+fn color_status_padded(status: DoctorStatus, width: usize) -> String {
     let (label, color) = status_style_label(status);
-    format!("{color}{label}\x1b[0m")
+    format!("{color}{label:<width$}\x1b[0m")
 }
 
 #[cfg(test)]

@@ -114,7 +114,7 @@ pub fn render_dashboard(
     let _ = writeln!(out, "{}\r", ui::bold("Activity"));
     let _ = writeln!(out, " Uptime : {}\r", format_uptime(metrics.uptime));
     let _ = writeln!(out, " Requests : {}\r", metrics.requests);
-    let _ = writeln!(out, " Unique visitors : {}\r", metrics.unique_visitors);
+    render_visitors(&mut out, metrics.unique_visitors);
     let err_str = if metrics.errors > 0 {
         ui::red(&metrics.errors.to_string())
     } else {
@@ -166,11 +166,13 @@ pub fn render_help() -> String {
         ui::bold("[O]")
     );
     let _ = writeln!(out, " {} Toggle log view\r", ui::bold("[L]"));
+    let _ = writeln!(out, " {} Open the menu\r", ui::bold("[M]"));
+    let _ = writeln!(out, " {} Quit RustHost\r", ui::bold("[Q]"));
     out.push_str("\r\n");
     let _ = writeln!(
         out,
         "{}\r",
-        ui::dim("Press any key to return to the dashboard.")
+        ui::dim("Press Esc to return to the dashboard.")
     );
     let _ = writeln!(out, "{}\r", ui::RULE);
     out
@@ -222,14 +224,28 @@ fn strip_timestamp(line: &str) -> &str {
 }
 
 fn clean_log_line(line: &str) -> String {
-    line.replace("╔═══════════════════════════════════════════════════╗", "")
-        .replace("╠═══════════════════════════════════════════════════╣", "")
-        .replace("╚═══════════════════════════════════════════════════╝", "")
-        .replace('║', "")
-        .trim()
-        .to_owned()
+    // Single pass: drop box-drawing border characters, then trim. Avoids the
+    // four intermediate `String::replace` allocations per line per frame.
+    let filtered: String = line
+        .chars()
+        .filter(|c| !matches!(c, '╔' | '═' | '╗' | '╠' | '╣' | '╚' | '╝' | '║'))
+        .collect();
+    filtered.trim().to_owned()
 }
 // ─── Unit tests ───────────────────────────────────────────────────────────────
+fn render_visitors(out: &mut String, count: usize) {
+    let _ = writeln!(out, " Unique visitors : {}\r", visitor_count_label(count));
+}
+
+fn visitor_count_label(count: usize) -> String {
+    let suffix = if count >= crate::runtime::state::MAX_TRACKED_VISITORS {
+        "+"
+    } else {
+        ""
+    };
+    format!("{count}{suffix}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{clean_log_line, render_dashboard, render_shutdown, strip_timestamp};
@@ -313,6 +329,7 @@ mod tests {
 
     #[test]
     fn dashboard_site_directory_uses_active_data_dir() {
+        let data_dir = Path::new("/tmp/rusthost-custom");
         let output = render_dashboard(
             &AppState::new(),
             MetricsSnapshot {
@@ -322,10 +339,10 @@ mod tests {
                 uptime: Duration::ZERO,
             },
             &Config::default(),
-            Path::new("/tmp/rusthost-custom"),
+            data_dir,
         );
 
-        assert!(output.contains("Directory : /tmp/rusthost-custom/site"));
+        assert!(output.contains(&format!("Directory : {}", data_dir.join("site").display())));
         assert!(!output.contains("./rusthost-data/site"));
     }
 
@@ -343,7 +360,10 @@ mod tests {
             Path::new("/Users/example/Desktop/rusthost-data"),
         );
 
-        assert!(output.contains("Directory : rusthost-data/site"));
+        assert!(output.contains(&format!(
+            "Directory : {}",
+            Path::new("rusthost-data").join("site").display()
+        )));
         assert!(!output.contains("/Users/example/Desktop/rusthost-data/site"));
     }
 }

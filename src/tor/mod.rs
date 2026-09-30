@@ -301,6 +301,11 @@ async fn process_streams(
     let mut active_tasks = JoinSet::new();
 
     loop {
+        while let Some(result) = active_tasks.try_join_next() {
+            if let Err(e) = result {
+                log::debug!("Tor stream task ended: {e}");
+            }
+        }
         tokio::select! {
             next = stream_requests.next() => {
                 if let Some(stream_req) = next {
@@ -449,10 +454,13 @@ async fn proxy_stream(stream_req: StreamRequest, local_addr: &str) -> anyhow::Re
         log::debug!("Tor: could not enable TCP_NODELAY on local proxy socket: {e}");
     }
 
-    let tor_stream = stream_req
-        .accept(Connected::new_empty())
-        .await
-        .context("failed to accept Tor stream")?;
+    let tor_stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        stream_req.accept(Connected::new_empty()),
+    )
+    .await
+    .context("Tor stream acceptance timed out")?
+    .context("failed to accept Tor stream")?;
 
     Box::pin(proxy_bidirectional_with_idle_timeout(
         tor_stream,
@@ -473,49 +481,24 @@ where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (reader_a, writer_a) = tokio::io::split(stream_a);
-    let (reader_b, writer_b) = tokio::io::split(stream_b);
-
-    let client_to_local = relay_with_idle_timeout(reader_a, writer_b, idle_timeout);
-    let local_to_client = relay_with_idle_timeout(reader_b, writer_a, idle_timeout);
-
-    let (_uplink, _downlink) = tokio::try_join!(client_to_local, local_to_client)?;
+    let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut stream_a =
+        crate::io_timeout::ProgressStream::new(stream_a, Arc::clone(&progress), idle_timeout);
+    let mut stream_b =
+        crate::io_timeout::ProgressStream::new(stream_b, Arc::clone(&progress), idle_timeout);
+    let transfer = tokio::io::copy_bidirectional_with_sizes(
+        &mut stream_a,
+        &mut stream_b,
+        TOR_RELAY_BUFFER_BYTES,
+        TOR_RELAY_BUFFER_BYTES,
+    );
+    tokio::time::timeout(
+        crate::io_timeout::MAX_CONNECTION_AGE,
+        crate::io_timeout::with_idle_timeout(transfer, progress, idle_timeout),
+    )
+    .await
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))???;
     Ok(())
-}
-
-async fn relay_with_idle_timeout<R, W>(
-    mut reader: R,
-    mut writer: W,
-    idle_timeout: Duration,
-) -> std::io::Result<u64>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let mut transferred = 0u64;
-    let mut buffer = vec![0u8; TOR_RELAY_BUFFER_BYTES].into_boxed_slice();
-
-    loop {
-        let read = tokio::time::timeout(
-            idle_timeout,
-            tokio::io::AsyncReadExt::read(&mut reader, &mut buffer),
-        )
-        .await
-        .map_err(|_elapsed| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("stream idle timeout after {}s", idle_timeout.as_secs()),
-            )
-        })??;
-
-        if read == 0 {
-            tokio::io::AsyncWriteExt::shutdown(&mut writer).await?;
-            return Ok(transferred);
-        }
-
-        tokio::io::AsyncWriteExt::write_all(&mut writer, &buffer[..read]).await?;
-        transferred = transferred.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-    }
 }
 
 // ─── Onion address encoding ───────────────────────────────────────────────────
@@ -659,10 +642,94 @@ mod backoff_tests {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::{format_local_addr, format_startup_failure, onion_address_from_pubkey};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
 
     const ZERO_KEY_ONION: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaam2dqd.onion";
+
+    #[tokio::test(start_paused = true)]
+    async fn one_way_transfer_survives_idle_periods_and_half_close() -> std::io::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut client, ingress) = tokio::io::duplex(64);
+        let (local, mut server) = tokio::io::duplex(64);
+        let proxy = tokio::spawn(super::proxy_bidirectional_with_idle_timeout(
+            ingress,
+            local,
+            Duration::from_secs(60),
+        ));
+        client.write_all(b"GET").await?;
+        client.shutdown().await?;
+        let mut request = Vec::new();
+        server.read_to_end(&mut request).await?;
+        assert_eq!(request, b"GET");
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            server.write_all(b"download").await?;
+            let mut bytes = [0; 8];
+            client.read_exact(&mut bytes).await?;
+            assert_eq!(&bytes, b"download");
+        }
+        server.shutdown().await?;
+        assert_eq!(client.read(&mut [0]).await?, 0);
+        proxy.await.map_err(std::io::Error::other)??;
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_receiver_and_idle_proxy_release_tasks() -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+        let (_client, ingress) = tokio::io::duplex(1);
+        let (local, mut server) = tokio::io::duplex(1);
+        let proxy = tokio::spawn(super::proxy_bidirectional_with_idle_timeout(
+            ingress,
+            local,
+            Duration::from_secs(60),
+        ));
+        let producer = tokio::spawn(async move { server.write_all(&vec![0; 100_000]).await });
+        let error = proxy
+            .await
+            .map_err(std::io::Error::other)?
+            .expect_err("stalled receiver");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(producer.await.map_err(std::io::Error::other)?.is_err());
+        let (_client, ingress) = tokio::io::duplex(1);
+        let (local, _server) = tokio::io::duplex(1);
+        let error =
+            super::proxy_bidirectional_with_idle_timeout(ingress, local, Duration::from_secs(60))
+                .await
+                .expect_err("idle proxy");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trickle_transfer_has_total_lifetime_limit() -> std::io::Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (mut client, ingress) = tokio::io::duplex(1);
+        let (local, mut server) = tokio::io::duplex(1);
+        let proxy = tokio::spawn(super::proxy_bidirectional_with_idle_timeout(
+            ingress,
+            local,
+            Duration::from_secs(60),
+        ));
+        let traffic = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if server.write_all(b"x").await.is_err() || client.read_u8().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let error = proxy
+            .await
+            .map_err(std::io::Error::other)?
+            .expect_err("total lifetime");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        traffic.await.map_err(std::io::Error::other)?;
+        Ok(())
+    }
 
     #[test]
     fn known_vector_all_zeros() {

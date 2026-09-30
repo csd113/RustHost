@@ -1,5 +1,6 @@
 //! # TLS Module
 pub mod acme;
+mod cache;
 pub mod self_signed;
 
 use std::{io::BufReader, path::Path, sync::Arc};
@@ -196,31 +197,24 @@ fn load_manual_cert(cfg: &ManualCertConfig, data_dir: &Path) -> Result<Arc<TlsAc
 /// Returns [`AppError::Tls`] if the certificate or key file cannot be read,
 /// parsed, or if the resulting pair is invalid.
 pub(super) fn load_pem_as_acceptor(cert_path: &Path, key_path: &Path) -> Result<Arc<TlsAcceptor>> {
-    // --- certificate chain ---------------------------------------------------
-    let cert_pem = std::fs::read(cert_path)
-        .map_err(|e| AppError::Tls(format!("read cert {}: {e}", cert_path.display())))?;
-    let mut cert_reader = BufReader::new(&cert_pem[..]);
+    let cert_pem = crate::persistence::read_bounded(cert_path, 1024 * 1024)?;
+    let key_pem = crate::persistence::read_bounded(key_path, 1024 * 1024)?;
+    pem_as_acceptor(&cert_pem, &key_pem)
+}
 
+pub(super) fn pem_as_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<TlsAcceptor>> {
+    let mut cert_reader = BufReader::new(cert_pem);
     let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| AppError::Tls(format!("parse cert PEM {}: {e}", cert_path.display())))?;
-
+        .map_err(|e| AppError::Tls(format!("parse certificate PEM: {e}")))?;
     if cert_chain.is_empty() {
-        return Err(AppError::Tls(format!(
-            "no certificates found in {}",
-            cert_path.display()
-        )));
+        return Err(AppError::Tls("no certificates found in PEM".into()));
     }
-
-    // --- private key ---------------------------------------------------------
-    let key_pem = std::fs::read(key_path)
-        .map_err(|e| AppError::Tls(format!("read key {}: {e}", key_path.display())))?;
-    let mut key_reader = BufReader::new(&key_pem[..]);
-
+    let mut key_reader = BufReader::new(key_pem);
     let key_der: PrivateKeyDer<'static> = private_key(&mut key_reader)
-        .map_err(|e| AppError::Tls(format!("parse key PEM {}: {e}", key_path.display())))?
+        .map_err(|e| AppError::Tls(format!("parse key PEM: {e}")))?
         .map(|k| private_key_der_to_static(&k))
-        .ok_or_else(|| AppError::Tls(format!("no private key found in {}", key_path.display())))?;
+        .ok_or_else(|| AppError::Tls("no private key found in PEM".into()))?;
 
     // --- ServerConfig --------------------------------------------------------
     let server_cfg = ServerConfig::builder()

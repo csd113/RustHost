@@ -21,7 +21,7 @@ workflow, code standards, and review expectations so your time is spent well.
 
 | Tool | Minimum version | Notes |
 |------|-----------------|-------|
-| Rust (stable) | 1.90+ | matches the crate's `rust-version` in `Cargo.toml` |
+| Rust | 1.91 | matches the crate's `rust-version` and `rust-toolchain.toml` |
 | `cargo-deny` | latest | `cargo install cargo-deny` |
 
 ---

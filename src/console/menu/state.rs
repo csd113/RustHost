@@ -1,4 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use super::{
     diagnostics::DiagnosticsReport,
@@ -364,11 +365,16 @@ impl Default for MenuState {
     }
 }
 
+/// Monotonic reference for the menu-selection pulse.
+///
+/// Using [`Instant`] rather than wall-clock time keeps the blink stable when
+/// the system clock is adjusted (NTP step, manual change).
+static PULSE_EPOCH: OnceLock<Instant> = OnceLock::new();
+
 #[must_use]
 pub fn pulse_visible() -> bool {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(true, |duration| (duration.as_millis() / 700) % 2 == 0)
+    let epoch = *PULSE_EPOCH.get_or_init(Instant::now);
+    (epoch.elapsed().as_millis() / 700).is_multiple_of(2)
 }
 
 const fn clamp_section(selected: usize, section_count: usize) -> usize {

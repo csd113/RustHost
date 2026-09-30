@@ -97,7 +97,7 @@ async fn read_response(
 struct TestServer {
     addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
-    _root_tx: watch::Sender<Arc<Path>>,
+    _root_tx: watch::Sender<Arc<rusthost::server::SiteSnapshot>>,
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -144,8 +144,7 @@ async fn start_server_or_skip(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (port_tx, port_rx) = tokio::sync::oneshot::channel::<Result<u16, String>>();
 
-    let joined = data_dir.join(&config.site.directory);
-    let site_root_arc: Arc<Path> = Arc::from(joined.as_path());
+    let site_root_arc = rusthost::server::SiteSnapshot::prepare(&config, &data_dir)?;
     let (root_tx, root_rx) = watch::channel(site_root_arc);
 
     let conn_semaphore = Arc::new(Semaphore::new(config.server.max_connections as usize));
