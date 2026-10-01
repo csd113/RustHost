@@ -22,17 +22,24 @@ env:
 
 jobs:
   quality:
-    name: Quality
+    name: Quality (${{ matrix.rust }})
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.99.0", "stable"]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
 
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.91
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
 
       - name: Cache Rust artifacts
@@ -52,6 +59,10 @@ jobs:
           -D clippy::nursery
           -D clippy::cargo
 
+      - name: Test latest stable
+        if: matrix.rust == 'stable'
+        run: cargo test --locked --workspace --all-features
+
   test:
     name: Tests
     runs-on: ubuntu-24.04
@@ -62,7 +73,7 @@ jobs:
         uses: actions/checkout@v6.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.91
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
@@ -96,7 +107,7 @@ jobs:
         uses: actions/checkout@v6.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.91
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: ${{ matrix.target }}
 
@@ -108,3 +119,14 @@ jobs:
 
       - name: Build
         run: cargo build --locked --all-features --target ${{ matrix.target }} --verbose
+
+  msrv:
+    name: Rust 1.91 compatibility
+    env:
+      RUSTUP_TOOLCHAIN: "1.91.0"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6.0.1
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Check minimum supported Rust
+        run: cargo check --locked --workspace --all-features

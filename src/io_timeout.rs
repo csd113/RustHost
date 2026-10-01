@@ -16,7 +16,7 @@ use tokio::{
 };
 
 /// Long downloads are allowed, but trickle traffic cannot retain a slot forever.
-pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+pub const MAX_CONNECTION_AGE: Duration = Duration::from_hours(24);
 pub const TRANSFER_IDLE: Duration = Duration::from_secs(60);
 
 pub struct ProgressStream<S> {
