@@ -2,8 +2,8 @@
 name = "rusthost"
 version = "1.1.0"
 edition = "2021"
-# Arti 0.46 and its Tor crates require Rust 1.91.
-rust-version = "1.91"
+# Requires Rust 1.99+.
+rust-version = "1.99"
 description = "Single-binary, zero-setup static site hosting appliance with Tor support"
 license = "MIT"
 repository = "https://github.com/csd113/RustHost"
@@ -65,18 +65,18 @@ tokio = { version = "1", features = [
 
 # default-features = false removes the implicit "native-tls" default that
 # would otherwise pull in openssl-sys and break cross-compilation.
-arti-client = { version = "0.46", default-features = false, features = [
+arti-client = { version = "0.47", default-features = false, features = [
     "tokio",
     "rustls",
     "onion-service-service",
 ] }
-tor-hsservice = { version = "0.46", default-features = false }
-tor-cell      = { version = "0.46", default-features = false }
-tor-rtcompat  = { version = "0.46", default-features = false, features = ["tokio", "rustls"] }
+tor-hsservice = { version = "0.47", default-features = false }
+tor-cell      = { version = "0.47", default-features = false }
+tor-rtcompat  = { version = "0.47", default-features = false, features = ["tokio", "rustls"] }
 futures       = "0.3"
 
 # Terminal auto-launcher: TTY detection uses std::io::IsTerminal
-# (stable since Rust 1.70; this project's MSRV is 1.91) — no additional crate
+# (stable since Rust 1.70; this project's MSRV is 1.99) — no additional crate
 # required. The previously used `atty` crate has been removed: it carried a
 # memory-safety vulnerability on Windows (RUSTSEC-2021-0145) and was
 # unmaintained. `anyhow` is retained for use in other modules.
@@ -99,9 +99,9 @@ libc = "0.2"
 # arti-client pulls rusqlite transitively; declaring it here unifies the feature
 # across the whole dep tree so cross-compiling to Linux/Windows works without a
 # system sqlite3 library present on the host Mac.
-# Arti 0.46's tor-dirmgr requires rusqlite < 0.40.  Keeping the newest
-# compatible 0.39 line here also enables bundled SQLite for the whole graph.
-rusqlite = { version = "0.39", features = ["bundled"] }
+# Arti 0.47's tor-dirmgr requires rusqlite >=0.36.0, <0.41.0. Keeping the newest
+# compatible 0.40 line here also enables bundled SQLite for the whole graph.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Per-IP connection tracking for rate limiting.
 # DashMap is a concurrent hash map with fine-grained shard locking; it avoids

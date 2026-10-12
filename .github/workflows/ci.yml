@@ -121,12 +121,12 @@ jobs:
         run: cargo build --locked --all-features --target ${{ matrix.target }} --verbose
 
   msrv:
-    name: Rust 1.91 compatibility
+    name: Rust 1.99 compatibility
     env:
-      RUSTUP_TOOLCHAIN: "1.91.0"
+      RUSTUP_TOOLCHAIN: "1.99.0"
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6.0.1
-      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: dtolnay/rust-toolchain@1.99.0
       - name: Check minimum supported Rust
         run: cargo check --locked --workspace --all-features
