@@ -1,8 +1,8 @@
 # Build on the target architecture so published images need no emulation.
 # Bootstrap from the published Debian 12 image; install the exact release compiler.
 FROM rust:1.98.1-bookworm AS builder
-RUN rustup toolchain install 1.99.0 --profile minimal --component rustfmt --component clippy \
-    && rustup default 1.99.0
+RUN rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy \
+    && rustup default 1.99.1
 WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake clang \
     && rm -rf /var/lib/apt/lists/*

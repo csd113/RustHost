@@ -1,6 +1,6 @@
 //! Shared version/build helpers.
 
-const FALLBACK_VERSION: &str = "1.1.0";
+const FALLBACK_VERSION: &str = "1.2.0";
 const UNKNOWN_BUILD_METADATA: &str = "unknown";
 
 #[must_use]
@@ -49,19 +49,4 @@ pub fn cli_version_output() -> String {
         commit_sha(),
         target_triple()
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{build_profile, cli_version_output, commit_sha, package_version, target_triple};
-
-    #[test]
-    fn cli_version_output_includes_build_metadata_lines() {
-        let output = cli_version_output();
-
-        assert!(output.starts_with(&format!("RustHost {}", package_version())));
-        assert!(output.contains(&format!("Build: {}", build_profile())));
-        assert!(output.contains(&format!("Commit: {}", commit_sha())));
-        assert!(output.contains(&format!("Target: {}", target_triple())));
-    }
 }

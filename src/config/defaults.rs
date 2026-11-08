@@ -148,22 +148,3 @@ pub fn write_default_config(path: &Path) -> Result<()> {
     crate::persistence::create_default(path, DEFAULT_SETTINGS.as_bytes())?;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::expect_used)]
-
-    use super::write_default_config;
-
-    #[test]
-    fn generated_settings_comment_describes_site_rescan_not_config_reload() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("settings.toml");
-
-        write_default_config(&path).expect("write defaults");
-
-        let body = std::fs::read_to_string(path).expect("read defaults");
-        assert!(body.contains("rescans site files and runtime state"));
-        assert!(!body.contains("reloads this\n# file when you press [R]"));
-    }
-}

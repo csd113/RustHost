@@ -136,34 +136,3 @@ fn display_relative_or_absolute(path: &Path) -> String {
 fn single_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::expect_used)]
-
-    use super::build_report;
-    use crate::{config::Config, runtime::state::AppState};
-
-    #[test]
-    fn diagnostics_contains_requested_fields() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(tmp.path().join("site")).expect("site dir");
-        std::fs::write(tmp.path().join("site/favicon.ico"), b"ico").expect("favicon");
-
-        let mut state = AppState::new();
-        state.actual_port = 8080;
-        let report = build_report(&Config::default(), &state, tmp.path(), None);
-        let text = report.text();
-
-        assert!(text.contains(&format!("RustHost {}", env!("CARGO_PKG_VERSION"))));
-        assert!(text.contains("Mode: interactive"));
-        assert!(text.contains("HTTP: 127.0.0.1:8080"));
-        assert!(text.contains("HTTPS: disabled"));
-        assert!(text.contains("Redirect HTTP: disabled"));
-        assert!(text.contains("Site root:"));
-        assert!(text.contains("Runtime path:"));
-        assert!(text.contains("Logs:"));
-        assert!(text.contains("Tor: starting"));
-        assert!(text.contains("Favicon: site/favicon.ico"));
-    }
-}

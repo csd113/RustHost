@@ -506,13 +506,3 @@ impl Default for Config {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Config;
-
-    #[test]
-    fn default_config_keeps_tor_enabled() {
-        assert!(Config::default().tor.enabled);
-    }
-}

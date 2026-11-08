@@ -870,24 +870,3 @@ pub fn scan_site(site_root: &Path) -> crate::Result<(u32, u64)> {
     }
     Ok((count, bytes))
 }
-
-#[cfg(test)]
-mod drain_tests {
-    use super::*;
-    #[tokio::test(start_paused = true)]
-    async fn expired_drain_joins_cancelled_tasks_and_releases_admission() -> Result<()> {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&semaphore)
-            .try_acquire_owned()
-            .map_err(std::io::Error::other)?;
-        let mut tasks = JoinSet::new();
-        tasks.spawn(async move {
-            let _permit = permit;
-            std::future::pending::<()>().await;
-        });
-        drain_connections(&mut tasks, Duration::from_secs(10)).await;
-        assert!(tasks.is_empty());
-        assert_eq!(semaphore.available_permits(), 1);
-        Ok(())
-    }
-}

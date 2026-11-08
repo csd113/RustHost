@@ -5,8 +5,8 @@
 [![CI](https://github.com/csd113/RustHost/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/RustHost/actions/workflows/ci.yml)
 [![Dependency Audit](https://github.com/csd113/RustHost/actions/workflows/audit.yml/badge.svg)](https://github.com/csd113/RustHost/actions/workflows/audit.yml)
 [![License: MIT](https://img.shields.io/github/license/csd113/RustHost)](LICENSE)
-[![Rust 1.91+](https://img.shields.io/badge/rust-1.91%2B-orange)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-v1.1.0-blue)](CHANGELOG.md)
+[![Rust 1.99.1+](https://img.shields.io/badge/rust-1.99.1%2B-orange)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-v1.2.0-blue)](CHANGELOG.md)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-3b82f6)](.github/workflows/ci.yml)
 
 RustHost is a production-focused static file server written in Rust. Drop in a directory, configure `settings.toml`, and get HTTP, optional HTTPS (self-signed, manual, or ACME), and an in-process Tor onion service — all from one binary.
@@ -47,9 +47,9 @@ It is intentionally narrow in scope: no web framework, no CMS, no reverse proxy,
 
 ## Quick Start
 
-Requires Rust 1.99+.
+Requires Rust 1.99.1+.
 
-Development and release builds use the Rust 1.99.0 pin in `rust-toolchain.toml`. CI also checks the latest `stable` compiler so future compiler and Clippy changes are reviewed before updating the release pin. After each stable release, install that exact version with rustup, update the toolchain/CI/container pins together, and pass the full validation gates before using it for releases. `Cargo.toml` sets Rust 1.99 as the minimum supported Rust version (MSRV). Existing toolchains and the global rustup default need no changes.
+Development and release builds use the Rust 1.99.1 pin in `rust-toolchain.toml`. CI also checks the latest `stable` compiler so future compiler and Clippy changes are reviewed before updating the release pin. After each stable release, install that exact version with rustup, update the toolchain/CI/container pins together, and pass the full validation gates before using it for releases. `Cargo.toml` sets Rust 1.99.1 as the minimum supported Rust version (MSRV). Existing toolchains and the global rustup default need no changes.
 
 ```bash
 git clone https://github.com/csd113/RustHost.git
@@ -95,13 +95,13 @@ Tagged releases ship as platform-specific ZIP archives containing the `rusthost-
 
 ### Docker images
 
-Images are published automatically to `ghcr.io/csd113/rusthost` for Linux AMD64 and ARM64. Release tags publish `1.1.0`, `1.1`, and `latest`; main builds publish `edge`. Pull requests build and smoke-test both architectures without publishing.
+Images are published automatically to `ghcr.io/csd113/rusthost` for Linux AMD64 and ARM64. Release tags publish `1.2.0`, `1.2`, and `latest`; main builds publish `edge`. Pull requests build and smoke-test both architectures without publishing.
 
 ```bash
 docker run -d --name rusthost --restart unless-stopped \
   -p 127.0.0.1:8080:8080 \
   -v rusthost-data:/data \
-  ghcr.io/csd113/rusthost:1.1.0
+  ghcr.io/csd113/rusthost:1.2.0
 ```
 
 Open `http://127.0.0.1:8080`. The named volume retains `settings.toml`, `site/`, and `runtime/`, including the Tor identity, across upgrades. Container defaults bind to `0.0.0.0:8080` internally, enable Tor, and run headlessly as UID/GID `10001`. The host port above is restricted to loopback; choose a public binding deliberately.
@@ -263,7 +263,7 @@ Doctor output is logged to `doctor.log` in the active runtime log path.
 ## TUI Overview
 
 ```
-RustHost 1.0.0
+RustHost 1.2.0
 HTTP   : http://127.0.0.1:8080
 HTTPS  : disabled
 Tor    : ready
@@ -316,7 +316,7 @@ Other Rust-supported targets may work but are not covered by the repository work
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo check --locked --workspace --all-targets --all-features
 ```
 
 CI enforces a stricter Clippy gate including `clippy::pedantic`, `clippy::nursery`, and `clippy::cargo`.

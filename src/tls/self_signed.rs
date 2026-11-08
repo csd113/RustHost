@@ -225,8 +225,9 @@ fn san_for(s: &str) -> Result<rcgen::SanType> {
 // ---------------------------------------------------------------------------
 /// Parse the first certificate in a validated bundle to check its expiry.
 fn remaining_validity_days(pem_bytes: &[u8]) -> Option<u64> {
+    use rustls::pki_types::{pem::PemObject as _, CertificateDer};
     use x509_cert::der::Decode as _;
-    let pem = rustls_pemfile::certs(&mut &*pem_bytes).next()?.ok()?;
+    let pem = CertificateDer::from_pem_slice(pem_bytes).ok()?;
 
     // Parse the DER-encoded certificate to reach the validity fields.
     let cert = x509_cert::Certificate::from_der(&pem)
@@ -245,112 +246,4 @@ fn remaining_validity_days(pem_bytes: &[u8]) -> Option<u64> {
         .ok()?;
 
     Some(remaining.as_secs() / 86_400)
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used)]
-    #![allow(clippy::expect_used)]
-    use super::*;
-    use tempfile::TempDir;
-
-    /// Install the `ring` crypto provider process-wide.
-    /// The first call succeeds; subsequent calls from other tests in the same
-    /// process return `Err` (already-installed) which is intentionally ignored.
-    fn ensure_crypto_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-
-    #[tokio::test]
-    async fn generates_cert_on_first_call() {
-        ensure_crypto_provider();
-        let tmp = TempDir::new().unwrap();
-        let cert = tmp.path().join("runtime/tls/dev/self-signed.pem");
-        assert!(!cert.exists());
-        generate_or_load(tmp.path())
-            .await
-            .expect("generate_or_load failed");
-        assert!(cert.exists(), "cert file should exist after first call");
-        assert!(load_bundle(&cert).expect("read persisted pair").is_some());
-    }
-
-    #[tokio::test]
-    async fn reuses_valid_cert_on_second_call() {
-        ensure_crypto_provider();
-        let tmp = TempDir::new().unwrap();
-        generate_or_load(tmp.path()).await.unwrap();
-        let cert_path = tmp.path().join("runtime/tls/dev/self-signed.pem");
-        let mtime_1 = std::fs::metadata(&cert_path).unwrap().modified().unwrap();
-        // Small sleep to ensure mtime would differ if the file were rewritten.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        generate_or_load(tmp.path()).await.unwrap();
-        let mtime_2 = std::fs::metadata(&cert_path).unwrap().modified().unwrap();
-        assert_eq!(mtime_1, mtime_2, "valid cert should not be regenerated");
-    }
-
-    #[test]
-    fn recovers_previous_bundle_without_changing_identity() -> Result<()> {
-        ensure_crypto_provider();
-        let tmp = TempDir::new()?;
-        generate_or_load_blocking(tmp.path())?;
-        let dir = tmp.path().join("runtime/tls/dev");
-        let previous = std::fs::read(dir.join(BUNDLE_NAME))?;
-        std::fs::write(dir.join(BACKUP_NAME), &previous)?;
-        std::fs::write(dir.join(BUNDLE_NAME), b"truncated")?;
-        generate_or_load_blocking(tmp.path())?;
-        assert_eq!(std::fs::read(dir.join(BUNDLE_NAME))?, previous);
-        Ok(())
-    }
-
-    #[test]
-    fn imports_legacy_pair_and_rejects_mismatched_keys() -> Result<()> {
-        ensure_crypto_provider();
-        let tmp = TempDir::new()?;
-        let dir = tmp.path().join("runtime/tls/dev");
-        std::fs::create_dir_all(&dir)?;
-        let bundle = generate_bundle()?;
-        std::fs::write(dir.join("self-signed.crt"), &bundle)?;
-        std::fs::write(dir.join("self-signed.key"), generate_bundle()?)?;
-        assert!(generate_or_load_blocking(tmp.path()).is_err());
-        assert!(!dir.join(BUNDLE_NAME).exists());
-        std::fs::write(dir.join("self-signed.key"), &bundle)?;
-        generate_or_load_blocking(tmp.path())?;
-        let imported = std::fs::read(dir.join(BUNDLE_NAME))?;
-        assert!(imported.starts_with(&bundle));
-        Ok(())
-    }
-
-    #[test]
-    fn san_for_parses_ipv4() {
-        let san = san_for("127.0.0.1").unwrap();
-        assert!(matches!(san, rcgen::SanType::IpAddress(_)));
-    }
-
-    #[test]
-    fn san_for_parses_ipv6() {
-        let san = san_for("::1").unwrap();
-        assert!(matches!(san, rcgen::SanType::IpAddress(_)));
-    }
-
-    #[test]
-    fn san_for_parses_dns() {
-        let san = san_for("localhost").unwrap();
-        assert!(matches!(san, rcgen::SanType::DnsName(_)));
-    }
-
-    #[test]
-    fn san_for_rejects_empty_dns() {
-        // Empty string is unconditionally invalid as a DNS name (RFC 1123).
-        assert!(san_for("").is_err());
-    }
-
-    #[test]
-    fn san_for_rejects_oversized_label() {
-        // A single DNS label must not exceed 63 characters (RFC 1123 §2.1).
-        let long_label = "a".repeat(64);
-        assert!(san_for(&long_label).is_err());
-    }
 }

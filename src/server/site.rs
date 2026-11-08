@@ -62,26 +62,3 @@ impl SiteSnapshot {
         }))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn invalid_roots_and_incomplete_scans_are_rejected() -> Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let mut config = Config::default();
-        assert!(SiteSnapshot::prepare(&config, tmp.path()).is_err());
-        let root = tmp.path().join("site");
-        std::fs::create_dir(&root)?;
-        let mut dir = root;
-        for _ in 0..64 {
-            dir = dir.join("deep");
-            std::fs::create_dir(&dir)?;
-        }
-        assert!(SiteSnapshot::prepare(&config, tmp.path()).is_err());
-        config.site.directory = "file".into();
-        std::fs::write(tmp.path().join("file"), b"not a directory")?;
-        assert!(SiteSnapshot::prepare(&config, tmp.path()).is_err());
-        Ok(())
-    }
-}

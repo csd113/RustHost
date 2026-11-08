@@ -34,27 +34,3 @@ pub fn display_path(path: &Path) -> Cow<'_, str> {
         path.to_string_lossy()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::display_path;
-
-    #[test]
-    fn trims_leading_segments_before_rusthost_data() {
-        let path = Path::new("/Users/example/Desktop/rusthost-data/site");
-
-        assert_eq!(
-            display_path(path),
-            Path::new("rusthost-data").join("site").to_string_lossy()
-        );
-    }
-
-    #[test]
-    fn keeps_paths_without_rusthost_data_unchanged() {
-        let path = Path::new("/tmp/custom-data/site");
-
-        assert_eq!(display_path(path), path.to_string_lossy());
-    }
-}

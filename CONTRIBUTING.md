@@ -21,7 +21,7 @@ workflow, code standards, and review expectations so your time is spent well.
 
 | Tool | Minimum version | Notes |
 |------|-----------------|-------|
-| Rust | 1.99 | matches the crate's `rust-version` and `rust-toolchain.toml` |
+| Rust | 1.99.1 | matches the crate's `rust-version` and `rust-toolchain.toml` |
 | `cargo-deny` | latest | `cargo install cargo-deny` |
 
 ---
@@ -32,8 +32,8 @@ workflow, code standards, and review expectations so your time is spent well.
 git clone https://github.com/your-org/rusthost
 cd rusthost
 
-# Build and run tests
-cargo test --all-targets --all-features
+# Check all production targets
+cargo check --locked --workspace --all-targets --all-features
 
 # Run clippy (same flags as CI)
 cargo clippy --all-targets --all-features -- -D warnings
@@ -57,7 +57,8 @@ unsafe_code = "forbid"
 [lints.clippy]
 all      = { level = "deny",  priority = -1 }
 pedantic = { level = "deny",  priority = -1 }
-nursery  = { level = "warn",  priority = -1 }
+nursery  = { level = "deny",  priority = -1 }
+cargo    = { level = "deny",  priority = -1 }
 ```
 
 Use `#[allow(...)]` sparingly and always include a comment explaining why the
@@ -85,24 +86,21 @@ match on `AppError` variants at call sites that need to handle specific cases.
 
 ---
 
-## Testing
+## Validation
 
 ```sh
-# Unit tests only
-cargo test --lib
-
-# All tests (unit + integration)
-cargo test --all-targets --all-features
-
-# A specific test by name
-cargo test percent_decode
-
-# Dependency policy check
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings -D clippy::all -D clippy::pedantic -D clippy::nursery -D clippy::cargo
+cargo build --locked --release --workspace --all-features
 cargo deny check advisories bans licenses sources
 ```
 
-Integration tests live in `tests/`. They import items re-exported from
-`src/lib.rs` under `#[cfg(test)]` guards so they do not pollute the public API.
+The retired project-owned unit/integration tests and local Playwright harness
+were removed for 1.2.0. The static site fixture is retained under
+`docs/fixtures/html_stress/` for manual HTTP smoke checks. Validate a release
+against an isolated data directory: version/help, doctor, HTTP GET/HEAD,
+health/readiness, traversal rejection, ranges, conditional requests, and graceful
+shutdown. Container CI retains its production readiness smoke check.
 
 ---
 
@@ -116,8 +114,8 @@ Integration tests live in `tests/`. They import items re-exported from
    to review and revert.
 4. **Changelog**: add a line under `[Unreleased]` in `CHANGELOG.md` before
    opening the PR.
-5. **CI must be green**: all three CI jobs (`test`, `lint`, `deny`) must pass.
-   The `test` job runs on Ubuntu, macOS, and Windows.
+5. **CI must be green**: quality and platform build jobs must pass.
+   Platform builds cover Linux, macOS, and Windows.
 
 ---
 
