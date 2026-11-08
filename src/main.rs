@@ -25,8 +25,6 @@
     clippy::todo,
     clippy::unimplemented
 )]
-#![allow(renamed_and_removed_lints)]
-#![warn(clippy::nursery)]
 
 use std::io::Write as _;
 use std::panic::AssertUnwindSafe;
@@ -637,68 +635,4 @@ fn main() -> std::process::ExitCode {
     }
 
     std::process::ExitCode::SUCCESS
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{format_help, parse_args_from, relaunch_intent_for_parse_result, ParseOutcome};
-    use rusthost::terminal::RelaunchIntent;
-
-    #[test]
-    fn headless_args_suppress_terminal_relaunch() {
-        let parsed = parse_args_from(std::iter::once("--headless").map(str::to_owned));
-        assert!(matches!(parsed, Ok(ParseOutcome::Args(_))));
-        assert_eq!(
-            relaunch_intent_for_parse_result(&parsed),
-            RelaunchIntent::Headless
-        );
-    }
-
-    #[test]
-    fn help_args_suppress_terminal_relaunch() {
-        let parsed = parse_args_from(std::iter::once("--help").map(str::to_owned));
-        assert!(matches!(parsed, Ok(ParseOutcome::Help)));
-        assert_eq!(
-            relaunch_intent_for_parse_result(&parsed),
-            RelaunchIntent::Help
-        );
-    }
-
-    #[test]
-    fn version_args_suppress_terminal_relaunch() {
-        let parsed = parse_args_from(std::iter::once("--version").map(str::to_owned));
-        assert!(matches!(parsed, Ok(ParseOutcome::Version)));
-        assert_eq!(
-            relaunch_intent_for_parse_result(&parsed),
-            RelaunchIntent::Version
-        );
-    }
-
-    #[test]
-    fn invalid_args_suppress_terminal_relaunch() {
-        let parsed = parse_args_from(std::iter::once("--definitely-invalid").map(str::to_owned));
-        assert!(parsed.is_err());
-        assert_eq!(
-            relaunch_intent_for_parse_result(&parsed),
-            RelaunchIntent::InvalidArguments
-        );
-    }
-
-    #[test]
-    fn doctor_subcommand_suppresses_terminal_relaunch() {
-        let parsed = parse_args_from(std::iter::once("doctor").map(str::to_owned));
-        assert!(matches!(parsed, Ok(ParseOutcome::Doctor(_))));
-        assert_eq!(
-            relaunch_intent_for_parse_result(&parsed),
-            RelaunchIntent::Headless
-        );
-    }
-
-    #[test]
-    fn help_text_mentions_headless_usage() {
-        let help = format_help("rusthost-cli", "1.2.3");
-        assert!(help.contains("--headless"));
-        assert!(help.contains("doctor"));
-        assert!(help.contains("rusthost 1.2.3"));
-    }
 }

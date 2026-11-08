@@ -1,116 +1,57 @@
-# RustHost Setup Guide
+# Setup guide
 
-RustHost is a static file server with an optional dashboard, HTTPS, and a built-in Tor onion service. This guide starts with the simplest local run and then points out the knobs you are most likely to need.
+[Home](README.md) · [Operations reference](docs/operations.md) · [Development](CONTRIBUTING.md)
 
-## Requirements
+Start with the [download instructions](README.md#download-and-run). The commands below assume you are in the extracted binary folder. On Windows, replace `./rusthost-cli` with `.\rusthost-cli.exe`.
 
-Install a current Rust toolchain, then check it:
+## Keep your site and settings together
 
-```bash
-rustc --version
-cargo --version
+```sh
+./rusthost-cli --data-dir ./rusthost-data
 ```
 
-You also need normal native build tools:
-
-- macOS: Xcode Command Line Tools, installed with `xcode-select --install`
-- Debian / Ubuntu: `build-essential`
-- Fedora: `gcc` and `make`
-- Windows: Visual Studio Build Tools or the Visual Studio C++ workload
-
-Build RustHost from the repository root:
-
-```bash
-cargo build --release
-```
-
-The release binary is `./target/release/rusthost-cli`.
-
-## Fresh Install
-
-For a managed install with persistent config, site files, logs, TLS state, and Tor state:
-
-```bash
-./target/release/rusthost-cli --data-dir ./rusthost-data
-```
-
-On first run RustHost creates:
+The first run creates a settings file and a starter page. Runtime subdirectories appear as their services need them:
 
 ```text
 rusthost-data/
-├── settings.toml
-├── site/
-│   └── index.html
-└── runtime/
-    ├── logs/
-    ├── tls/
-    └── tor/
+  settings.toml
+  site/
+    index.html
+  runtime/
+    logs/
+    tls/
+    tor/
 ```
 
-Put your static site files in `rusthost-data/site/`. The generated `settings.toml` also lives in `rusthost-data/`.
+Put your files in `site/`. Edit `settings.toml` to change how RustHost runs, then restart. Pressing `R` only rescans the site; it does not reload settings. Without `--data-dir`, the data folder defaults to `rusthost-data` next to the executable.
 
-If `settings.toml` is deleted later, RustHost regenerates it from defaults and keeps existing `site/` and `runtime/` data.
+## Change the common settings
 
-## Quick One-Shot Serve
+Edit the existing sections in the generated file. The snippets in this guide are **edits to that file**, not complete replacement configurations. Do not create a second copy of a section.
 
-If you only want to serve a directory without creating `settings.toml`:
+| Setting | Default | Use |
+| --- | --- | --- |
+| `[server] bind` | `"127.0.0.1"` | Local HTTP only; use a LAN address or `"0.0.0.0"` to accept connections from other machines |
+| `[server] port` | `8080` | HTTP port |
+| `[site] directory` | `"site"` | Site folder, relative to the data directory |
+| `[site] index_file` | `"index.html"` | Default page |
+| `[tor] enabled` | `true` | Publish the site as an onion service |
+| `[tls] enabled` | `false` | Start HTTPS |
+| `[logging] enabled` | `true` | Write runtime logs |
+| `[console] interactive` | `true` | Show the dashboard |
 
-```bash
-./target/release/rusthost-cli --serve ./public
-```
-
-Useful variants:
-
-```bash
-./target/release/rusthost-cli --serve ./public --port 3000
-./target/release/rusthost-cli --serve ./public --no-tor
-./target/release/rusthost-cli --serve ./public --headless
-```
-
-## Basic Settings
-
-The most important generated defaults are:
+For local-only hosting, disable Tor as well as keeping the loopback bind:
 
 ```toml
-[server]
-port = 8080
-bind = "127.0.0.1"
-csp_level = "off"
-
-[site]
-directory = "site"
-index_file = "index.html"
-favicon = "favicon.ico"
-enable_png_favicon = false
-
 [tor]
-enabled = true
+enabled = false
 ```
 
-Keep `bind = "127.0.0.1"` for local work. Use `0.0.0.0` or a specific LAN/public interface only when you intentionally want other machines to connect.
+For a single-page app, add `spa_routing = true` under `[site]`. Unknown routes then serve the index page. Optional `error_404` and `error_503` values name custom HTML files relative to the site folder.
 
-## Favicon Basics
+Directory listings and dotfile access are off in managed mode. Their settings are `enable_directory_listing` and `expose_dotfiles` under `[site]`. Keep private files outside the site folder.
 
-By default, browsers can request:
-
-```text
-http://127.0.0.1:8080/favicon.ico
-```
-
-RustHost serves that from:
-
-```text
-rusthost-data/site/favicon.ico
-```
-
-To use a different `.ico` file under the site directory:
-
-```toml
-[site]
-favicon = "assets/site-icon.ico"
-```
-
-To use PNG instead:
+For a PNG favicon, edit `[site]`:
 
 ```toml
 [site]
@@ -118,54 +59,21 @@ favicon = "assets/site-icon.png"
 enable_png_favicon = true
 ```
 
-Favicon paths are resolved under the site directory and cannot escape it.
+The path must stay inside the site folder. PNG support adds `/favicon.png`; `/favicon.ico` uses the configured favicon.
 
-## TUI Basics
+## Run without the dashboard
 
-When `[console] interactive = true`, RustHost opens a simple terminal dashboard.
-
-Keys:
-
-- `H`: help
-- `R`: rescan the site directory and refresh serving state
-- `O`: open the local URL in your default browser
-- `L`: show recent logs
-- `Q`: ask for shutdown confirmation
-- `Y`: confirm shutdown
-- `N`: cancel shutdown
-
-Reloads show a short status message, such as `Reload complete`. During shutdown, the TUI reports that the web server and background services are stopping. If Tor is enabled, cleanup can take a few seconds while active streams close.
-
-For services, containers, CI, or SSH sessions where an alternate-screen dashboard is not wanted:
-
-```toml
-[console]
-interactive = false
+```sh
+./rusthost-cli --data-dir ./rusthost-data --headless
 ```
 
-## Serveo Quick Public Testing
+Use this with a service manager, container, or remote shell. Stop with Ctrl+C or your service manager's normal stop signal. Use a writable data directory and keep one instance per directory.
 
-Serveo can expose your local RustHost port through an SSH tunnel without router port forwarding. This is useful for short public tests, demos, or phone/browser checks.
+## Enable HTTPS
 
-Start RustHost locally:
+### Local HTTPS
 
-```bash
-./target/release/rusthost-cli --data-dir ./rusthost-data
-```
-
-In another terminal, create a tunnel to the local HTTP port:
-
-```bash
-ssh -R 80:127.0.0.1:8080 serveo.net
-```
-
-Serveo prints a public URL. Keep both terminals running while testing.
-
-Use this only for temporary testing. For production, use your own domain, firewall rules, TLS setup, monitoring, and service manager.
-
-## HTTPS and ACME
-
-For local HTTPS with a self-signed certificate:
+Edit `[tls]`:
 
 ```toml
 [tls]
@@ -173,9 +81,25 @@ enabled = true
 port = 8443
 ```
 
-Browsers will warn for self-signed certificates. That is expected.
+Open `https://localhost:8443`. RustHost creates a self-signed certificate; browsers will warn because they do not trust it. Plain HTTP remains available unless you enable redirects.
 
-For Let's Encrypt / ACME, configure `[tls.acme]` in `settings.toml`:
+### Your own certificate
+
+Place the PEM certificate chain and private key inside the data directory, enable TLS, and add:
+
+```toml
+[tls.manual_cert]
+cert_path = "runtime/tls/manual/fullchain.pem"
+key_path = "runtime/tls/manual/privkey.pem"
+```
+
+Both paths must stay within the data directory, and each file must be at most 1 MiB. Restart after replacing them. Manual certificates take priority over ACME when both are configured.
+
+### Let's Encrypt
+
+Point your domain's DNS at this machine and allow inbound TCP port 443. RustHost uses **TLS-ALPN-01** validation, so the ACME connection must reach RustHost's TLS listener. A proxy that terminates TLS may prevent validation. Wildcards are not supported by this challenge method.
+
+Edit the generated sections:
 
 ```toml
 [tls]
@@ -192,75 +116,52 @@ staging = true
 cache_dir = "runtime/tls/acme"
 ```
 
-ACME basics:
+Replace the example domain and email. Remove any `[tls.manual_cert]` section when choosing ACME. Test with `staging = true`, then change it to `false` and restart for trusted certificates. Staging certificates produce browser warnings. Binding ports 80/443 may require OS privileges or port forwarding.
 
-- DNS must point at the machine running RustHost.
-- The public HTTP/HTTPS ports must be reachable from the internet.
-- `localhost` and raw IP addresses do not work for Let's Encrypt certificates.
-- Start with `staging = true` to avoid production rate limits.
-- Switch to `staging = false` only after the staging flow works.
+Port 80 is needed for the HTTP redirect in this example, not for certificate validation. In redirect mode, `[tls].http_port` replaces the normal HTTP file-serving listener; it may equal `[server].port`. Redirects require TLS to be enabled. See the [ACME limitations](docs/operations.md#known-limitations) before relying on unattended renewal.
 
-Manual certificates are also supported:
+## Use Tor
 
-```toml
-[tls.manual_cert]
-cert_path = "runtime/tls/manual/fullchain.pem"
-key_path = "runtime/tls/manual/privkey.pem"
+Tor runs inside RustHost through Arti. No external daemon or `torrc` is needed. The dashboard shows bootstrap progress and the onion address; use Tor Browser to visit that address. First startup may take longer while directory data downloads.
+
+Tor serves the same site through its own internal HTTP ingress. Keep `runtime/tor/arti_state/` to preserve the onion identity, and back up the whole data directory while stopped. Do not copy an active identity between simultaneously running instances. Tor state and cache live under `runtime/tor/`.
+
+## Use Docker
+
+Release images are published to `ghcr.io/csd113/rusthost` for Linux AMD64 and ARM64. Choose an available release tag; main-branch builds use `edge`.
+
+```sh
+docker run -d --name rusthost --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -v rusthost-data:/data \
+  ghcr.io/csd113/rusthost:1.2.0
 ```
 
-## Tor Onion Service
+Open `http://127.0.0.1:8080`. The named volume keeps settings, site files, TLS state, and the Tor identity across container replacements. Container defaults are headless, bind internally to `0.0.0.0:8080`, and enable Tor. The host port above accepts local HTTP connections only; onion access is still enabled.
 
-When `[tor] enabled = true`, RustHost starts Arti in-process and publishes an onion service for the same static site.
+Edit `/data/settings.toml`, populate `/data/site`, then restart. The process uses UID/GID `10001`. Bind-mounted directories must be writable by that identity and contain settings with `server.bind = "0.0.0.0"`; an empty bind mount hides the image's settings. Map an additional port if you enable HTTPS. The built-in health check requests HTTP `/ready` on port 8080; override it if you change ports or enable redirects.
 
-Expect the first startup to take longer because Arti downloads Tor directory data. Later runs reuse cached state under `rusthost-data/runtime/tor/`.
+To build the image yourself, run `docker build -t rusthost:local .` from the source checkout.
 
-If the onion address matters, back up the runtime Tor state and do not share one data directory between unrelated RustHost instances.
+## Troubleshoot
 
-## Troubleshooting
-
-### Port Already In Use
-
-Change `[server].port`, `[tls].port`, or `[tls].http_port`. If this is a development machine and you are comfortable with fallback ports, you can set:
-
-```toml
-[server]
-auto_port_fallback = true
+```sh
+./rusthost-cli doctor --data-dir ./rusthost-data
 ```
 
-For production, fixed ports are usually better because reverse proxies, firewall rules, and monitors expect stable addresses.
+Doctor checks the configuration, paths, listeners, TLS, Tor setup, and logging without starting the server. Results use `PASS`, `WARN`, `FAIL`, and `NOT RUN`. The dashboard's Doctor and Diagnostics pages provide more detail. Check `runtime/logs/rusthost.log` for runtime errors.
 
-### Tor Startup Is Slow Or Fails
+| Problem | Next step |
+| --- | --- |
+| Port is in use | Stop the other process or change the configured port; restart RustHost |
+| Changed settings have no effect | Restart; `R` only rescans site files |
+| Site rescan fails | Check permissions, file paths, configured error pages, and the scan limits in the operations reference |
+| Tor is slow or fails | Check outbound internet access and logs; disable Tor if it is not needed |
+| HTTPS browser warning | Self-signed and staging certificates are untrusted; use a trusted manual certificate or production ACME |
+| Favicon missing | Check the path under the site folder and enable PNG support if needed |
 
-First startup can be slow while Arti bootstraps. Confirm outbound internet access is allowed. If you do not need onion access:
+## Upgrade
 
-```toml
-[tor]
-enabled = false
-```
+Stop RustHost, back up the data directory, and replace the executable with the new release binary. Start it with the same `--data-dir`. Keep your existing settings and runtime state, especially TLS keys and Tor identity. Read the [changelog](CHANGELOG.md) before upgrading.
 
-Check `rusthost-data/runtime/logs/rusthost.log` for the detailed Tor status.
-
-### Reload Did Not Pick Up Changes
-
-Press `R` in the TUI and watch for the reload status line. In headless mode, send SIGHUP on Unix systems or restart the process.
-
-If reload reports a failure, check that `[site].directory` exists under `rusthost-data/` and that RustHost can read the files.
-
-### Browser Warns On HTTPS
-
-Self-signed local certificates trigger browser warnings. Use ACME or your own trusted certificate for public browser-facing deployments.
-
-### Favicon Does Not Appear
-
-Check that `rusthost-data/site/favicon.ico` exists, or update `[site].favicon` to the correct file under the site directory. For PNG files, set `enable_png_favicon = true` and request `/favicon.png`.
-
-## Upgrade Workflow
-
-From the repository root:
-
-```bash
-git pull
-cargo build --release
-```
-
-Before restarting a public instance, back up `rusthost-data/`, especially TLS and Tor runtime state.
+If the settings file is missing, RustHost generates defaults without replacing an existing site or runtime data. Losing settings can re-enable default behavior, including Tor, so restore your saved configuration before restarting.

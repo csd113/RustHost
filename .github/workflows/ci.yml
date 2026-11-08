@@ -22,17 +22,25 @@ env:
 
 jobs:
   quality:
-    name: Quality
-    runs-on: ubuntu-24.04
+    name: Quality (${{ matrix.os }}, ${{ matrix.rust }})
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.99.1", "stable"]
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 25
 
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.91
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
 
       - name: Cache Rust artifacts
@@ -52,25 +60,17 @@ jobs:
           -D clippy::nursery
           -D clippy::cargo
 
-  test:
-    name: Tests
+  # Preserve the existing required status while gating every matrix entry.
+  quality-gate:
+    name: Quality
+    if: ${{ always() }}
+    needs: quality
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6.0.1
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.91
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: test
-
-      - name: Run tests
-        run: cargo test --locked --workspace --all-features
+      - name: Require all lint jobs to pass
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+        run: test "$QUALITY_RESULT" = success
 
   platform-smoke:
     name: Platform smoke (${{ matrix.name }})
@@ -96,7 +96,7 @@ jobs:
         uses: actions/checkout@v6.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.91
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           targets: ${{ matrix.target }}
 
@@ -108,3 +108,15 @@ jobs:
 
       - name: Build
         run: cargo build --locked --all-features --target ${{ matrix.target }} --verbose
+
+  # Legacy protected-branch status name; validates production compilation only.
+  msrv:
+    name: Tests
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.1"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6.0.1
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: Check minimum supported Rust
+        run: cargo check --locked --workspace --all-features

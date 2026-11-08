@@ -1,9 +1,36 @@
 # Changelog
 
-All notable changes to RustHost are documented here.
+Release history. Older entries describe behavior and validation at the time; use [Setup](SETUP.md) and the [operations reference](docs/operations.md) for current guidance.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
+## [v1.2.0] — 2026-11-08
+
+### Changed
+
+- Use Rust 1.99.1 for source builds, CI, and releases. Downloaded binaries do not require Rust.
+- Upgrade built-in Arti/Tor to 0.48.0 and refresh dependencies. Keep bundled rusqlite on 0.40.2 because Arti requires `<0.41`; 0.41.1 is incompatible.
+- Deny all, pedantic, nursery and cargo Clippy groups, with relevant Rust 1.98/1.99 additions and selected restriction lints; check Linux and Windows in CI.
+- Replace the blanket duplicate-dependency lint suppression with an explicit per-crate compatibility inventory and remove obsolete lint and dependency-policy exceptions.
+- Replace unmaintained rustls-pemfile with rustls's supported PEM parser while retaining bounded input, key/certificate validation and expiry checks.
+
+### Fixed
+
+- Make log shutdown destructuring explicit under the new rest-pattern lint.
+- Compile directory flushing only on Unix, preserving file sync on Windows and directory durability checks on Unix without no-op lint suppressions.
+- Align package and fallback versions with 1.2.0; simplify setup around downloading one binary and consolidate current operations guidance.
+
+### Removed
+
+- Remove obsolete documentation plans, audits, migration notes, and diagrams; retain current guidance and historical release notes.
+- Retire project-owned Rust unit/integration test harnesses and development-only dependencies, plus local Playwright ignore infrastructure. Preserve the 10 static-site fixture files under `docs/fixtures/html_stress/`, reusable generators, and all production safeguards.
+
+### Validation
+
+- Windows Rust 1.99.1 optimized build, strict Clippy, formatting, dependency policy checks, and 23 isolated HTTP/TLS/CLI/persistence/shutdown release probes passed. Linux/Windows lint and Linux ARM64/macOS/Windows build jobs also passed on the upgrade code before this documentation cleanup. Live Tor, ACME issuance, and power-loss recovery were not validated. See [Contributing](CONTRIBUTING.md) for current validation commands and lint policy, and the [operations reference](docs/operations.md) for remaining limitations.
 
 ---
 

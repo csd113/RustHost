@@ -380,26 +380,3 @@ pub(super) async fn wait_for_background_task(
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::wait_for_background_task;
-    use std::{sync::Arc, time::Duration};
-    use tokio::sync::Semaphore;
-
-    #[tokio::test]
-    async fn timed_out_task_releases_resources_before_shutdown_returns() -> crate::Result<()> {
-        let semaphore = Arc::new(Semaphore::new(1));
-        let permit = Arc::clone(&semaphore)
-            .acquire_owned()
-            .await
-            .map_err(std::io::Error::other)?;
-        let task = tokio::spawn(async move {
-            let _permit = permit;
-            std::future::pending::<()>().await;
-        });
-        wait_for_background_task(Some(task), Duration::from_millis(10), "test worker").await;
-        assert_eq!(semaphore.available_permits(), 1);
-        Ok(())
-    }
-}

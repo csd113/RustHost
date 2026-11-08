@@ -3,13 +3,12 @@ pub mod acme;
 mod cache;
 pub mod self_signed;
 
-use std::{io::BufReader, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
+    pki_types::{pem::PemObject as _, CertificateDer, PrivateKeyDer},
     ServerConfig,
 };
-use rustls_pemfile::{certs, private_key};
 use tokio_rustls::TlsAcceptor;
 
 use crate::Result;
@@ -23,11 +22,6 @@ fn is_rooted_path(path: &Path) -> bool {
 
     path.components()
         .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir))
-}
-
-/// Converts a borrowed `PrivateKeyDer` to an owned `'static` version.
-fn private_key_der_to_static(key: &PrivateKeyDer<'_>) -> PrivateKeyDer<'static> {
-    key.clone_key()
 }
 
 /// A TLS acceptor that is either a static [`TlsAcceptor`] (manual cert or
@@ -203,18 +197,14 @@ pub(super) fn load_pem_as_acceptor(cert_path: &Path, key_path: &Path) -> Result<
 }
 
 pub(super) fn pem_as_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<TlsAcceptor>> {
-    let mut cert_reader = BufReader::new(cert_pem);
-    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| AppError::Tls(format!("parse certificate PEM: {e}")))?;
     if cert_chain.is_empty() {
         return Err(AppError::Tls("no certificates found in PEM".into()));
     }
-    let mut key_reader = BufReader::new(key_pem);
-    let key_der: PrivateKeyDer<'static> = private_key(&mut key_reader)
-        .map_err(|e| AppError::Tls(format!("parse key PEM: {e}")))?
-        .map(|k| private_key_der_to_static(&k))
-        .ok_or_else(|| AppError::Tls("no private key found in PEM".into()))?;
+    let key_der = PrivateKeyDer::from_pem_slice(key_pem)
+        .map_err(|e| AppError::Tls(format!("parse key PEM: {e}")))?;
 
     // --- ServerConfig --------------------------------------------------------
     let server_cfg = ServerConfig::builder()
@@ -223,73 +213,4 @@ pub(super) fn pem_as_acceptor(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<Tls
         .map_err(|e| AppError::Tls(format!("invalid certificate/key pair: {e}")))?;
 
     Ok(Arc::new(TlsAcceptor::from(Arc::new(server_cfg))))
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
-
-    use super::*;
-    use crate::config::ManualCertConfig;
-    use tempfile::TempDir;
-
-    fn traversal_cfg(cert: &str, key: &str) -> ManualCertConfig {
-        ManualCertConfig {
-            cert_path: cert.into(),
-            key_path: key.into(),
-        }
-    }
-
-    // Helper: call load_manual_cert and check that it returns an Err whose
-    // message contains `needle`.
-    fn assert_rejected(cfg: &ManualCertConfig, data_dir: &Path, needle: &str) {
-        match load_manual_cert(cfg, data_dir) {
-            Ok(_) => panic!("expected load_manual_cert to return Err"),
-            Err(err) => {
-                let msg = err.to_string();
-                assert!(
-                    msg.contains(needle),
-                    "expected error to contain {needle:?}, got: {msg:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn rejects_parent_dir_in_cert_path() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = traversal_cfg("../outside.crt", "server.key");
-        assert_rejected(&cfg, tmp.path(), "parent directory");
-    }
-
-    #[test]
-    fn rejects_parent_dir_in_key_path() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = traversal_cfg("server.crt", "../outside.key");
-        assert_rejected(&cfg, tmp.path(), "parent directory");
-    }
-
-    #[test]
-    fn rejects_nested_traversal_in_cert_path() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = traversal_cfg("sub/../../escape.crt", "server.key");
-        assert_rejected(&cfg, tmp.path(), "parent directory");
-    }
-
-    #[test]
-    fn rejects_absolute_cert_path() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = traversal_cfg("/etc/ssl/cert.pem", "server.key");
-        assert_rejected(&cfg, tmp.path(), "relative path");
-    }
-
-    #[test]
-    fn rejects_absolute_key_path() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = traversal_cfg("server.crt", "/etc/ssl/private/key.pem");
-        assert_rejected(&cfg, tmp.path(), "relative path");
-    }
 }

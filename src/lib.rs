@@ -1,13 +1,9 @@
 //! # rusthost — library crate
 //! Exposes the public API surface used by the binary entry point in
-//! `src/main.rs`, integration tests in `tests/`, and downstream callers.
+//! `src/main.rs` and downstream callers.
 
 #![deny(warnings)]
 #![deny(clippy::all, clippy::pedantic)]
-// This project depends on Arti/Tor plus TLS/proc-macro/platform ecosystems
-// that intentionally carry parallel semver lines; forcing unification here is
-// outside this crate's control and would make dependency upgrades brittle.
-#![allow(clippy::multiple_crate_versions)]
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -15,9 +11,8 @@
     clippy::todo,
     clippy::unimplemented
 )]
-#![allow(renamed_and_removed_lints)]
 
-// Public modules used by the CLI, integration tests, and library callers.
+// Public modules used by the CLI and library callers.
 pub mod config;
 pub mod console;
 pub mod error;
@@ -25,7 +20,7 @@ pub(crate) mod io_timeout;
 pub mod logging;
 pub(crate) mod path_display;
 pub(crate) mod persistence;
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub(crate) mod process;
 pub mod runtime;
 pub mod server;

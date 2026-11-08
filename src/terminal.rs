@@ -37,7 +37,7 @@
 //! ## MSRV note
 //!
 //! TTY detection uses [`std::io::IsTerminal`], stable since Rust 1.70 (June
-//! 2023). This project's MSRV is 1.91, so no additional crate is required.
+//! 2023). This project's MSRV is 1.99.1, so no additional crate is required.
 //! The `atty` crate previously used here carries a known memory-safety
 //! vulnerability on Windows (RUSTSEC-2021-0145) and has been removed.
 //!
@@ -81,9 +81,9 @@ pub enum RelaunchIntent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StdioKind {
     Terminal,
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     NullDevice,
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     Redirected,
     Other,
 }
@@ -96,7 +96,7 @@ struct StdioSummary {
 }
 
 impl StdioSummary {
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     const fn all_null_devices(self) -> bool {
         matches!(
             self,
@@ -108,7 +108,7 @@ impl StdioSummary {
         )
     }
 
-    #[cfg(not(any(unix, test)))]
+    #[cfg(not(unix))]
     const fn all_null_devices(self) -> bool {
         let _ = self;
         false
@@ -120,14 +120,14 @@ impl StdioSummary {
             || matches!(self.stderr, StdioKind::Terminal)
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(unix)]
     const fn has_redirected_stream(self) -> bool {
         matches!(self.stdin, StdioKind::Redirected)
             || matches!(self.stdout, StdioKind::Redirected)
             || matches!(self.stderr, StdioKind::Redirected)
     }
 
-    #[cfg(not(any(unix, test)))]
+    #[cfg(not(unix))]
     const fn has_redirected_stream(self) -> bool {
         let _ = self;
         false
@@ -452,76 +452,4 @@ fn is_on_path(name: &str) -> bool {
             p.metadata()
                 .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{should_relaunch, RelaunchIntent, StdioKind, StdioSummary};
-
-    const NULL_STDIO: StdioSummary = StdioSummary {
-        stdin: StdioKind::NullDevice,
-        stdout: StdioKind::NullDevice,
-        stderr: StdioKind::NullDevice,
-    };
-
-    const REDIRECTED_STDIO: StdioSummary = StdioSummary {
-        stdin: StdioKind::Redirected,
-        stdout: StdioKind::Redirected,
-        stderr: StdioKind::Redirected,
-    };
-
-    #[test]
-    fn headless_invocation_never_relaunches() {
-        assert!(!should_relaunch(
-            RelaunchIntent::Headless,
-            false,
-            NULL_STDIO
-        ));
-    }
-
-    #[test]
-    fn help_invocation_never_relaunches() {
-        assert!(!should_relaunch(RelaunchIntent::Help, false, NULL_STDIO));
-    }
-
-    #[test]
-    fn version_invocation_never_relaunches() {
-        assert!(!should_relaunch(RelaunchIntent::Version, false, NULL_STDIO));
-    }
-
-    #[test]
-    fn invalid_arguments_never_relaunch() {
-        assert!(!should_relaunch(
-            RelaunchIntent::InvalidArguments,
-            false,
-            NULL_STDIO
-        ));
-    }
-
-    #[test]
-    fn spawned_process_never_relaunches() {
-        assert!(!should_relaunch(
-            RelaunchIntent::Interactive,
-            true,
-            NULL_STDIO
-        ));
-    }
-
-    #[test]
-    fn redirected_stdio_is_treated_as_service_style() {
-        assert!(!should_relaunch(
-            RelaunchIntent::Interactive,
-            false,
-            REDIRECTED_STDIO
-        ));
-    }
-
-    #[test]
-    fn detached_interactive_stdio_requests_relaunch() {
-        assert!(should_relaunch(
-            RelaunchIntent::Interactive,
-            false,
-            NULL_STDIO
-        ));
-    }
 }

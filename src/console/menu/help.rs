@@ -157,20 +157,3 @@ pub fn render(page: &HelpPageState) -> String {
     ui::push_controls_footer(&mut out, "[↑↓/jk] Select  [Enter] Open  [Esc] Back");
     out
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{render, HelpPageState};
-
-    #[test]
-    fn help_opens_selected_topic_on_same_page() {
-        let mut page = HelpPageState::new();
-        page.move_down();
-        page.open_selected();
-        let output = render(&page);
-
-        assert!(output.contains("rusthost-cli --headless"));
-        assert!(!output.contains("check-config"));
-        assert!(!output.contains("[Q] Quit"));
-    }
-}

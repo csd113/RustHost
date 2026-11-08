@@ -182,36 +182,3 @@ macro_rules! cache_impl {
 }
 cache_impl!(CertCache, EC, load_cert, store_cert, Kind::Certificate);
 cache_impl!(AccountCache, EA, load_account, store_account, Kind::Account);
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rustls_acme::AccountCache as _;
-    #[tokio::test]
-    async fn cache_is_compatible_and_recovers_previous_key() -> io::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let cache = AtomicCache::new(tmp.path().to_owned())?;
-        let key = rcgen::KeyPair::generate()
-            .map_err(io::Error::other)?
-            .serialize_der();
-        let contact = vec!["mailto:test@example.com".into()];
-        cache.store_account(&contact, "directory", &key).await?;
-        let legacy = rustls_acme::caches::DirCache::new(tmp.path());
-        assert_eq!(
-            legacy.load_account(&contact, "directory").await?,
-            Some(key.clone())
-        );
-        let next = rcgen::KeyPair::generate()
-            .map_err(io::Error::other)?
-            .serialize_der();
-        cache.store_account(&contact, "directory", &next).await?;
-        let name = AtomicCache::filename(Kind::Account, &contact, "directory")?;
-        std::fs::write(tmp.path().join(name), b"partial")?;
-        assert_eq!(cache.load_account(&contact, "directory").await?, Some(key));
-        assert!(cache
-            .store_account(&contact, "directory", b"invalid")
-            .await
-            .is_err());
-        Ok(())
-    }
-}

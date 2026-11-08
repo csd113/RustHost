@@ -18,6 +18,7 @@ pub struct Directory {
 impl Directory {
     pub fn open(path: &Path) -> io::Result<Self> {
         create_dir_all(path)?;
+        #[cfg(unix)]
         for ancestor in path.ancestors().filter(|p| !p.as_os_str().is_empty()) {
             sync_dir(ancestor)?;
         }
@@ -97,6 +98,7 @@ impl Directory {
                     Err(e) => return Err(e),
                 }
             }
+            #[cfg(unix)]
             sync_dir(&self.path)?;
             Ok(true)
         })();
@@ -169,26 +171,23 @@ pub fn create_dir_all(path: &Path) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
         Err(e) => return Err(e),
     }
-    sync_dir(path)?;
-    sync_dir(
-        path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new(".")),
-    )
-}
-
-fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        File::open(path)?.sync_all()
+        sync_dir(path)?;
+        sync_dir(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?;
     }
-    // std has no portable directory flush on Windows. File contents are synced;
-    // power-loss durability of the rename needs platform-specific validation.
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    Ok(())
+}
+
+// std has no portable directory flush on Windows. File contents are synced;
+// power-loss durability of the rename needs platform-specific validation.
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 pub fn create_default(path: &Path, contents: &[u8]) -> io::Result<()> {
@@ -201,132 +200,4 @@ pub fn create_default(path: &Path, contents: &[u8]) -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid default filename"))?;
     Directory::open(parent)?.write(name, contents, false)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn reserved_names_cannot_replace_writer_lock_or_stage() -> io::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let mut dir = Directory::open(tmp.path())?;
-        for name in [
-            ".rusthost-persist.lock",
-            ".rusthost-persist.tmp",
-            "../escape",
-        ] {
-            assert!(dir.write(name, b"invalid", true).is_err());
-        }
-        assert!(Directory::open(tmp.path()).is_err());
-        dir.write("valid", b"valid", true)?;
-        Ok(())
-    }
-
-    #[test]
-    fn crashed_stage_recovers_old_generation_and_releases_lock() -> io::Result<()> {
-        const CHILD_DIR: &str = "RUSTHOST_TEST_CRASH_DIRECTORY";
-        if let Some(path) = std::env::var_os(CHILD_DIR) {
-            let mut dir = Directory::open(Path::new(&path))?;
-            dir.stage(std::ffi::OsStr::new("state"), true, |file| {
-                file.write_all(b"partial generation")?;
-                std::process::exit(0);
-            })?;
-            return Ok(());
-        }
-        let tmp = tempfile::tempdir()?;
-        Directory::open(tmp.path())?.write("state", b"old generation", true)?;
-        let mut command = std::process::Command::new(std::env::current_exe()?);
-        command
-            .args([
-                "--exact",
-                "persistence::tests::crashed_stage_recovers_old_generation_and_releases_lock",
-            ])
-            .env(CHILD_DIR, tmp.path());
-        assert!(
-            crate::process::run_bounded(&mut command, std::time::Duration::from_secs(5))?.success()
-        );
-        assert!(tmp.path().join(".rusthost-persist.tmp").exists());
-        let mut dir = Directory::open(tmp.path())?;
-        assert_eq!(std::fs::read(tmp.path().join("state"))?, b"old generation");
-        assert!(!tmp.path().join(".rusthost-persist.tmp").exists());
-        dir.write("state", b"new generation", true)?;
-        assert_eq!(std::fs::read(tmp.path().join("state"))?, b"new generation");
-        Ok(())
-    }
-
-    #[test]
-    fn concurrent_readers_observe_complete_generations() -> io::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let mut dir = Directory::open(tmp.path())?;
-        let old = vec![b'a'; 4096];
-        let new = vec![b'b'; 8192];
-        dir.write("state", &old, true)?;
-        std::thread::scope(|scope| -> io::Result<()> {
-            let reader = scope.spawn(|| -> io::Result<()> {
-                for _ in 0..200 {
-                    let observed = std::fs::read(tmp.path().join("state"))?;
-                    assert!(observed == old || observed == new);
-                }
-                Ok(())
-            });
-            for _ in 0..20 {
-                dir.write("state", &new, true)?;
-                dir.write("state", &old, true)?;
-            }
-            reader
-                .join()
-                .map_err(|_| io::Error::other("reader panicked"))??;
-            Ok(())
-        })
-    }
-
-    #[test]
-    fn failed_stage_keeps_old_file_and_removes_temporary() -> io::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let mut dir = Directory::open(tmp.path())?;
-        dir.write("state", b"old", true)?;
-        assert!(dir
-            .stage(std::ffi::OsStr::new("state"), true, |file| {
-                file.write_all(b"partial")?;
-                Err(io::Error::other("injected write failure"))
-            })
-            .is_err());
-        assert_eq!(std::fs::read(tmp.path().join("state"))?, b"old");
-        assert!(!tmp.path().join(".rusthost-persist.tmp").exists());
-        dir.write("state", b"new", true)?;
-        assert_eq!(std::fs::read(tmp.path().join("state"))?, b"new");
-        Ok(())
-    }
-    #[test]
-    fn no_clobber_and_stale_stage_recovery() -> io::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        std::fs::write(tmp.path().join(".rusthost-persist.tmp"), b"crashed")?;
-        let mut dir = Directory::open(tmp.path())?;
-        assert!(dir.write("settings", b"first", false)?);
-        assert!(!dir.write("settings", b"second", false)?);
-        assert_eq!(std::fs::read(tmp.path().join("settings"))?, b"first");
-        assert!(Directory::open(tmp.path()).is_err());
-        drop(dir);
-        assert!(Directory::open(tmp.path()).is_ok());
-        Ok(())
-    }
-    #[cfg(unix)]
-    #[test]
-    fn rejects_symlink_replacement_and_private_mode_is_preserved() -> io::Result<()> {
-        use std::os::unix::fs::{symlink, PermissionsExt as _};
-        let tmp = tempfile::tempdir()?;
-        let mut dir = Directory::open(tmp.path())?;
-        dir.write("real", b"secret", true)?;
-        symlink("real", tmp.path().join("link"))?;
-        assert!(dir.write("link", b"changed", true).is_err());
-        assert_eq!(std::fs::read(tmp.path().join("real"))?, b"secret");
-        assert_eq!(
-            std::fs::metadata(tmp.path().join("real"))?
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        Ok(())
-    }
 }

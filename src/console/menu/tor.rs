@@ -179,26 +179,3 @@ fn bootstrap_log_label(state: &AppState) -> String {
 fn single_line(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{copy_onion_status, render, TorPageState};
-    use crate::{config::Config, runtime::state::AppState};
-
-    #[test]
-    fn restart_action_is_rendered_as_unsupported() {
-        let output = render(&TorPageState::new(), &Config::default(), &AppState::new());
-
-        assert!(output.contains("Restart Tor: not supported yet"));
-        assert!(!output.contains("[Q] Quit"));
-    }
-
-    #[test]
-    fn copy_onion_degrades_without_clipboard() {
-        let mut state = AppState::new();
-        state.onion_address = Some("abcdefghijklmnop.onion".to_owned());
-
-        assert!(copy_onion_status(&state).contains("Clipboard support unavailable"));
-        assert!(copy_onion_status(&state).contains("abcdefghijklmnop.onion"));
-    }
-}

@@ -23,10 +23,6 @@ allow = [
     "CC0-1.0",
     # MPL-2.0 — pulled in by option-ext (dirs-sys dependency of arti-client)
     "MPL-2.0",
-    # LGPL-3.0-or-later — pulled in by priority-queue (arti circuit scheduler)
-    # priority-queue is dual-licensed LGPL-3.0-or-later OR MPL-2.0; cargo-deny
-    # requires both sides of an OR expression to be in the allow list.
-    "LGPL-3.0-or-later",
     # BSL-1.0 (Boost) — pulled in by xxhash-rust (arti hashing utilities)
     "BSL-1.0",
     # Unlicense — pulled in by async_executors (arti async runtime abstraction)
@@ -42,61 +38,47 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 deny = []
+# The current Arti/Tor, TLS, crypto and derive-macro graphs require these
+# incompatible semver lines. This is the active-graph subset of clippy.toml.
 skip = [
-    # crossterm 0.28 uses rustix 0.38.x / linux-raw-sys 0.4.x; the async-io /
-    # rustls-acme / tempfile stack uses rustix 1.x / linux-raw-sys 0.12.x.
-    # Both generations are transitive-only; upgrade blocked on crossterm's
-    # upstream adoption of rustix 1.x.
-    { name = "rustix" },
-    { name = "linux-raw-sys" },
-    # Various crates in the tokio/crossterm/arti tree pin different windows-sys generations
-    { name = "windows-sys" },
-    # Arti 0.40 dependency tree spans multiple generations of these crates;
-    # none of the duplicates are under our direct control.
     { name = "atomic" },
-    { name = "bitflags" },
+    { name = "base64" },
+    { name = "block-buffer" },
+    { name = "cipher" },
+    { name = "const-oid" },
+    { name = "cpufeatures" },
+    { name = "crypto-common" },
     { name = "darling" },
     { name = "darling_core" },
     { name = "darling_macro" },
+    { name = "der" },
+    { name = "digest" },
+    { name = "foldhash" },
     { name = "getrandom" },
-    { name = "itertools" },
+    { name = "hashbrown" },
+    { name = "inout" },
+    { name = "pem" },
+    { name = "pem-rfc7468" },
     { name = "r-efi" },
     { name = "rand" },
     { name = "rand_chacha" },
     { name = "rand_core" },
+    { name = "rcgen" },
     { name = "serde_spanned" },
+    { name = "sha2" },
+    { name = "signature" },
+    { name = "spki" },
     { name = "strsim" },
     { name = "syn" },
+    { name = "synstructure" },
     { name = "thiserror" },
     { name = "thiserror-impl" },
     { name = "toml" },
     { name = "toml_datetime" },
     { name = "toml_edit" },
-    { name = "windows-core" },
-    { name = "windows-link" },
-    { name = "windows-result" },
-    { name = "windows-strings" },
-    { name = "windows-targets" },
-    { name = "windows_aarch64_gnullvm" },
-    { name = "windows_aarch64_msvc" },
-    { name = "windows_i686_gnu" },
-    { name = "windows_i686_gnullvm" },  # 0.52.6 (ring) vs 0.53.1 (notify → tor-config)
-    { name = "windows_i686_msvc" },
-    { name = "windows_x86_64_gnu" },
-    { name = "windows_x86_64_gnullvm" },
-    { name = "windows_x86_64_msvc" },
+    { name = "windows-sys" },
     { name = "winnow" },
-    # hashbrown 0.12 / 0.15 / 0.16 — pulled by indexmap 1.x, tokio/arti, and
-    # latest arti-client dependency updates respectively
-    { name = "hashbrown" },
-    # asn1-rs 0.6.x / 0.7.x — x509-cert pulls der 0.7 → asn1-rs 0.6;
-    # tor-* crates pull der 0.8 → asn1-rs 0.7.  Both generations are needed
-    # until the tor-* ecosystem converges on a single der/asn1-rs release.
-    { name = "asn1-rs" },
-    { name = "asn1-rs-derive" },
-    # der-parser 9.0.0 (x509-parser → rustls-acme) vs 10.0.0 (tor-llcrypto → arti-client)
-    { name = "der-parser" },
-
+    { name = "yasna" },
 ]
 
 # ─── Advisories ───────────────────────────────────────────────────────────────
@@ -114,9 +96,6 @@ ignore = [
     # Transitive dep via tor-rtcompat → arti-client.
     { id = "RUSTSEC-2024-0436", reason = "transitive dep via arti-client/tor-rtcompat; no direct upgrade path available" },
 
-    # rustls-pemfile 2.2.0 — unmaintained (RUSTSEC-2025-0134).
-    # Direct dep of rusthost; migrate to rustls-pki-types PemObject trait when time allows.
-    { id = "RUSTSEC-2025-0134", reason = "direct dep of rusthost; migrate to rustls-pki-types PemObject trait (>=1.9.0)" },
 ]
 
 # ─── Sources ──────────────────────────────────────────────────────────────────

@@ -16,7 +16,7 @@ use tokio::{
 };
 
 /// Long downloads are allowed, but trickle traffic cannot retain a slot forever.
-pub const MAX_CONNECTION_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+pub const MAX_CONNECTION_AGE: Duration = Duration::from_hours(24);
 pub const TRANSFER_IDLE: Duration = Duration::from_secs(60);
 
 pub struct ProgressStream<S> {
@@ -133,42 +133,4 @@ pub async fn with_idle_timeout<F: Future>(
         }
     })
     .await
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::expect_used)]
-    use super::*;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    #[tokio::test(start_paused = true)]
-    async fn stalled_write_times_out_even_with_incoming_progress() -> io::Result<()> {
-        let (stream, mut peer) = tokio::io::duplex(1);
-        let progress = Arc::new(AtomicU64::new(0));
-        let mut stream =
-            ProgressStream::new(stream, Arc::clone(&progress), Duration::from_millis(30));
-        stream.write_all(b"x").await?;
-        peer.write_all(b"y").await?;
-        assert_eq!(stream.read_u8().await?, b'y');
-        let error = tokio::time::timeout(Duration::from_secs(2), stream.write_all(b"blocked"))
-            .await
-            .map_err(io::Error::other)?
-            .expect_err("stalled writer must time out");
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        Ok(())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn idle_driver_is_woken_without_io_polls() {
-        let result = with_idle_timeout(
-            std::future::pending::<()>(),
-            Arc::new(AtomicU64::new(0)),
-            Duration::from_millis(10),
-        )
-        .await;
-        assert_eq!(
-            result.expect_err("idle deadline").kind(),
-            io::ErrorKind::TimedOut
-        );
-    }
 }

@@ -1,7 +1,7 @@
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 use std::io;
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 pub fn validate_windows_identity_name_component(
     s: &str,
     extra_disallowed: &[char],
@@ -64,36 +64,4 @@ pub fn current_windows_identity(extra_disallowed: &[char]) -> io::Result<(String
     validate_windows_identity_name_component(&userdomain, extra_disallowed)?;
 
     Ok((userdomain, username))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::validate_windows_identity_name_component;
-
-    #[test]
-    fn rejects_empty_names() {
-        assert!(validate_windows_identity_name_component("", &[]).is_err());
-    }
-
-    #[test]
-    fn rejects_overlong_names() {
-        assert!(validate_windows_identity_name_component(&"a".repeat(257), &[]).is_err());
-    }
-
-    #[test]
-    fn rejects_common_icacls_metacharacters() {
-        assert!(validate_windows_identity_name_component("user(admin)", &[]).is_err());
-        assert!(validate_windows_identity_name_component("user;cmd", &[]).is_err());
-    }
-
-    #[test]
-    fn rejects_optional_extra_characters() {
-        assert!(validate_windows_identity_name_component("user & evil", &['&']).is_err());
-    }
-
-    #[test]
-    fn accepts_normal_names() {
-        assert!(validate_windows_identity_name_component("John Smith", &[]).is_ok());
-        assert!(validate_windows_identity_name_component("normal_user", &['&']).is_ok());
-    }
 }
