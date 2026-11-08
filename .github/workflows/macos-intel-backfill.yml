@@ -1,0 +1,177 @@
+name: macOS Intel v1.2.0 backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Add the Intel archive and dedicated checksum to the existing release
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-v1.2.0-macos-intel-backfill
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: v1.2.0
+  SOURCE_COMMIT: cd4b838707e337d809e7a72761d54d3c32f84cbb
+  ASSET_NAME: rusthost-cli-v1.2.0-macos-intel
+  CHECKSUM_NAME: SHA256SUMS-macos-intel.txt
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_TOOLCHAIN: 1.99.1
+
+jobs:
+  build:
+    name: Build original release for macOS Intel
+    # Rust's Intel target is cross-compiled by the ARM64 host toolchain.
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout immutable release source
+        uses: actions/checkout@v6.0.1
+        with:
+          ref: cd4b838707e337d809e7a72761d54d3c32f84cbb
+
+      - name: Verify source, tag and existing published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)" = "$SOURCE_COMMIT"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,tagName \
+            --jq 'select(.isDraft == false and .tagName == "v1.2.0") | .tagName' | grep -Fx "$RELEASE_TAG"
+          python3 - <<'PYTHON'
+          import os
+          import tomllib
+          from pathlib import Path
+          assert tomllib.loads(Path("Cargo.toml").read_text())["package"]["version"] == "1.2.0"
+          assert tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]["channel"] == os.environ["RUSTUP_TOOLCHAIN"]
+          PYTHON
+
+      - name: Install pinned ARM64 Rust toolchain and Intel target
+        uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos-intel-backfill
+          key: x86_64-apple-darwin
+
+      - name: Cross-compile original source
+        env:
+          RUSTHOST_GIT_COMMIT: ${{ env.SOURCE_COMMIT }}
+        run: cargo build --locked --release --target x86_64-apple-darwin
+
+      - name: Package and verify Intel archive
+        run: |
+          set -euo pipefail
+          binary=target/x86_64-apple-darwin/release/rusthost-cli
+          file "$binary" | tee binary-format.txt
+          grep -F 'Mach-O 64-bit executable x86_64' binary-format.txt
+          test "$(lipo -archs "$binary")" = x86_64
+          otool -hv "$binary"
+          mkdir -p "dist/package/$ASSET_NAME"
+          cp "$binary" "dist/package/$ASSET_NAME/rusthost-cli"
+          chmod 0755 "dist/package/$ASSET_NAME/rusthost-cli"
+          cp README.md LICENSE "dist/package/$ASSET_NAME/"
+          {
+            printf 'Release: %s\nSource commit: %s\n' "$RELEASE_TAG" "$SOURCE_COMMIT"
+            printf 'Target: x86_64-apple-darwin\nWorkflow: %s\n' "$GITHUB_WORKFLOW_REF"
+            printf 'Run: https://github.com/%s/actions/runs/%s\n' "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf 'Validation: cross-compiled on ARM64; Mach-O architecture and archive verified; native Intel runtime not tested.\n'
+            rustc --version --verbose
+            xcrun --sdk macosx --show-sdk-version
+            cat binary-format.txt
+          } > "dist/package/$ASSET_NAME/BUILD.txt"
+          (cd dist/package && zip -r -9 "../$ASSET_NAME.zip" "$ASSET_NAME")
+          (cd dist && shasum -a 256 "$ASSET_NAME.zip" > "$CHECKSUM_NAME" && shasum -a 256 -c "$CHECKSUM_NAME")
+          verify_dir=$(mktemp -d)
+          unzip -q "dist/$ASSET_NAME.zip" -d "$verify_dir"
+          diff -r "dist/package/$ASSET_NAME" "$verify_dir/$ASSET_NAME"
+          test -x "$verify_dir/$ASSET_NAME/rusthost-cli"
+          test "$(lipo -archs "$verify_dir/$ASSET_NAME/rusthost-cli")" = x86_64
+          file "$verify_dir/$ASSET_NAME/rusthost-cli"
+          otool -hv "$verify_dir/$ASSET_NAME/rusthost-cli"
+          cat "dist/package/$ASSET_NAME/BUILD.txt" >> "$GITHUB_STEP_SUMMARY"
+          cat "dist/$CHECKSUM_NAME" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain verified Intel package
+        uses: actions/upload-artifact@v6
+        with:
+          name: rusthost-cli-v1.2.0-macos-intel
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS-macos-intel.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Add Intel assets to existing release
+    if: ${{ inputs.publish && github.ref == 'refs/heads/main' }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified Intel package
+        uses: actions/download-artifact@v5
+        with:
+          name: rusthost-cli-v1.2.0-macos-intel
+          path: dist
+
+      - name: Verify release and append new assets without replacement
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)" = "$SOURCE_COMMIT"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,tagName \
+            --jq 'select(.isDraft == false and .tagName == "v1.2.0") | .tagName' | grep -Fx "$RELEASE_TAG"
+          cd dist
+          sha256sum --check --strict "$CHECKSUM_NAME"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > ../release-before.json
+          python3 - <<'PYTHON'
+          import json
+          import os
+          from pathlib import Path
+          release = json.loads(Path("../release-before.json").read_text())
+          names = {asset["name"] for asset in release["assets"]}
+          requested = {os.environ["ASSET_NAME"] + ".zip", os.environ["CHECKSUM_NAME"]}
+          if names & requested:
+              raise SystemExit("Intel assets already exist; refusing to replace any asset")
+          if "SHA256SUMS.txt" not in names:
+              raise SystemExit("Original release checksum manifest is missing")
+          PYTHON
+          # No --clobber: GitHub rejects a conflicting asset rather than replacing it.
+          gh release upload "$RELEASE_TAG" "$ASSET_NAME.zip" "$CHECKSUM_NAME" --repo "$GITHUB_REPOSITORY"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > ../release-after.json
+          python3 - <<'PYTHON'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          before = json.loads(Path("../release-before.json").read_text())
+          after = json.loads(Path("../release-after.json").read_text())
+          current = {asset["name"]: asset for asset in after["assets"]}
+          for asset in before["assets"]:
+              preserved = current[asset["name"]]
+              for field in ("id", "size", "digest", "updated_at"):
+                  assert preserved.get(field) == asset.get(field), (asset["name"], field)
+          for name in (os.environ["ASSET_NAME"] + ".zip", os.environ["CHECKSUM_NAME"]):
+              asset = current[name]
+              assert asset["size"] == Path(name).stat().st_size
+              assert asset["digest"] == "sha256:" + hashlib.sha256(Path(name).read_bytes()).hexdigest()
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+                  summary.write(f"{asset['browser_download_url']}\n")
+          PYTHON
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)" = "$SOURCE_COMMIT"
