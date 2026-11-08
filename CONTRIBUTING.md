@@ -100,7 +100,9 @@ were removed for 1.2.0. The static site fixture is retained under
 `docs/fixtures/html_stress/` for manual HTTP smoke checks. Validate a release
 against an isolated data directory: version/help, doctor, HTTP GET/HEAD,
 health/readiness, traversal rejection, ranges, conditional requests, and graceful
-shutdown. Container CI retains its production readiness smoke check.
+shutdown. Container CI retains its production readiness smoke check. The protected-branch
+status named `Tests` is retained for compatibility and runs production compilation
+only; `Quality` aggregates the compiler/OS lint matrix.
 
 ---
 

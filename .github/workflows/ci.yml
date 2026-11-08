@@ -60,6 +60,18 @@ jobs:
           -D clippy::nursery
           -D clippy::cargo
 
+  # Preserve the existing required status while gating every matrix entry.
+  quality-gate:
+    name: Quality
+    if: ${{ always() }}
+    needs: quality
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require all lint jobs to pass
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+        run: test "$QUALITY_RESULT" = success
+
   platform-smoke:
     name: Platform smoke (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -97,8 +109,9 @@ jobs:
       - name: Build
         run: cargo build --locked --all-features --target ${{ matrix.target }} --verbose
 
+  # Legacy protected-branch status name; validates production compilation only.
   msrv:
-    name: Rust 1.99.1 compatibility
+    name: Tests
     env:
       RUSTUP_TOOLCHAIN: "1.99.1"
     runs-on: ubuntu-24.04

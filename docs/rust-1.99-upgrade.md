@@ -138,4 +138,10 @@ records still describe the tests that existed when those records were written.
   execution and container builds are unavailable locally. Existing native Linux,
   macOS and Windows build/release matrices remain; the quality matrix now checks
   both Linux and Windows. Their remote results are not claimed as local passes.
+- Main requires the historical `Quality`, `Tests` and three platform-smoke
+  status names, including for administrators. CI preserves that contract:
+  `Quality` aggregates all lint jobs; the legacy `Tests` status runs only a
+  production Cargo check. No retired tests were restored, and branch protections
+  were not weakened. Direct pushes are rejected; publication and upgrade-branch
+  deletion depend on a successful PR merge.
 - No live public Tor onion-service or ACME issuance validation is claimed.
