@@ -16,6 +16,7 @@ Serve a folder of HTML, CSS, JavaScript, and other files from one executable. Ru
    | --- | --- |
    | `windows-x86_64` | Windows, Intel/AMD 64-bit |
    | `apple-silicon` | macOS, Apple Silicon |
+   | `macos-intel` | macOS, Intel 64-bit |
    | `linux-x86_64` | Linux, Intel/AMD 64-bit |
    | `linux-arm64` | Linux, ARM64 |
 

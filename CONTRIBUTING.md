@@ -43,7 +43,7 @@ Audit the lockfile, not `.cargo/audit.toml`: the latter is policy configuration.
 
 Project-owned unit and integration harnesses were retired in 1.2.0. Validate behavior changes against an isolated data directory using the built binary. Cover the affected paths and, for releases, version/help, Doctor, GET/HEAD, health/readiness, TLS, ranges, caching, compression, path rejection, persisted certificate reuse, and graceful shutdown. Do not use an operator's live data for smoke checks.
 
-CI runs Linux/Windows formatting and lint jobs and Linux ARM64, macOS Apple Silicon, and Windows build jobs. The required status named `Tests` is a legacy name for a production Cargo check; it does not run the retired tests. `Quality` aggregates the lint matrix. Docker CI separately builds both architectures and checks container readiness and persistent-volume setup. A build or local smoke check does not establish live Tor, ACME renewal, power-loss recovery, or production-load behavior.
+CI runs Linux/Windows formatting and lint jobs and Linux ARM64, macOS Apple Silicon, macOS Intel, and Windows build jobs. The Intel target cross-compiles on the ARM64 `macos-15` runner with Rust 1.99.1 and the macOS SDK; `file`, `lipo`, and `otool` inspect the resulting x86_64 Mach-O. This is build validation, not native Intel runtime validation. The required status named `Tests` is a legacy name for a production Cargo check; it does not run the retired tests. `Quality` aggregates the lint matrix. Docker CI separately builds both architectures and checks container readiness and persistent-volume setup. A build or local smoke check does not establish live Tor, ACME renewal, power-loss recovery, or production-load behavior.
 
 ## Code and dependency policy
 
@@ -83,4 +83,12 @@ Open a focused pull request and let the required checks pass before merging. Do 
 
 For a compiler upgrade, update the toolchain, manifest minimum, CI, release, audit, and container pins together, then run the gates above. Keep the release compiler pinned even though CI also checks stable.
 
-The release workflow requires the `v` tag to match the package version and a matching `[vX.Y.Z]` changelog entry. It packages binaries, README, and LICENSE for four targets and publishes a verified `SHA256SUMS.txt`. Container automation publishes release version/minor tags and main-branch `edge` builds. These workflows are the source of truth for packaging; tagging and publishing are separate release actions.
+The release workflow requires the `v` tag to match the package version and a matching `[vX.Y.Z]` changelog entry. It packages binaries, README, and LICENSE for five targets and publishes a verified `SHA256SUMS.txt`. Container automation publishes release version/minor tags and main-branch `edge` builds. These workflows are the source of truth for packaging; tagging and publishing are separate release actions.
+
+The manual `macos-intel-backfill.yml` workflow adds Intel packaging to the existing v1.2.0 release. It checks out exactly `cd4b838707e337d809e7a72761d54d3c32f84cbb`, verifies the existing tag still resolves to that commit, and uses Rust 1.99.1 on the ARM64 `macos-15` runner. Its ZIP includes the tagged README/LICENSE and a `BUILD.txt` provenance record. It validates the archived Mach-O and a dedicated `SHA256SUMS-macos-intel.txt`; the original release manifest and assets remain untouched. Dispatch with `publish=false` to retain Actions artifacts only, or `publish=true` from `main` to add the two Intel assets to an already published release. Publication refuses existing Intel asset names and never creates or moves a tag. An upload interrupted between the two files needs operator inspection before another attempt.
+
+For the v1.2.0 Intel download, verify its separate manifest from the directory containing both downloaded files:
+
+```sh
+shasum -a 256 -c SHA256SUMS-macos-intel.txt
+```

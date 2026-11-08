@@ -87,6 +87,10 @@ jobs:
           - name: macos-apple-silicon
             os: macos-15
             target: aarch64-apple-darwin
+          # Rust 1.99.1 runs on ARM64; cross-compile Intel using the macOS SDK.
+          - name: macos-intel
+            os: macos-15
+            target: x86_64-apple-darwin
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -108,6 +112,15 @@ jobs:
 
       - name: Build
         run: cargo build --locked --all-features --target ${{ matrix.target }} --verbose
+
+      - name: Verify Intel Mach-O architecture
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          set -euo pipefail
+          binary=target/x86_64-apple-darwin/debug/rusthost-cli
+          file "$binary"
+          test "$(lipo -archs "$binary")" = x86_64
+          otool -hv "$binary"
 
   # Legacy protected-branch status name; validates production compilation only.
   msrv:
