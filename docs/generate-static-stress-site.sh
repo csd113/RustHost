@@ -2,7 +2,7 @@
 # =============================================================================
 # RustHost Static Stress Test Fixture Generator
 # =============================================================================
-# Usage:  ./scripts/generate-static-stress-site.sh [OUTPUT_DIR]
+# Usage:  ./docs/generate-static-stress-site.sh [OUTPUT_DIR]
 # Default output: <repo-root>/test-sites/static-stress/
 #
 # Optional deps (gracefully skipped if absent):

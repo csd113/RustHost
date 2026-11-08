@@ -1,7 +1,7 @@
 # Arti/Tor, ACME/TLS and their derive macros require incompatible semver lines.
 # This per-crate inventory keeps multiple_crate_versions enabled for unexpected
-# duplicates. Remove entries when upstream dependencies converge; see the release
-# upgrade report for the resolved graph and rationale.
+# duplicates. Remove entries when upstream dependencies converge; see
+# CONTRIBUTING.md for the current dependency policy and rationale.
 allowed-duplicate-crates = [
     "atomic",
     "base64",

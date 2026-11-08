@@ -1,330 +1,70 @@
 # RustHost
 
-> Single-binary static file server with HTTP, HTTPS, and built-in Tor onion service support.
-
 [![CI](https://github.com/csd113/RustHost/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/csd113/RustHost/actions/workflows/ci.yml)
 [![Dependency Audit](https://github.com/csd113/RustHost/actions/workflows/audit.yml/badge.svg)](https://github.com/csd113/RustHost/actions/workflows/audit.yml)
 [![License: MIT](https://img.shields.io/github/license/csd113/RustHost)](LICENSE)
-[![Rust 1.99.1+](https://img.shields.io/badge/rust-1.99.1%2B-orange)](Cargo.toml)
-[![Version](https://img.shields.io/badge/version-v1.2.0-blue)](CHANGELOG.md)
-[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-3b82f6)](.github/workflows/ci.yml)
 
-RustHost is a production-focused static file server written in Rust. Drop in a directory, configure `settings.toml`, and get HTTP, optional HTTPS (self-signed, manual, or ACME), and an in-process Tor onion service — all from one binary.
+Serve a folder of HTML, CSS, JavaScript, and other files from one executable. RustHost includes a terminal dashboard, optional HTTPS, and a built-in Tor onion service.
 
-It is intentionally narrow in scope: no web framework, no CMS, no reverse proxy, no auth layer. Just explicit, inspectable static hosting.
+## Download and run
 
----
+**You do not need Rust or a separate Tor installation.**
 
-## Table of Contents
+1. Download a ZIP from [Releases](https://github.com/csd113/RustHost/releases/latest) for your computer:
 
-- [Features](#features)
-- [Quick Start](#quick-start)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [Operational Endpoints](#operational-endpoints)
-- [Doctor and Diagnostics](#doctor-and-diagnostics)
-- [TUI Overview](#tui-overview)
-- [Security Notes](#security-notes)
-- [Platform Support](#platform-support)
-- [Development](#development)
-- [License](#license)
+   | Archive suffix | Computer |
+   | --- | --- |
+   | `windows-x86_64` | Windows, Intel/AMD 64-bit |
+   | `apple-silicon` | macOS, Apple Silicon |
+   | `linux-x86_64` | Linux, Intel/AMD 64-bit |
+   | `linux-arm64` | Linux, ARM64 |
 
----
+2. Extract the ZIP and open a terminal in the extracted folder.
+3. Start RustHost:
 
-## Features
+   **Windows (PowerShell)**
 
-| Area | Details |
-|---|---|
-| **Static hosting** | HTTP/1.1 keep-alive, `GET` / `HEAD` / `OPTIONS`, ETag & `Last-Modified`, range requests, compression, precompressed sidecars, SPA fallback, custom error pages, optional directory listings |
-| **HTTPS** | Self-signed localhost certs, manual PEM loading, ACME / Let's Encrypt, optional HTTP→HTTPS redirect |
-| **Tor** | In-process onion service via [Arti](https://gitlab.torproject.org/tpo/core/arti) — no external Tor daemon required |
-| **Operations** | `/health`, `/ready`, headless mode, graceful shutdown, structured logging, connection limits |
-| **TUI** | Interactive terminal dashboard with Home, Logs, Doctor, Diagnostics, Tor, Network, Site, Settings, and Help pages |
-| **Diagnostics** | `rusthost-cli doctor` command, runtime snapshots, build-aware `--version`, readiness checks for config, TLS, Tor, paths, and logging |
+   ```powershell
+   .\rusthost-cli.exe --data-dir .\rusthost-data
+   ```
 
----
+   **macOS / Linux**
 
-## Quick Start
+   ```sh
+   chmod +x ./rusthost-cli
+   ./rusthost-cli --data-dir ./rusthost-data
+   ```
 
-Requires Rust 1.99.1+.
+4. Open **http://127.0.0.1:8080**. Replace `rusthost-data/site/index.html` with your own page and put the rest of your site in that folder.
 
-Development and release builds use the Rust 1.99.1 pin in `rust-toolchain.toml`. CI also checks the latest `stable` compiler so future compiler and Clippy changes are reviewed before updating the release pin. After each stable release, install that exact version with rustup, update the toolchain/CI/container pins together, and pass the full validation gates before using it for releases. `Cargo.toml` sets Rust 1.99.1 as the minimum supported Rust version (MSRV). Existing toolchains and the global rustup default need no changes.
+The dashboard shows addresses and status. Press `H` for help, `R` to rescan the site, or `Q` then `Y` to stop.
 
-```bash
-git clone https://github.com/csd113/RustHost.git
-cd RustHost
-cargo build --release
+**Tor is on by default**, so your site can also become available at a public `.onion` address even though HTTP is bound to localhost. For local-only use, stop RustHost, set `enabled = false` under `[tor]` in `rusthost-data/settings.toml`, and restart.
+
+## Already have a site folder?
+
+Serve it directly without creating a settings file:
+
+```sh
+./rusthost-cli --serve ./public --no-tor
 ```
 
-**Managed mode** — creates a persistent data directory with `settings.toml`, `site/`, and `runtime/`:
+On Windows, use `.\rusthost-cli.exe` instead. Add `--port 3000` to change the port or `--headless` to run without the dashboard. This mode enables directory listings and disables file logging. Omit `--no-tor` to enable onion access. Runtime data can still be created beside the served folder.
 
-```bash
-./target/release/rusthost-cli --data-dir ./rusthost-data
-```
+## What it supports
 
-**One-shot mode** — serve a directory immediately, no config file written:
+- Static files, directory listings, single-page app routing, custom error pages, and redirects.
+- HTTP caching, range requests, compression, and precompressed `.br` / `.gz` files.
+- HTTPS with a local self-signed certificate, your own certificate, or Let's Encrypt.
+- Built-in Tor through Arti, health checks, logs, and a `doctor` command for troubleshooting.
 
-```bash
-./target/release/rusthost-cli --serve ./public
-```
+RustHost does not execute server-side code or provide accounts, uploads, or authentication. Review the files you publish; use an authentication service in front of it if your site needs access control.
 
----
+## More help
 
-## Installation
+- [Setup guide](https://github.com/csd113/RustHost/blob/main/SETUP.md): settings, HTTPS, Tor, Docker, and upgrades.
+- [Operations reference](https://github.com/csd113/RustHost/blob/main/docs/operations.md): CLI options, deployment limits, persistence, and known limitations.
+- [Contributing](https://github.com/csd113/RustHost/blob/main/CONTRIBUTING.md): build from source and validate changes.
+- [Changelog](https://github.com/csd113/RustHost/blob/main/CHANGELOG.md): release history.
 
-### Build from Source
-
-```bash
-git clone https://github.com/csd113/RustHost.git
-cd RustHost
-cargo build --release
-# Binary at: ./target/release/rusthost-cli
-```
-
-### Release Archives
-
-Tagged releases ship as platform-specific ZIP archives containing the `rusthost-cli` binary, `README.md`, and `LICENSE`. Available targets:
-
-| Target | Platform |
-|---|---|
-| `x86_64-unknown-linux-gnu` | Linux x86_64 |
-| `aarch64-unknown-linux-gnu` | Linux ARM64 |
-| `aarch64-apple-darwin` | macOS Apple Silicon |
-| `x86_64-pc-windows-msvc` | Windows x86_64 |
-
-### Docker images
-
-Images are published automatically to `ghcr.io/csd113/rusthost` for Linux AMD64 and ARM64. Release tags publish `1.2.0`, `1.2`, and `latest`; main builds publish `edge`. Pull requests build and smoke-test both architectures without publishing.
-
-```bash
-docker run -d --name rusthost --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 \
-  -v rusthost-data:/data \
-  ghcr.io/csd113/rusthost:1.2.0
-```
-
-Open `http://127.0.0.1:8080`. The named volume retains `settings.toml`, `site/`, and `runtime/`, including the Tor identity, across upgrades. Container defaults bind to `0.0.0.0:8080` internally, enable Tor, and run headlessly as UID/GID `10001`. The host port above is restricted to loopback; choose a public binding deliberately.
-
-Edit `/data/settings.toml` and populate `/data/site` in the volume, then restart for configuration changes. Bind mounts must already be writable by UID/GID `10001` and include a settings file with `server.bind = "0.0.0.0"`; empty bind mounts hide the image's default settings. HTTPS requires configuration and an additional port mapping. The image health check targets HTTP `/ready` on port 8080; override it if you change the listener or enable redirects.
-
-To build locally: `docker build -t rusthost:local .`.
-
----
-
-## Usage
-
-### Version and Build Info
-
-```bash
-./target/release/rusthost-cli --version
-```
-
-Prints the version, build profile, short commit hash, and target triple.
-
-### Interactive TUI
-
-```bash
-# With a managed data directory
-./target/release/rusthost-cli --data-dir ./rusthost-data
-
-# Default (no data-dir flag)
-./target/release/rusthost-cli
-```
-
-### Headless / Service Mode
-
-Disables the TUI — intended for service managers, CI, and remote-shell environments.
-
-```bash
-./target/release/rusthost-cli --headless
-./target/release/rusthost-cli --data-dir ./rusthost-data --headless
-```
-
-### One-Shot Directory Serving
-
-Serves a directory directly without writing a persistent `settings.toml`. Binds to `127.0.0.1`, enables directory listings, disables file logging, and enables Tor by default.
-
-```bash
-./target/release/rusthost-cli --serve ./public
-./target/release/rusthost-cli --serve ./public --port 3000
-./target/release/rusthost-cli --serve ./public --headless
-./target/release/rusthost-cli --serve ./public --no-tor
-```
-
-### Validate an Existing Config
-
-```bash
-./target/release/rusthost-cli doctor
-./target/release/rusthost-cli doctor --data-dir ./rusthost-data
-```
-
----
-
-## Configuration
-
-In managed mode, RustHost generates the following directory structure:
-
-```
-rusthost-data/
-  settings.toml   ← primary config
-  site/           ← static files to serve
-  runtime/        ← logs, TLS state, Tor state
-```
-
-### Defaults
-
-| Setting | Default |
-|---|---|
-| Site root | `site/` (relative to data directory) |
-| HTTP | `127.0.0.1:8080` |
-| HTTPS | Disabled (optional listener on `8443`) |
-| Tor | Enabled |
-| Favicon | `site/favicon.ico` |
-| Logging | Enabled — `runtime/logs/rusthost.log` |
-| Console | Interactive TUI enabled |
-
-### Configuration Sections
-
-| Section | Purpose |
-|---|---|
-| `[server]` | Bind address, port, connection limits, CSP preset, trusted proxies |
-| `[site]` | Site directory, index file, favicon, directory listing, dotfiles, SPA fallback, custom error pages |
-| `[tls]` | HTTPS listener, redirect behavior, ACME, manual PEM certificates |
-| `[tor]` | Onion service enablement and shutdown grace period |
-| `[logging]` | Log level, log file path, dependency log filtering |
-| `[console]` | Interactive dashboard behavior |
-| `[identity]` | Dashboard instance name |
-| `[[redirects]]` | Exact-path redirects evaluated before filesystem resolution |
-
-### Minimal Example
-
-```toml
-[server]
-bind = "127.0.0.1"
-port = 8080
-
-[site]
-directory = "site"
-index_file = "index.html"
-```
-
-### HTTPS / TLS
-
-- HTTPS is optional. When enabled, it supports self-signed localhost certs, manual PEM files, and ACME-managed certificates.
-- `redirect_http = true` requires TLS to be enabled. When active, the HTTP listener redirects rather than serves files.
-
-### Persistence, reloads, and resource limits
-
-Development TLS stores its certificate and private key together in `runtime/tls/dev/self-signed.pem`. Renewal retains `self-signed.previous.pem`; valid older `.crt`/`.key` pairs are imported without changing identity. These bundles contain private keys. Malformed state without a valid backup requires operator repair; RustHost does not silently replace a persisted identity. Application-owned settings, bundles, ACME cache entries, and Doctor reports use atomic publication. Unix writes sync file contents and directory metadata; Windows rename durability still needs platform testing.
-
-`R` and SIGHUP rescan the site, including its favicon path and configured error pages. Settings, listeners, TLS, and Tor configuration still require a restart. Each request selects one complete site generation, including requests on existing keep-alive connections. Failed preparation retains the previous generation. Keep old deployment directories available until in-flight requests finish; editing files in place is not a filesystem snapshot. Scans fail on unreadable entries or limits of 64 directory levels, one million entries, or 4,096 queued directories.
-
-Visitor counting retains at most 65,536 hashes for the process lifetime; `65536+` is a lower bound. No visitor identifiers are persisted. Transfers track progress in both directions: clearnet HTTP/HTTPS retain a five-second inactivity limit, while Tor relay and ingress allow 60 seconds. Headers have a separate five-second deadline, TLS handshakes ten seconds, and HTTP drivers/Tor relays have a 24-hour maximum lifetime even with trickle traffic. A blocked write, flush, or shutdown has a 60-second deadline; shorter connection inactivity limits may expire first. Logs stop accepting file writes at 100 MiB if rotation fails, continuing periodic rotation attempts. See the [second-pass robustness audit](docs/robustness-audit-2026-09-06.md) for validation and remaining upstream/platform limitations.
-
-### Tor
-
-RustHost uses [Arti](https://gitlab.torproject.org/tpo/core/arti) in-process — no external `tor` binary needed. Tor state and cache are stored under `runtime/`. The same site can be accessible over HTTP/HTTPS and `.onion` simultaneously.
-
-### Favicon
-
-- `/favicon.ico` is served from `[site].favicon` (defaults to `favicon.ico` in the site root).
-- Favicon paths are validated to stay within the site directory.
-- Supported formats: `.ico`, `.png`, `.svg`. PNG serving requires `[site].enable_png_favicon = true`.
-
----
-
-## Operational Endpoints
-
-| Endpoint | Behavior |
-|---|---|
-| `/health` | Returns `OK` — basic liveness check |
-| `/ready` | Returns `READY` only after startup completes and active directories are confirmed usable |
-
-```bash
-curl -i http://127.0.0.1:8080/health
-curl -i http://127.0.0.1:8080/ready
-```
-
----
-
-## Doctor and Diagnostics
-
-`rusthost-cli doctor` is a preflight validator. It checks whether RustHost is ready to start and whether runtime assumptions hold for the current configuration.
-
-Checks include config loading, path availability, listener assumptions, TLS and redirect configuration, Tor setup, favicon resolution, and log path availability.
-
-Results are reported as `PASS`, `WARN`, `FAIL`, or `NOT RUN`. The TUI Doctor page can also run these checks interactively without starting any public listeners.
-
-Doctor output is logged to `doctor.log` in the active runtime log path.
-
----
-
-## TUI Overview
-
-```
-RustHost 1.2.0
-HTTP   : http://127.0.0.1:8080
-HTTPS  : disabled
-Tor    : ready
-Site   : ./rusthost-data/site
-Logs   : ./rusthost-data/runtime/logs/rusthost.log
-
-[M] Menu  [L] Logs  [R] Rescan  [H] Help  [Q] Quit
-```
-
-| Page | Purpose |
-|---|---|
-| Home | Runtime status dashboard |
-| Logs | Recent log output |
-| Doctor | Readiness checks for config, paths, ports, TLS, Tor, and favicon |
-| Diagnostics | Compact runtime snapshot for troubleshooting |
-| Tor | Onion service status and Tor runtime details |
-| Network | Bind addresses, ports, HTTPS, and local reachability |
-| Site | Configured site directory and primary served files |
-| Settings | Effective runtime settings |
-| Help | Console controls and guidance |
-
-**Key bindings:** `M` — menu, `L` — logs, `R` — rescan, `Esc` — back, `Q` — quit.
-
----
-
-## Security Notes
-
-- RustHost serves static files only. There are no users, sessions, file uploads, or admin auth endpoints.
-- Default bind is `127.0.0.1`. Only bind to `0.0.0.0` or a public interface when your firewall and deployment model are intentional.
-- `/ready` fails closed until startup completes and active directories are confirmed usable.
-- Favicon paths are constrained to the site root. Redirects are validated before use.
-- Review site contents before public exposure — RustHost will not classify files as sensitive.
-- For authenticated operator access or complex ingress policy, place RustHost behind a service that provides it.
-
----
-
-## Platform Support
-
-Actively tested in CI on:
-
-- **Ubuntu 24.04** — formatting, linting, tests, and release builds
-- **Linux ARM64, macOS Apple Silicon, Windows x86_64** — platform smoke builds
-
-Other Rust-supported targets may work but are not covered by the repository workflows.
-
----
-
-## Development
-
-```bash
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo check --locked --workspace --all-targets --all-features
-```
-
-CI enforces a stricter Clippy gate including `clippy::pedantic`, `clippy::nursery`, and `clippy::cargo`.
-
-See [CHANGELOG.md](CHANGELOG.md) and the [release workflow](.github/workflows/release.yml) for version history and release automation.
-
----
-
-## License
-
-RustHost is released under the [MIT License](LICENSE).
+The online guides also work when this README is opened from a release ZIP. RustHost is available under the [MIT License](LICENSE).
