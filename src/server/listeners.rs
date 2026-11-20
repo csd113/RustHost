@@ -111,10 +111,7 @@ pub async fn serve(
         role,
         &context.state,
         &mut connections,
-        deadline(
-            started,
-            Duration::from_secs(context.config.server.shutdown_grace_secs),
-        ),
+        deadline(started, role.shutdown_class().grace(&context.config)),
     )
     .await
 }

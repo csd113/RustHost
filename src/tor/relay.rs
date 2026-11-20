@@ -36,7 +36,7 @@ impl Relay {
 
     pub(super) async fn forward(
         &mut self,
-        mut requests: impl futures::Stream<Item = StreamRequest> + Unpin,
+        requests: &mut (impl futures::Stream<Item = StreamRequest> + Unpin),
         local_addr: SocketAddr,
         shutdown: &mut Shutdown,
     ) -> RelayEnd {

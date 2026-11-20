@@ -10,7 +10,7 @@ use crate::{
     config::Config,
     console, logging,
     runtime::{
-        shutdown::{deadline, ServiceOutcome},
+        shutdown::{deadline, ServiceOutcome, ShutdownClass},
         state::{AcmeStatus, ConsoleMode, ListenerRole, ListenerStatus, SharedState, TorStatus},
     },
     server::{
@@ -37,11 +37,12 @@ impl Service {
     }
 
     const fn grace(self, config: &Config) -> Duration {
-        Duration::from_secs(match self {
-            Self::Listener(_) => config.server.shutdown_grace_secs,
-            Self::Acme => 5,
-            Self::Tor => config.tor.shutdown_grace_secs,
-        })
+        let class = match self {
+            Self::Listener(role) => role.shutdown_class(),
+            Self::Acme => ShutdownClass::Acme,
+            Self::Tor => ShutdownClass::Tor,
+        };
+        class.grace(config)
     }
 }
 

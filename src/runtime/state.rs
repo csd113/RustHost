@@ -68,6 +68,14 @@ pub enum ListenerRole {
 }
 
 impl ListenerRole {
+    pub(crate) const fn shutdown_class(self) -> super::shutdown::ShutdownClass {
+        use super::shutdown::ShutdownClass;
+        match self {
+            Self::Http | Self::Https | Self::Redirect => ShutdownClass::Clearnet,
+            Self::TorIngress => ShutdownClass::Tor,
+        }
+    }
+
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {

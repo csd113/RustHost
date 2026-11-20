@@ -253,11 +253,31 @@ async fn run_session(
     log_onion_banner(&onion_name);
     publish(state, TorStatus::Ready, Some(onion_name)).await;
 
-    let mut relay = Relay::new(max_connections);
-    let end = relay
-        .forward(stream_requests, local_addr, &mut shutdown)
-        .await;
-    finish_forwarding(&mut relay, end, state, &mut shutdown, grace).await
+    forward_session(
+        &mut Relay::new(max_connections),
+        stream_requests,
+        local_addr,
+        state,
+        &mut shutdown,
+        grace,
+    )
+    .await
+}
+
+async fn forward_session(
+    relay: &mut Relay,
+    mut requests: impl futures::Stream<Item = StreamRequest> + Unpin,
+    local_addr: SocketAddr,
+    state: &SharedState,
+    shutdown: &mut Shutdown,
+    grace: Duration,
+) -> SessionEnd {
+    let end = relay.forward(&mut requests, local_addr, shutdown).await;
+    // Arti's incoming stream owns rendezvous request sources used by active
+    // transfers. Keep it alive without polling it until those transfers drain.
+    let outcome = finish_forwarding(relay, end, state, shutdown, grace).await;
+    drop(requests);
+    outcome
 }
 
 async fn finish_forwarding(

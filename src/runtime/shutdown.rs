@@ -6,6 +6,26 @@ use std::{
 };
 use tokio::{sync::watch, time::Instant};
 
+use crate::config::Config;
+
+/// Services in one class share a grace period measured from the same signal.
+#[derive(Clone, Copy)]
+pub enum ShutdownClass {
+    Clearnet,
+    Tor,
+    Acme,
+}
+
+impl ShutdownClass {
+    pub const fn grace(self, config: &Config) -> Duration {
+        Duration::from_secs(match self {
+            Self::Clearnet => config.server.shutdown_grace_secs,
+            Self::Tor => config.tor.shutdown_grace_secs,
+            Self::Acme => 5,
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct Shutdown {
     signal: watch::Receiver<bool>,
