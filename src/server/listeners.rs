@@ -54,6 +54,17 @@ pub async fn serve(
     context: ListenerContext,
     ready: impl FnOnce(BindResult),
 ) -> ServiceOutcome {
+    let grace = role.shutdown_class().grace(&context.config);
+    serve_with_grace(role, acceptor, context, grace, ready).await
+}
+
+async fn serve_with_grace(
+    role: ListenerRole,
+    acceptor: Option<Acceptor>,
+    context: ListenerContext,
+    grace: Duration,
+    ready: impl FnOnce(BindResult),
+) -> ServiceOutcome {
     context
         .state
         .set_listener(role, ListenerStatus::Starting)
@@ -109,7 +120,7 @@ pub async fn serve(
         role,
         &context.state,
         &mut connections,
-        deadline(started, role.shutdown_class().grace(&context.config)),
+        deadline(started, grace),
     )
     .await
 }
@@ -415,7 +426,7 @@ pub async fn run_https(
 /// Serve the Tor ingress listener using the legacy port acknowledgement.
 ///
 /// This entry point retains the library API for callers with their own
-/// listener wiring. The application runtime uses socket-address acknowledgements.
+/// listener wiring and uses the grace period from `[server]`.
 #[expect(
     clippy::too_many_arguments,
     reason = "Preserve the public listener signature."
@@ -430,6 +441,7 @@ pub async fn run_tor_ingress(
     shared_semaphore: Arc<Semaphore>,
     root_watch: watch::Receiver<Arc<SiteSnapshot>>,
 ) {
+    let grace = Duration::from_secs(config.server.shutdown_grace_secs);
     let context = ListenerContext {
         config,
         state: RuntimeState::new(state),
@@ -442,9 +454,15 @@ pub async fn run_tor_ingress(
             per_ip_map: Arc::new(DashMap::new()),
         },
     };
-    let outcome = serve(ListenerRole::TorIngress, None, context, move |result| {
-        let _ = port_tx.send(result.map(|addr| addr.port()));
-    })
+    let outcome = serve_with_grace(
+        ListenerRole::TorIngress,
+        None,
+        context,
+        grace,
+        move |result| {
+            let _ = port_tx.send(result.map(|addr| addr.port()));
+        },
+    )
     .await;
     if let ServiceOutcome::Failed(message) = outcome {
         log::error!("{message}");
