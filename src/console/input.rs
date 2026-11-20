@@ -6,7 +6,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::{mpsc::Sender, watch, Notify};
 
-use crate::runtime::events::KeyEvent;
+use super::actions::KeyEvent;
 
 pub fn spawn(tx: Sender<KeyEvent>, shutdown: watch::Receiver<bool>, render_notify: Arc<Notify>) {
     tokio::task::spawn_blocking(move || loop {

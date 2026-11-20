@@ -11,7 +11,7 @@
 //! When absent the original defaults (relative to `current_exe()`) are used,
 //! preserving backward compatibility for zero-argument invocations.
 
-mod support;
+mod services;
 
 use std::{
     fmt::Write as _,
@@ -25,15 +25,16 @@ use tokio::sync::{mpsc, oneshot, watch, RwLock};
 
 use crate::{
     config::{self, Config},
-    console, logging,
+    console::{self, actions},
+    logging,
     path_display::display_path,
     runtime::{
-        events, runtime_root,
+        runtime_root, site_reload,
         state::{AppState, Metrics, SharedMetrics, SharedState, TorStatus},
     },
     server, tor, Result,
 };
-use support::{
+use services::{
     graceful_shutdown, maybe_open_browser, setup_tls, wait_for_background_task, wait_for_bind_port,
     ListenerReady,
 };
@@ -448,7 +449,7 @@ async fn normal_run_with_config(
                 shutdown_tx,
                 server_handle,
                 None,
-                support::BackgroundTasks::default(),
+                services::BackgroundTasks::default(),
             )
             .await;
             return Err(err);
@@ -625,7 +626,7 @@ async fn start_console(
     metrics: &SharedMetrics,
     shutdown: watch::Receiver<bool>,
     data_dir: &Path,
-) -> Result<Option<(mpsc::Receiver<events::KeyEvent>, Arc<tokio::sync::Notify>)>> {
+) -> Result<Option<(mpsc::Receiver<actions::KeyEvent>, Arc<tokio::sync::Notify>)>> {
     if config.console.interactive {
         let session = console::start(
             Arc::clone(config),
@@ -738,7 +739,7 @@ async fn next_sigterm() {
 }
 
 async fn event_loop(
-    session: Option<(mpsc::Receiver<events::KeyEvent>, Arc<tokio::sync::Notify>)>,
+    session: Option<(mpsc::Receiver<actions::KeyEvent>, Arc<tokio::sync::Notify>)>,
     config: &Arc<Config>,
     state: &SharedState,
     metrics: &SharedMetrics,
@@ -786,7 +787,7 @@ async fn event_loop(
             if let Some(rx) = key_rx.as_mut() {
                 rx.recv().await
             } else {
-                std::future::pending::<Option<events::KeyEvent>>().await
+                std::future::pending::<Option<actions::KeyEvent>>().await
             }
         };
         let sighup_fut = async {
@@ -808,7 +809,7 @@ async fn event_loop(
         tokio::select! {
             maybe_key = key_fut => {
                 if let Some(key) = maybe_key {
-                    let quit = events::handle(
+                    let quit = actions::handle(
                         key,
                         config,
                         Arc::clone(state),
@@ -850,7 +851,7 @@ async fn event_loop(
             maybe_hup = sighup_fut => {
                 if maybe_hup.is_some() {
                     log::info!("SIGHUP received — reloading site state.");
-                    events::reload_site(config, Arc::clone(state), data_dir.clone(), &root_tx).await?;
+                    site_reload::reload_site(config, Arc::clone(state), data_dir.clone(), &root_tx).await?;
                 }
             }
         }

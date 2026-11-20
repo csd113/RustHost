@@ -8,6 +8,7 @@
 
 pub mod events;
 pub mod lifecycle;
+pub(crate) mod site_reload;
 pub mod state;
 
 use std::path::{Path, PathBuf};

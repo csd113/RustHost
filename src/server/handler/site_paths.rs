@@ -1,7 +1,6 @@
 //! # Handler Path Helpers
 
 use std::{
-    borrow::Cow,
     collections::BTreeSet,
     fmt::Write as _,
     path::{Path, PathBuf},
@@ -11,26 +10,6 @@ use std::{
 use super::CustomErrorPage;
 
 const MAX_DIRECTORY_LISTING_ENTRIES: usize = 512;
-
-pub(super) fn cache_control_for(content_type: &str, path: &str) -> &'static str {
-    if content_type.starts_with("text/html") {
-        return "no-cache";
-    }
-    let file_name = Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    if is_hashed_asset(file_name) {
-        "max-age=31536000, immutable"
-    } else {
-        "no-cache"
-    }
-}
-
-pub(super) fn is_hashed_asset(name: &str) -> bool {
-    name.split('.')
-        .any(|seg| (8..=16).contains(&seg.len()) && seg.chars().all(|c| c.is_ascii_hexdigit()))
-}
 
 fn normalize_path(path: &Path) -> PathBuf {
     let mut stack: Vec<std::path::Component<'_>> = Vec::new();
@@ -48,7 +27,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     stack.iter().collect()
 }
 
-pub(super) fn resolved_path_has_dotfile(resolved: &Path, root: &Path) -> bool {
+fn resolved_path_has_dotfile(resolved: &Path, root: &Path) -> bool {
     resolved
         .strip_prefix(root)
         .unwrap_or(resolved)
@@ -199,14 +178,6 @@ fn resolve_not_found(
     Resolved::NotFound
 }
 
-pub(super) fn sanitize_header_value(s: &str) -> Cow<'_, str> {
-    if s.chars().any(|c| c.is_ascii_control()) {
-        Cow::Owned(s.chars().filter(|c| !c.is_ascii_control()).collect())
-    } else {
-        Cow::Borrowed(s)
-    }
-}
-
 pub(super) fn build_directory_listing(dir: &Path, url_path: &str, expose_dotfiles: bool) -> String {
     let mut items = String::new();
     let mut truncated = false;
@@ -229,7 +200,7 @@ pub(super) fn build_directory_listing(dir: &Path, url_path: &str, expose_dotfile
             truncated = true;
             let should_replace = names.last().is_some_and(|largest| name < *largest);
             if should_replace {
-                let largest = names.last().map(ToOwned::to_owned).unwrap_or_default();
+                let largest = names.last().cloned().unwrap_or_default();
                 names.remove(&largest);
                 names.insert(name);
             }

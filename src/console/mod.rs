@@ -17,6 +17,7 @@
 //!    them over a bounded channel to the event dispatch loop in
 //!    [`crate::runtime::lifecycle`].
 
+pub mod actions;
 pub mod dashboard;
 pub mod input;
 pub mod menu;
@@ -33,12 +34,11 @@ use tokio::sync::watch;
 
 use crate::{
     config::Config,
-    runtime::{
-        events::KeyEvent,
-        state::{ConsoleMode, SharedMetrics, SharedState},
-    },
+    runtime::state::{ConsoleMode, SharedMetrics, SharedState},
     AppError, Result,
 };
+
+use self::actions::KeyEvent;
 
 // ─── Global raw-mode flag ────────────────────────────────────────────────────
 

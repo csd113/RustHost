@@ -187,7 +187,7 @@ pub async fn run_redirect_server(
         }
     }
 
-    super::drain_connections(&mut join_set, drain_timeout).await;
+    super::listeners::drain_connections(&mut join_set, drain_timeout).await;
     state.write().await.server_running = false;
     log::info!("HTTP-redirect server stopped.");
 }
