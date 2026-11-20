@@ -13,8 +13,8 @@ use std::{
 
 use crate::runtime::state::SharedState;
 
+use super::site_snapshot::CustomErrorPage;
 pub(crate) use connection::handle;
-pub(crate) use file_response::{load_custom_error_page, CustomErrorPage};
 
 /// Boolean feature flags for connection/request handling.
 ///

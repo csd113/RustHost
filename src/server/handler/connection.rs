@@ -14,7 +14,10 @@ use super::{
     routes::{route, RouteConfig},
     HandlerConfig, RequestIngress,
 };
-use crate::{runtime::state::SharedMetrics, Result};
+use crate::{
+    runtime::{shutdown::Shutdown, state::SharedMetrics},
+    Result,
+};
 
 const MAX_REQUEST_BUFFER_BYTES: usize = 16 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -28,7 +31,12 @@ const MAX_REJECTED_HEADER_DRAIN_BYTES: usize = 64 * 1024;
 /// # Errors
 ///
 /// Propagates I/O errors from hyper's connection driver.
-pub async fn handle<S>(stream: S, config: HandlerConfig, metrics: SharedMetrics) -> Result<()>
+pub async fn handle<S>(
+    stream: S,
+    config: HandlerConfig,
+    metrics: SharedMetrics,
+    mut shutdown: Shutdown,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -44,7 +52,12 @@ where
         Arc::clone(&progress),
         crate::io_timeout::TRANSFER_IDLE,
     );
-    let Some(prefetched) = preflight_initial_headers(&mut stream, peer_addr).await? else {
+    let prefetched = tokio::select! {
+        biased;
+        _ = shutdown.wait() => return Ok(()),
+        result = preflight_initial_headers(&mut stream, peer_addr) => result?,
+    };
+    let Some(prefetched) = prefetched else {
         return Ok(());
     };
     let cfg = Arc::new(config);
@@ -65,6 +78,17 @@ where
                 async move { route(req, &cfg, &met).await }
             }),
         );
+    let connection = async {
+        tokio::pin!(connection);
+        tokio::select! {
+            biased;
+            _ = shutdown.wait() => {
+                connection.as_mut().graceful_shutdown();
+                connection.await
+            }
+            result = connection.as_mut() => result,
+        }
+    };
     let result = tokio::time::timeout(
         crate::io_timeout::MAX_CONNECTION_AGE,
         crate::io_timeout::with_idle_timeout(connection, progress, idle_timeout),

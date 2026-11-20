@@ -17,14 +17,12 @@ use super::super::{fallback, SiteSnapshot};
 use super::file_response::{
     external_redirect_response, html_response, inject_security_headers, method_not_allowed,
     method_not_allowed_with_allow, operational_text_response, options_response, redirect_response,
-    sanitize_header_value, serve_favicon, serve_file, text_response, BoxBody,
+    sanitize_header_value, serve_favicon, serve_file, text_response, BoxBody, FileRequest,
 };
 use super::site_paths::{
     build_directory_listing, percent_decode, resolve_path, ResolveOptions, Resolved,
 };
-use super::{
-    CustomErrorPage, FaviconConfig, FeatureFlags, HandlerConfig, ReadinessConfig, RequestIngress,
-};
+use super::{FaviconConfig, FeatureFlags, HandlerConfig, ReadinessConfig, RequestIngress};
 use crate::runtime::state::{SharedMetrics, SharedState, VisitorIdentity};
 
 static READINESS_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -43,17 +41,7 @@ enum FaviconKind {
     Svg,
 }
 
-pub(super) struct RequestContext<'a> {
-    pub(super) req: &'a Request<Incoming>,
-    pub(super) is_head: bool,
-    pub(super) metrics: &'a SharedMetrics,
-    pub(super) canonical_root: &'a Path,
-    pub(super) csp: &'a str,
-    decoded: &'a str,
-    expose_dotfiles: bool,
-    pub(super) error_503_page: Option<&'a CustomErrorPage>,
-}
-
+/// Immutable routing policy with one site snapshot selected for this request.
 pub(super) struct RouteConfig {
     site: Arc<SiteSnapshot>,
     index_file: Arc<str>,
@@ -91,198 +79,113 @@ impl RouteConfig {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "Routing intentionally keeps request classification in one place."
-)]
 pub(super) async fn route(
     req: Request<Incoming>,
     cfg: &RouteConfig,
     metrics: &SharedMetrics,
-) -> std::result::Result<Response<BoxBody>, std::io::Error> {
-    if !has_valid_host_header(&req) {
-        metrics.add_error();
-        let resp = text_response(StatusCode::BAD_REQUEST, "Bad Request", &cfg.csp, "");
-        log_request(
-            &req,
-            resp.status().as_u16(),
-            response_size(&resp),
-            cfg.peer_addr,
-            &cfg.trusted_proxies,
-        );
-        return Ok(
-            inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await,
-        );
-    }
-
-    // Count unique visitors for real site traffic only. Operational probes
-    // (`/health`, `/ready`) are infrastructure traffic, not visitors, and
-    // skipping them keeps the per-request visitor lock off the probe path.
-    if let Some(endpoint) = OperationalEndpoint::from_path(req.uri().path()) {
-        let resp = route_operational_endpoint(&req, cfg, metrics, endpoint).await?;
-        log_request(
-            &req,
-            resp.status().as_u16(),
-            response_size(&resp),
-            cfg.peer_addr,
-            &cfg.trusted_proxies,
-        );
-        return Ok(
-            inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await,
-        );
-    }
-
-    record_unique_visitor(
+) -> std::io::Result<Response<BoxBody>> {
+    let response = route_request(&req, cfg, metrics).await?;
+    log_request(
         &req,
+        response.status().as_u16(),
+        response_size(&response),
+        cfg.peer_addr,
+        &cfg.trusted_proxies,
+    );
+    Ok(inject_security_headers(response, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await)
+}
+
+async fn route_request(
+    req: &Request<Incoming>,
+    cfg: &RouteConfig,
+    metrics: &SharedMetrics,
+) -> std::io::Result<Response<BoxBody>> {
+    if !has_valid_host_header(req) {
+        metrics.add_error();
+        return Ok(text_response(
+            StatusCode::BAD_REQUEST,
+            "Bad Request",
+            &cfg.csp,
+            "",
+        ));
+    }
+    if let Some(endpoint) = OperationalEndpoint::from_path(req.uri().path()) {
+        return route_operational_endpoint(req, cfg, metrics, endpoint).await;
+    }
+
+    // Operational probes are infrastructure traffic and do not count as visitors.
+    record_unique_visitor(
+        req,
         cfg.peer_addr,
         &cfg.trusted_proxies,
         cfg.ingress,
         metrics,
     );
-
-    match req.method() {
-        &Method::OPTIONS => {
+    match *req.method() {
+        Method::OPTIONS => {
             metrics.add_request();
-            let resp = options_response();
-            log_request(
-                &req,
-                resp.status().as_u16(),
-                response_size(&resp),
-                cfg.peer_addr,
-                &cfg.trusted_proxies,
-            );
-            return Ok(inject_security_headers(
-                resp,
-                &req,
-                cfg.flags.is_https,
-                &cfg.csp,
-                &cfg.state,
-            )
-            .await);
+            return Ok(options_response());
         }
-        m if m != Method::GET && m != Method::HEAD => {
+        Method::GET | Method::HEAD => {}
+        _ => {
             metrics.add_error();
-            let resp = method_not_allowed();
-            log_request(
-                &req,
-                resp.status().as_u16(),
-                response_size(&resp),
-                cfg.peer_addr,
-                &cfg.trusted_proxies,
-            );
-            return Ok(inject_security_headers(
-                resp,
-                &req,
-                cfg.flags.is_https,
-                &cfg.csp,
-                &cfg.state,
-            )
-            .await);
+            return Ok(method_not_allowed());
         }
-        _ => {}
     }
 
-    let is_head = req.method() == Method::HEAD;
     let decoded = percent_decode(req.uri().path());
-
-    // Check operator redirect rules before any filesystem access.
-    for rule in cfg.redirects.iter() {
-        if decoded == rule.from {
-            let safe = sanitize_header_value(&rule.to);
-            let status = rule.status;
-            metrics.add_request();
-            let resp = external_redirect_response(&safe, status, &cfg.csp)?;
-            log_request(
-                &req,
-                resp.status().as_u16(),
-                response_size(&resp),
-                cfg.peer_addr,
-                &cfg.trusted_proxies,
-            );
-            return Ok(inject_security_headers(
-                resp,
-                &req,
-                cfg.flags.is_https,
-                &cfg.csp,
-                &cfg.state,
-            )
-            .await);
-        }
+    if let Some(rule) = cfg.redirects.iter().find(|rule| decoded == rule.from) {
+        let safe = sanitize_header_value(&rule.to);
+        metrics.add_request();
+        return external_redirect_response(&safe, rule.status, &cfg.csp);
     }
+    if let Some(response) = route_favicon(req, cfg, metrics, &decoded).await? {
+        return Ok(response);
+    }
+    route_static(req, cfg, metrics, decoded).await
+}
 
-    // Favicon resolution touches the filesystem. Run it on the blocking pool,
-    // but only for favicon paths so ordinary requests pay no extra hop.
-    let favicon_resolution = if requested_favicon_kind(&decoded).is_some() {
-        let favicon = Arc::clone(&cfg.site.favicon);
-        let decoded_for_favicon = decoded.clone();
-        tokio::task::spawn_blocking(move || resolve_favicon_request(&decoded_for_favicon, &favicon))
-            .await
-            .map_err(|e| std::io::Error::other(format!("favicon resolution task panicked: {e}")))?
-    } else {
-        FaviconResolution::NotFavicon
-    };
-
-    match favicon_resolution {
-        FaviconResolution::File(abs_path) => {
+async fn route_favicon(
+    req: &Request<Incoming>,
+    cfg: &RouteConfig,
+    metrics: &SharedMetrics,
+    decoded: &str,
+) -> std::io::Result<Option<Response<BoxBody>>> {
+    if requested_favicon_kind(decoded).is_none() {
+        return Ok(None);
+    }
+    // Filesystem resolution only needs the blocking pool for favicon requests.
+    let favicon = Arc::clone(&cfg.site.favicon);
+    let path = decoded.to_owned();
+    let resolution = tokio::task::spawn_blocking(move || resolve_favicon_request(&path, &favicon))
+        .await
+        .map_err(|error| {
+            std::io::Error::other(format!("favicon resolution task panicked: {error}"))
+        })?;
+    let response = match resolution {
+        FaviconResolution::File(path) => {
             metrics.add_request();
-            let resp = serve_favicon(&abs_path, &req, is_head, &cfg.csp, &decoded).await?;
-            log_request(
-                &req,
-                resp.status().as_u16(),
-                response_size(&resp),
-                cfg.peer_addr,
-                &cfg.trusted_proxies,
-            );
-            return Ok(inject_security_headers(
-                resp,
-                &req,
-                cfg.flags.is_https,
-                &cfg.csp,
-                &cfg.state,
-            )
-            .await);
+            serve_favicon(&path, req, req.method() == Method::HEAD, &cfg.csp, decoded).await?
         }
         FaviconResolution::NotFound => {
             metrics.add_request();
-            let resp = text_response(StatusCode::NOT_FOUND, "Not Found", &cfg.csp, &decoded);
-            log_request(
-                &req,
-                resp.status().as_u16(),
-                response_size(&resp),
-                cfg.peer_addr,
-                &cfg.trusted_proxies,
-            );
-            return Ok(inject_security_headers(
-                resp,
-                &req,
-                cfg.flags.is_https,
-                &cfg.csp,
-                &cfg.state,
-            )
-            .await);
+            text_response(StatusCode::NOT_FOUND, "Not Found", &cfg.csp, decoded)
         }
         FaviconResolution::Forbidden => {
             metrics.add_error();
-            let resp = text_response(StatusCode::FORBIDDEN, "Forbidden", &cfg.csp, &decoded);
-            log_request(
-                &req,
-                resp.status().as_u16(),
-                response_size(&resp),
-                cfg.peer_addr,
-                &cfg.trusted_proxies,
-            );
-            return Ok(inject_security_headers(
-                resp,
-                &req,
-                cfg.flags.is_https,
-                &cfg.csp,
-                &cfg.state,
-            )
-            .await);
+            text_response(StatusCode::FORBIDDEN, "Forbidden", &cfg.csp, decoded)
         }
-        FaviconResolution::NotFavicon => {}
-    }
+        FaviconResolution::NotFavicon => return Ok(None),
+    };
+    Ok(Some(response))
+}
 
+async fn route_static(
+    req: &Request<Incoming>,
+    cfg: &RouteConfig,
+    metrics: &SharedMetrics,
+    decoded: String,
+) -> std::io::Result<Response<BoxBody>> {
     let canonical_root = Arc::clone(&cfg.site.canonical_root);
     let index_file = Arc::clone(&cfg.index_file);
     let decoded_for_resolve = decoded.clone();
@@ -306,33 +209,7 @@ pub(super) async fn route(
     .await
     .map_err(|e| std::io::Error::other(format!("path resolution task panicked: {e}")))?;
 
-    let resp = dispatch_resolved(
-        resolved,
-        RequestContext {
-            req: &req,
-            is_head,
-            metrics,
-            canonical_root: cfg.site.canonical_root.as_ref(),
-            csp: &cfg.csp,
-            decoded: &decoded,
-            expose_dotfiles: cfg.flags.expose_dotfiles,
-            error_503_page: cfg.site.error_503_page.as_deref(),
-        },
-    )
-    .await?;
-
-    // Write one Combined Log Format line per request.
-    log_request(
-        &req,
-        resp.status().as_u16(),
-        response_size(&resp),
-        cfg.peer_addr,
-        &cfg.trusted_proxies,
-    );
-
-    // Inject HSTS and other security headers that depend on transport.
-    let resp = inject_security_headers(resp, &req, cfg.flags.is_https, &cfg.csp, &cfg.state).await;
-    Ok(resp)
+    dispatch_resolved(resolved, req, cfg, metrics, &decoded).await
 }
 
 #[derive(Clone, Copy)]
@@ -511,59 +388,77 @@ fn visitor_identity<B>(
 /// Extracted from [`route`] to keep that function within the 100-line limit.
 async fn dispatch_resolved(
     resolved: Resolved,
-    ctx: RequestContext<'_>,
-) -> std::result::Result<Response<BoxBody>, std::io::Error> {
+    req: &Request<Incoming>,
+    cfg: &RouteConfig,
+    metrics: &SharedMetrics,
+    decoded: &str,
+) -> std::io::Result<Response<BoxBody>> {
+    let is_head = req.method() == Method::HEAD;
     Ok(match resolved {
-        Resolved::File(abs_path) => serve_file(&abs_path, &ctx).await?,
+        Resolved::File(abs_path) => {
+            serve_file(
+                &abs_path,
+                &FileRequest {
+                    req,
+                    is_head,
+                    metrics,
+                    canonical_root: &cfg.site.canonical_root,
+                    csp: &cfg.csp,
+                    error_503_page: cfg.site.error_503_page.as_deref(),
+                },
+            )
+            .await?
+        }
         Resolved::NotFound => {
-            let decoded_for_log = sanitize_header_value(ctx.decoded);
+            let decoded_for_log = sanitize_header_value(decoded);
             log::debug!("404 Not Found: {decoded_for_log}");
-            ctx.metrics.add_request();
-            text_response(StatusCode::NOT_FOUND, "Not Found", ctx.csp, "")
+            metrics.add_request();
+            text_response(StatusCode::NOT_FOUND, "Not Found", &cfg.csp, "")
         }
         Resolved::Redirect(mut location) => {
-            if let Some(query) = ctx.req.uri().query() {
+            if let Some(query) = req.uri().query() {
                 location.push('?');
                 location.push_str(query);
             }
             let safe = sanitize_header_value(&location);
-            ctx.metrics.add_request();
-            redirect_response(&safe, ctx.csp)
+            metrics.add_request();
+            redirect_response(&safe, &cfg.csp)
         }
         Resolved::Fallback => {
-            ctx.metrics.add_request();
-            ctx.error_503_page.map_or_else(
+            metrics.add_request();
+            cfg.site.error_503_page.as_deref().map_or_else(
                 || {
                     html_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         fallback::NO_SITE_HTML,
-                        ctx.is_head,
-                        ctx.csp,
+                        is_head,
+                        &cfg.csp,
                         "",
                     )
                 },
-                |page| page.response(ctx.is_head, ctx.csp, ""),
+                |page| page.response(is_head, &cfg.csp, ""),
             )
         }
         Resolved::Forbidden => {
-            let decoded_for_log = sanitize_header_value(ctx.decoded);
+            let decoded_for_log = sanitize_header_value(decoded);
             log::warn!("403 Forbidden: {decoded_for_log}");
-            ctx.metrics.add_error();
-            text_response(StatusCode::FORBIDDEN, "Forbidden", ctx.csp, "")
+            metrics.add_error();
+            text_response(StatusCode::FORBIDDEN, "Forbidden", &cfg.csp, "")
         }
         Resolved::DirectoryListing(dir_path) => {
-            let decoded_owned = ctx.decoded.to_owned();
+            let decoded_owned = decoded.to_owned();
+            let expose_dotfiles = cfg.flags.expose_dotfiles;
             let html = tokio::task::spawn_blocking(move || {
-                build_directory_listing(&dir_path, &decoded_owned, ctx.expose_dotfiles)
+                build_directory_listing(&dir_path, &decoded_owned, expose_dotfiles)
             })
             .await
             .map_err(|e| std::io::Error::other(format!("directory listing task panicked: {e}")))?;
-            ctx.metrics.add_request();
-            html_response(StatusCode::OK, &html, ctx.is_head, ctx.csp, ctx.decoded)
+            metrics.add_request();
+            html_response(StatusCode::OK, &html, is_head, &cfg.csp, decoded)
         }
         Resolved::CustomError(page) => {
-            ctx.metrics.add_request();
-            page.response(ctx.is_head, ctx.csp, "")
+            metrics.add_request();
+            page.response(is_head, &cfg.csp, "")
         }
     })
 }

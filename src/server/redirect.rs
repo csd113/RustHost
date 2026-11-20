@@ -10,12 +10,15 @@
 
 use std::{
     fmt::Write as _,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     sync::{atomic::AtomicU32, Arc},
     time::Duration,
 };
 
-use super::admission::{admit_connection, AdmissionRejection};
+use super::{
+    admission::{admit_connection, AdmissionRejection},
+    listeners::{accept_connections, bind_failed, finish_listener, BindResult, ConnectionBudget},
+};
 use dashmap::DashMap;
 use tokio::{
     io::AsyncWriteExt as _,
@@ -24,7 +27,10 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::runtime::state::SharedState;
+use crate::runtime::{
+    shutdown::{deadline, ServiceOutcome, Shutdown},
+    state::{ListenerRole, ListenerStatus, SharedState},
+};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const HEADER_READ_LIMIT: u64 = 16 * 1024 + 1;
@@ -56,8 +62,7 @@ enum HostHeader {
 /// request to `https://<host>:<https_port><original-path>`.
 ///
 /// Accepts a `shutdown` watch so it stops alongside the rest of the server.
-/// Bind failures are logged and the function returns early — the main HTTPS
-/// server continues regardless.
+/// A bind failure is sent back through the acknowledgement channel.
 ///
 /// # Why manual HTTP/1.1?
 ///
@@ -69,127 +74,115 @@ enum HostHeader {
 ///
 /// This avoids pulling the request body, keep-alive handling, or any response
 /// body into what is effectively a TCP-level redirect pump.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Redirect listener keeps bind, admission, and shutdown wiring together."
-)]
 pub async fn run_redirect_server(
     config: RedirectServerConfig,
     state: SharedState,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     port_tx: oneshot::Sender<std::result::Result<u16, String>>,
     semaphore: Arc<Semaphore>,
     per_ip_map: Arc<DashMap<IpAddr, Arc<AtomicU32>>>,
 ) {
-    let RedirectServerConfig {
-        bind_addr,
-        plain_port,
-        tls_port,
-        allowed_hosts,
-        max_per_ip,
-        drain_timeout,
-    } = config;
-    let allowed_hosts = Arc::new(allowed_hosts);
-    let bind_socket = std::net::SocketAddr::new(bind_addr, plain_port);
-    let listener = match TcpListener::bind(bind_socket).await {
-        Ok(l) => l,
-        Err(e) => {
+    let outcome = serve_redirect(
+        config,
+        state,
+        Shutdown::from_receiver(shutdown),
+        ConnectionBudget {
+            semaphore,
+            per_ip_map,
+        },
+        move |result| {
+            let _ = port_tx.send(result.map(|addr| addr.port()));
+        },
+    )
+    .await;
+    if let ServiceOutcome::Failed(message) = outcome {
+        log::error!("{message}");
+    }
+}
+
+pub(crate) async fn serve_redirect(
+    config: RedirectServerConfig,
+    state: SharedState,
+    mut shutdown: Shutdown,
+    budget: ConnectionBudget,
+    ready: impl FnOnce(BindResult),
+) -> ServiceOutcome {
+    let role = ListenerRole::Redirect;
+    state
+        .write()
+        .await
+        .set_listener(role, ListenerStatus::Starting);
+    let socket = SocketAddr::new(config.bind_addr, config.plain_port);
+    let bound = match TcpListener::bind(socket).await {
+        Ok(listener) => listener.local_addr().map(|address| (listener, address)),
+        Err(error) => Err(error),
+    };
+    let (listener, address) = match bound {
+        Ok(bound) => bound,
+        Err(source) => {
             let message = crate::AppError::ServerBind {
                 listener: "HTTP redirect listener",
-                addr: bind_socket,
-                source: e,
+                addr: socket,
+                source,
             }
             .to_string();
-            log::error!("{message}");
-            let _ = port_tx.send(Err(message));
-            return;
+            return bind_failed(role, &state, ready, message).await;
         }
     };
-    let _ = port_tx.send(Ok(plain_port));
-    {
-        let mut s = state.write().await;
-        s.actual_port = plain_port;
-        s.server_running = true;
-    }
+    state
+        .write()
+        .await
+        .set_listener(role, ListenerStatus::Listening(address));
+    ready(Ok(address));
     log::info!(
-        "HTTP-redirect server listening on {bind_addr}:{plain_port} \
-         → HTTPS port {tls_port}"
+        "HTTP redirect listener listening on {address} → HTTPS port {}",
+        config.tls_port
     );
-    let mut join_set: JoinSet<()> = JoinSet::new();
-    let mut backoff_ms: u64 = 1;
-
-    while !*shutdown.borrow() {
-        while let Some(result) = join_set.try_join_next() {
-            if let Err(e) = result {
-                log::debug!("Connection task ended: {e}");
+    let mut tasks = JoinSet::new();
+    let allowed_hosts: Arc<[String]> = config.allowed_hosts.into();
+    let result = accept_connections(&listener, role, &mut tasks, &mut shutdown, |mut stream, peer, tasks| {
+        let peer_ip = peer.ip();
+        let admission = match admit_connection(
+            &budget.semaphore, &budget.per_ip_map, peer_ip, Some(config.max_per_ip),
+        ) {
+            Ok(admission) => admission,
+            Err(AdmissionRejection::PerIpLimit { limit }) => {
+                log::warn!("Per-IP limit ({limit}) reached for {peer_ip}; dropping redirect connection");
+                return;
             }
+            Err(AdmissionRejection::GlobalLimit) => {
+                log::warn!("Connection limit reached; rejecting redirect connection from {peer_ip}");
+                return;
+            }
+        };
+        let allowed_hosts = Arc::clone(&allowed_hosts);
+        let bind_addr = config.bind_addr;
+        let tls_port = config.tls_port;
+        tasks.spawn(async move {
+            let _admission = admission;
+            handle_redirect_connection(&mut stream, peer_ip, bind_addr, tls_port, &allowed_hosts).await;
+        });
+    }).await;
+    drop(listener);
+    match result {
+        Ok(started) => {
+            finish_listener(
+                role,
+                &state,
+                &mut tasks,
+                deadline(started, config.drain_timeout),
+            )
+            .await
         }
-        tokio::select! {
-            result = listener.accept() => {
-                match result {
-                    Ok((mut stream, peer)) => {
-                        backoff_ms = 1;
-                        // Match the other listeners: disable Nagle so the small
-                        // redirect response is not delayed by delayed-ACK.
-                        let _ = stream.set_nodelay(true);
-                        log::debug!("Redirect connection from {peer}");
-                        let peer_ip = peer.ip();
-                        let admission = match admit_connection(
-                            &semaphore,
-                            &per_ip_map,
-                            peer_ip,
-                            Some(max_per_ip),
-                        ) {
-                            Ok(admission) => admission,
-                            Err(AdmissionRejection::PerIpLimit { limit }) => {
-                                log::warn!(
-                                    "Per-IP limit ({limit}) reached for {peer_ip}; dropping redirect connection"
-                                );
-                                drop(stream);
-                                continue;
-                            }
-                            Err(AdmissionRejection::GlobalLimit) => {
-                                log::warn!(
-                                    "Connection limit reached; rejecting redirect connection from {peer_ip}"
-                                );
-                                drop(stream);
-                                continue;
-                            }
-                        };
-                        let allowed_hosts = Arc::clone(&allowed_hosts);
-                        join_set.spawn(async move {
-                            let _admission = admission;
-                            handle_redirect_connection(
-                                &mut stream,
-                                peer_ip,
-                                bind_addr,
-                                tls_port,
-                                allowed_hosts.as_slice(),
-                            )
-                            .await;
-                        });
-                    }
-                    Err(e) => {
-                        log::debug!("Redirect accept error: {e}");
-                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-                        backoff_ms = backoff_ms.saturating_mul(2).min(1_000);
-                    }
-                }
-            }
-            Some(result) = join_set.join_next(), if !join_set.is_empty() => {
-                if let Err(e) = result {
-                    log::debug!("Redirect connection task join error: {e}");
-                }
-            }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() { break; }
-            }
+        Err(error) => {
+            let message = format!("HTTP redirect accept failed: {error}");
+            state
+                .write()
+                .await
+                .set_listener(role, ListenerStatus::Failed(message.clone()));
+            ServiceOutcome::Failed(message)
         }
     }
-
-    super::listeners::drain_connections(&mut join_set, drain_timeout).await;
-    state.write().await.server_running = false;
-    log::info!("HTTP-redirect server stopped.");
 }
 
 /// Read the `Host` header and request path from `stream`, then emit a `301`.

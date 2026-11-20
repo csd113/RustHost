@@ -8,6 +8,7 @@
 
 pub mod events;
 pub mod lifecycle;
+pub(crate) mod shutdown;
 pub(crate) mod site_reload;
 pub mod state;
 
@@ -47,6 +48,28 @@ pub fn open_browser(url: &str) {
             });
         }
         Err(e) => log::warn!("Could not open browser at {url}: {e}"),
+    }
+}
+
+pub(crate) async fn open_local_site(state: &state::SharedState) {
+    let url = {
+        let state = state.read().await;
+        state.public_http.bound_addr().map_or_else(
+            || {
+                state.https.bound_addr().map(|address| {
+                    crate::console::ui::local_https_url(address.ip(), address.port())
+                })
+            },
+            |address| {
+                Some(crate::console::ui::local_http_url(
+                    address.ip(),
+                    address.port(),
+                ))
+            },
+        )
+    };
+    if let Some(url) = url {
+        open_browser(&url);
     }
 }
 

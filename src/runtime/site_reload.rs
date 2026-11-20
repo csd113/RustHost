@@ -30,19 +30,23 @@ pub async fn reload_site(
             .await
             .map_err(|e| e.to_string())
             .and_then(|result| result.map_err(|e| e.to_string()));
+    let mut state = state.write().await;
+    if !Arc::ptr_eq(&root_tx.borrow(), &previous) {
+        log::debug!("Discarding superseded site reload");
+        return Ok(());
+    }
     let next = match prepared {
         Ok(next) => next,
         Err(message) => {
             log::warn!("Site reload failed: {message}");
-            state.write().await.status_message = Some(StatusMessage::persistent(format!(
+            state.status_message = Some(StatusMessage::persistent(format!(
                 "Reload failed: {message}"
             )));
             return Ok(());
         }
     };
-    let mut state = state.write().await;
-    // A concurrently completed reload must not be overwritten by older work.
-    // Cancellation before this synchronous publication leaves the old site intact.
+    // A caller that independently replaced the watched snapshot also wins
+    // over this preparation. Publication and the status update share one lock.
     let published = root_tx.send_if_modified(|current| {
         if !Arc::ptr_eq(current, &previous) {
             return false;

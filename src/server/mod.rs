@@ -9,7 +9,7 @@
 //! - [`mime`] — file-extension → MIME type mapping
 //! - [`fallback`] — built-in "No site found" page
 mod admission;
-mod listeners;
+pub(crate) mod listeners;
 mod site_snapshot;
 
 pub mod fallback;

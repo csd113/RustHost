@@ -15,6 +15,7 @@ use crate::Result;
 use crate::{
     config::{ManualCertConfig, TlsConfig},
     error::AppError,
+    runtime::{shutdown::ServiceOutcome, state::CertStatus},
 };
 
 fn is_rooted_path(path: &Path) -> bool {
@@ -26,6 +27,7 @@ fn is_rooted_path(path: &Path) -> bool {
 
 /// A TLS acceptor that is either a static [`TlsAcceptor`] (manual cert or
 /// self-signed) or an [`AcmeAcceptor`] (Let's Encrypt / rustls-acme).
+#[derive(Clone)]
 pub enum Acceptor {
     /// Static certificate — manual PEM files or a self-signed dev cert.
     Static(Arc<TlsAcceptor>),
@@ -58,44 +60,71 @@ pub struct TlsSetup {
 /// - The ACME cache directory cannot be created.
 /// - The self-signed certificate cannot be generated or written to disk.
 pub async fn build_acceptor(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<TlsSetup>> {
+    let Some(tls) = prepare(cfg, data_dir).await? else {
+        return Ok(None);
+    };
+    let (acme_task, acme_guard) = if let Some((events, guard)) = tls.acme {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_missing_runtime| {
+            AppError::Tls("build_acceptor requires an active Tokio runtime in ACME mode".into())
+        })?;
+        let task = runtime.spawn(async move {
+            if let ServiceOutcome::Failed(message) = events.run(None).await {
+                log::error!("{message}");
+            }
+        });
+        (Some(task), Some(guard))
+    } else {
+        (None, None)
+    };
+    Ok(Some(TlsSetup {
+        acceptor: tls.acceptor,
+        acme_task,
+        acme_guard,
+    }))
+}
+
+pub(crate) struct PreparedTls {
+    pub(crate) acceptor: Acceptor,
+    pub(crate) cert_status: CertStatus,
+    pub(crate) acme: Option<(acme::AcmeEvents, acme::AcmeInitGuard)>,
+}
+
+pub(crate) async fn prepare(cfg: &TlsConfig, data_dir: &Path) -> Result<Option<PreparedTls>> {
     if !cfg.enabled {
         return Ok(None);
     }
 
     if let Some(manual) = &cfg.manual_cert {
         log::info!("TLS: loading manual certificate");
-        return Ok(Some(TlsSetup {
+        return Ok(Some(PreparedTls {
             acceptor: Acceptor::Static(load_manual_cert(manual, data_dir)?),
-            acme_task: None,
-            acme_guard: None,
+            cert_status: CertStatus::Manual,
+            acme: None,
         }));
     }
 
     if cfg.acme.enabled {
         log::info!(
             "TLS: starting ACME / Let's Encrypt provisioning (cache: {})",
-            cfg.acme.cache_dir.as_str()
+            cfg.acme.cache_dir
         );
-        // Duplicate-initialization is now enforced by the OnceLock guard
-        // inside acme::build_acme_acceptor — a second call returns an error.
-        let (acme_acceptor, server_cfg, event_loop, acme_guard) =
-            acme::build_acme_acceptor(&cfg.acme, data_dir)?;
-        return Ok(Some(TlsSetup {
-            acceptor: Acceptor::Acme(acme_acceptor, server_cfg),
-            acme_task: Some(event_loop),
-            acme_guard: Some(acme_guard),
+        let acme = acme::prepare(&cfg.acme, data_dir)?;
+        return Ok(Some(PreparedTls {
+            acceptor: Acceptor::Acme(acme.acceptor, acme.server_config),
+            cert_status: CertStatus::Acme {
+                domain: cfg.acme.domains.first().cloned().unwrap_or_default(),
+            },
+            acme: Some((acme.events, acme.guard)),
         }));
     }
 
     log::info!("TLS: no cert configured — generating/loading self-signed dev certificate");
     let acceptor = self_signed::generate_or_load(data_dir).await?;
-    log::warn!(
-        "TLS: using self-signed localhost dev cert (INSECURE FOR PROD — configure manual_cert or acme)"
-    );
-    Ok(Some(TlsSetup {
+    log::warn!("TLS: using self-signed localhost dev cert (INSECURE FOR PROD — configure manual_cert or acme)");
+    Ok(Some(PreparedTls {
         acceptor: Acceptor::Static(acceptor),
-        acme_task: None,
-        acme_guard: None,
+        cert_status: CertStatus::SelfSigned,
+        acme: None,
     }))
 }
 

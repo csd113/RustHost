@@ -152,7 +152,10 @@ fn tor_status_label(config: &Config, state: &AppState) -> String {
     match &state.tor_status {
         TorStatus::Disabled => ui::dim("Disabled"),
         TorStatus::Starting => ui::yellow("Starting"),
-        TorStatus::Ready => ui::green("Running"),
+        TorStatus::Ready => ui::green("Forwarding"),
+        TorStatus::Reconnecting => ui::yellow("Reconnecting"),
+        TorStatus::Draining => ui::yellow("Draining"),
+        TorStatus::Stopped => ui::dim("Stopped"),
         TorStatus::Failed(reason) => ui::red(&format!("Failed ({})", single_line(reason))),
     }
 }
@@ -172,7 +175,10 @@ fn bootstrap_log_label(state: &AppState) -> String {
     match &state.tor_status {
         TorStatus::Failed(reason) => format!("Last Tor failure: {}", single_line(reason)),
         TorStatus::Starting => "No bootstrap log available; Tor is still starting.".to_owned(),
-        TorStatus::Ready | TorStatus::Disabled => "No bootstrap log available.".to_owned(),
+        TorStatus::Reconnecting => "Tor is waiting to reconnect.".to_owned(),
+        TorStatus::Draining | TorStatus::Stopped | TorStatus::Ready | TorStatus::Disabled => {
+            "No bootstrap log available.".to_owned()
+        }
     }
 }
 

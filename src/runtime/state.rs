@@ -45,11 +45,71 @@ pub enum TorStatus {
     Disabled,
     /// Tor bootstrapping; waiting to connect to the network.
     Starting,
-    /// `hostname` file read; `.onion` address available in `onion_address`.
+    /// Arti has provided a service address and the local relay is forwarding.
     Ready,
+    /// The stream ended and the service will attempt to reconnect.
+    Reconnecting,
+    /// It has stopped accepting streams and is draining active transfers.
+    Draining,
+    /// Forwarding and retry work have stopped.
+    Stopped,
     /// Tor failed; the inner `String` is a brief human-readable reason
     /// (e.g. `"bootstrap failed"`, `"stream ended"`) shown in the dashboard.
     Failed(String),
+}
+
+/// Role and effective address of an active listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerRole {
+    Http,
+    Https,
+    Redirect,
+    TorIngress,
+}
+
+impl ListenerRole {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Http => "HTTP",
+            Self::Https => "HTTPS",
+            Self::Redirect => "HTTP redirect",
+            Self::TorIngress => "Tor ingress",
+        }
+    }
+}
+
+/// Runtime state of one local listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenerStatus {
+    Inactive,
+    Starting,
+    Listening(std::net::SocketAddr),
+    Draining,
+    Stopped,
+    Failed(String),
+}
+
+impl ListenerStatus {
+    #[must_use]
+    pub const fn bound_addr(&self) -> Option<std::net::SocketAddr> {
+        if let Self::Listening(addr) = self {
+            Some(*addr)
+        } else {
+            None
+        }
+    }
+}
+
+/// Issuance and renewal state, independent of the HTTPS listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcmeStatus {
+    Inactive,
+    Starting,
+    Available,
+    Retrying(String),
+    Failed(String),
+    Stopped,
 }
 
 /// Describes the active TLS certificate type for the dashboard.
@@ -97,6 +157,12 @@ pub struct AppState {
     /// Whether the HTTP server is accepting connections.
     pub server_running: bool,
 
+    pub public_http_role: ListenerRole,
+    pub public_http: ListenerStatus,
+    pub https: ListenerStatus,
+    pub tor_ingress: ListenerStatus,
+    pub acme: AcmeStatus,
+
     /// Whether startup completed enough for the process to serve normal traffic.
     pub runtime_ready: bool,
 
@@ -137,6 +203,11 @@ impl AppState {
         Self {
             actual_port: 0,
             server_running: false,
+            public_http_role: ListenerRole::Http,
+            public_http: ListenerStatus::Inactive,
+            https: ListenerStatus::Inactive,
+            tor_ingress: ListenerStatus::Inactive,
+            acme: AcmeStatus::Inactive,
             runtime_ready: false,
             tor_status: TorStatus::Starting,
             onion_address: None,
@@ -148,6 +219,28 @@ impl AppState {
             tls_port: None,
             tls_cert_status: CertStatus::Unknown,
             status_message: None,
+        }
+    }
+
+    pub(crate) fn set_listener(&mut self, role: ListenerRole, status: ListenerStatus) {
+        let address = status.bound_addr();
+        match role {
+            ListenerRole::Http | ListenerRole::Redirect => {
+                self.public_http_role = role;
+                self.public_http = status;
+                self.server_running = address.is_some();
+                if let Some(addr) = address {
+                    self.actual_port = addr.port();
+                }
+            }
+            ListenerRole::Https => {
+                self.https = status;
+                self.tls_running = address.is_some();
+                if let Some(addr) = address {
+                    self.tls_port = Some(addr.port());
+                }
+            }
+            ListenerRole::TorIngress => self.tor_ingress = status,
         }
     }
 

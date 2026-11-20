@@ -5,7 +5,8 @@ use crate::{
     logging,
     path_display::display_path,
     runtime::state::{
-        format_bytes, format_uptime, AppState, CertStatus, MetricsSnapshot, TorStatus,
+        format_bytes, format_uptime, AcmeStatus, AppState, CertStatus, ListenerStatus,
+        MetricsSnapshot, TorStatus,
     },
 };
 use std::fmt::Write as _;
@@ -24,44 +25,14 @@ pub fn render_dashboard(
     out.push_str("\r\n");
     // ── Status ───────────────────────────────────────────────────────────────
     let _ = writeln!(out, "{}\r", ui::bold("Status"));
-    let server_str = if state.server_running {
-        ui::green(&format!(
-            "RUNNING ({}:{})",
-            config.server.bind, state.actual_port
-        ))
-    } else {
-        ui::yellow("STARTING...")
-    };
-    let _ = writeln!(out, " Local Server : {server_str}\r");
-    // HTTPS status row — always shown so the user knows at a glance whether
-    // TLS is active or has been left disabled in settings.toml.
-    if config.tls.enabled {
-        let tls_str = if state.tls_running {
-            let cert_label = match &state.tls_cert_status {
-                CertStatus::Unknown => String::new(),
-                CertStatus::SelfSigned => " \u{00b7} self-signed".into(),
-                CertStatus::Acme { domain } if domain.is_empty() => {
-                    " \u{00b7} Let\u{2019}s Encrypt".into()
-                }
-                CertStatus::Acme { domain } => format!(" \u{00b7} Let\u{2019}s Encrypt ({domain})"),
-                CertStatus::Manual => " \u{00b7} manual cert".into(),
-            };
-            ui::green(&format!(
-                "RUNNING (port {}{})",
-                state.tls_port.unwrap_or(0),
-                cert_label
-            ))
-        } else {
-            ui::yellow("STARTING\u{2026}")
-        };
-        let _ = writeln!(out, " HTTPS : {tls_str}\r");
-    } else {
-        let _ = writeln!(out, " HTTPS : {}\r", ui::dim("DISABLED"));
-    }
+    render_listener_status(&mut out, state);
     let tor_str = match &state.tor_status {
         TorStatus::Disabled => ui::dim("DISABLED"),
         TorStatus::Starting => ui::yellow("STARTING — bootstrapping Tor network…"),
-        TorStatus::Ready => ui::green("READY"),
+        TorStatus::Ready => ui::green("READY — forwarding locally"),
+        TorStatus::Reconnecting => ui::yellow("RECONNECTING"),
+        TorStatus::Draining => ui::yellow("DRAINING"),
+        TorStatus::Stopped => ui::dim("STOPPED"),
         TorStatus::Failed(reason) => ui::red(&format!("FAILED ({reason}) — see log for details")),
     };
     let _ = writeln!(out, " Tor : {tor_str}\r");
@@ -71,14 +42,13 @@ pub fn render_dashboard(
     out.push_str("\r\n");
     // ── Endpoints ────────────────────────────────────────────────────────────
     let _ = writeln!(out, "{}\r", ui::bold("Endpoints"));
-    let local_url = ui::local_http_url(config.server.bind, state.actual_port);
-    let _ = writeln!(out, " Local : {local_url}\r");
-    // HTTPS endpoint — only shown when the TLS server is up.
-    if state.tls_running {
-        if let Some(tls_port) = state.tls_port {
-            let https_url = ui::local_https_url(config.server.bind, tls_port);
-            let _ = writeln!(out, " HTTPS : {}\r", ui::green(&https_url));
-        }
+    if let Some(address) = state.public_http.bound_addr() {
+        let url = ui::local_http_url(address.ip(), address.port());
+        let _ = writeln!(out, " {} : {url}\r", state.public_http_role.label());
+    }
+    if let Some(address) = state.https.bound_addr() {
+        let url = ui::local_https_url(address.ip(), address.port());
+        let _ = writeln!(out, " HTTPS : {}\r", ui::green(&url));
     }
     let onion_str = state.onion_address.as_deref().map_or_else(
         || match &state.tor_status {
@@ -94,7 +64,10 @@ pub fn render_dashboard(
                 );
                 ui::dim("(address unavailable)")
             }
-            TorStatus::Failed(_) => ui::dim("(unavailable)"),
+            TorStatus::Reconnecting => ui::dim("(reconnecting…)"),
+            TorStatus::Draining | TorStatus::Stopped | TorStatus::Failed(_) => {
+                ui::dim("(unavailable)")
+            }
         },
         |addr| format!("http://{addr}"),
     );
@@ -128,6 +101,51 @@ pub fn render_dashboard(
         "[H] Help [R] Reload [O] Open [L] Logs [M] Menu [Q] Quit",
     );
     out
+}
+
+fn render_listener_status(out: &mut String, state: &AppState) {
+    let _ = writeln!(
+        out,
+        " {} : {}\r",
+        state.public_http_role.label(),
+        listener_status(&state.public_http)
+    );
+    let https = listener_status(&state.https);
+    let cert = match &state.tls_cert_status {
+        CertStatus::Unknown => String::new(),
+        CertStatus::SelfSigned => " · self-signed".into(),
+        CertStatus::Acme { domain } if domain.is_empty() => " · Let's Encrypt".into(),
+        CertStatus::Acme { domain } => format!(" · Let's Encrypt ({domain})"),
+        CertStatus::Manual => " · manual cert".into(),
+    };
+    let _ = writeln!(out, " HTTPS : {https}{cert}\r");
+    if state.tor_ingress != ListenerStatus::Inactive {
+        let _ = writeln!(
+            out,
+            " Tor ingress : {}\r",
+            listener_status(&state.tor_ingress)
+        );
+    }
+    let acme = match &state.acme {
+        AcmeStatus::Inactive => return,
+        AcmeStatus::Starting => ui::yellow("STARTING"),
+        AcmeStatus::Available => ui::green("CERTIFICATE AVAILABLE"),
+        AcmeStatus::Retrying(reason) => ui::yellow(&format!("RETRYING ({reason})")),
+        AcmeStatus::Failed(reason) => ui::red(&format!("FAILED ({reason})")),
+        AcmeStatus::Stopped => ui::dim("STOPPED"),
+    };
+    let _ = writeln!(out, " ACME : {acme}\r");
+}
+
+fn listener_status(status: &ListenerStatus) -> String {
+    match status {
+        ListenerStatus::Inactive => ui::dim("DISABLED"),
+        ListenerStatus::Starting => ui::yellow("STARTING…"),
+        ListenerStatus::Listening(address) => ui::green(&format!("LISTENING ({address})")),
+        ListenerStatus::Draining => ui::yellow("DRAINING"),
+        ListenerStatus::Stopped => ui::dim("STOPPED"),
+        ListenerStatus::Failed(reason) => ui::red(&format!("FAILED ({reason})")),
+    }
 }
 
 // ─── Log view ────────────────────────────────────────────────────────────────

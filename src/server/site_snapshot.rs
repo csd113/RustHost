@@ -1,10 +1,20 @@
 //! A prepared site generation, published once and selected afresh per request.
-use super::handler::{self, CustomErrorPage, FaviconConfig};
+use super::handler::FaviconConfig;
 use crate::{config::Config, Result};
+use bytes::Bytes;
+use hyper::StatusCode;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+const MAX_CUSTOM_ERROR_PAGE_BYTES: u64 = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomErrorPage {
+    pub(super) status: StatusCode,
+    pub(super) body: Bytes,
+}
 
 /// Immutable routing state shared by HTTP, HTTPS and Tor ingress.
 ///
@@ -31,9 +41,9 @@ impl SiteSnapshot {
         let (file_count, total_bytes) = scan_site(&root)?;
         let error_page = |path: Option<&str>, label, status| -> Result<_> {
             path.map(|path| {
-                handler::load_custom_error_page(&root, &root.join(path), label, status).ok_or_else(
-                    || crate::AppError::ConfigLoad(format!("cannot load configured {label}")),
-                )
+                load_custom_error_page(&root, &root.join(path), label, status).ok_or_else(|| {
+                    crate::AppError::ConfigLoad(format!("cannot load configured {label}"))
+                })
             })
             .transpose()
         };
@@ -63,6 +73,67 @@ impl SiteSnapshot {
     }
 }
 
+fn load_custom_error_page(
+    canonical_root: &Path,
+    candidate: &Path,
+    label: &str,
+    status: StatusCode,
+) -> Option<Arc<CustomErrorPage>> {
+    let resolved = match candidate.canonicalize() {
+        Ok(resolved) if resolved.starts_with(canonical_root) => resolved,
+        Ok(resolved) => {
+            log::warn!(
+                "Ignoring [site] {label} path {} because it resolves outside the site root: {}",
+                candidate.display(),
+                resolved.display()
+            );
+            return None;
+        }
+        Err(e) => {
+            log::warn!(
+                "Ignoring [site] {label} path {} because it could not be resolved: {e}",
+                candidate.display()
+            );
+            return None;
+        }
+    };
+
+    let metadata = match std::fs::metadata(&resolved) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            log::warn!(
+                "Ignoring [site] {label} path {} because metadata could not be read: {e}",
+                resolved.display()
+            );
+            return None;
+        }
+    };
+
+    if !metadata.is_file() || metadata.len() > MAX_CUSTOM_ERROR_PAGE_BYTES {
+        log::warn!(
+            "Ignoring [site] {label} path {} because it exceeds the {} byte limit",
+            resolved.display(),
+            MAX_CUSTOM_ERROR_PAGE_BYTES
+        );
+        return None;
+    }
+
+    match crate::persistence::read_bounded(&resolved, MAX_CUSTOM_ERROR_PAGE_BYTES) {
+        Ok(body) => Some(Arc::new(CustomErrorPage {
+            status,
+            body: Bytes::from(body),
+        })),
+        Err(e) => {
+            log::warn!(
+                "Ignoring [site] {label} path {} because it could not be read: {e}",
+                resolved.display()
+            );
+            None
+        }
+    }
+}
+
+/// Maximum directory depth `scan_site` will traverse.
 ///
 /// Prevents runaway BFS on artificially deep or adversarially-constructed
 /// directory trees. A legitimate site tree is extremely unlikely to exceed

@@ -1,12 +1,17 @@
 //! # ACME TLS Support
-use crate::Result;
 use crate::{config::AcmeConfig, error::AppError};
+use crate::{
+    runtime::{
+        shutdown::{ServiceOutcome, Shutdown},
+        state::{AcmeStatus, SharedState},
+    },
+    Result,
+};
 use futures::StreamExt as _;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_acme::AcmeAcceptor;
 use std::{
     collections::HashSet,
-    fmt::Debug,
     net::IpAddr,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -97,6 +102,38 @@ type AcmeBuildResult = Result<(
 #[must_use = "the AcmeAcceptor and ServerConfig must be used to serve TLS; \
               the JoinHandle must be retained to monitor the ACME event loop"]
 pub fn build_acme_acceptor(cfg: &AcmeConfig, data_dir: &Path) -> AcmeBuildResult {
+    let runtime = Handle::try_current().map_err(|_missing_runtime| {
+        AppError::Tls(
+            "build_acme_acceptor must be called from within an active Tokio runtime".into(),
+        )
+    })?;
+    let PreparedAcme {
+        acceptor,
+        server_config,
+        guard,
+        events,
+    } = prepare(cfg, data_dir)?;
+    let task = runtime.spawn(async move {
+        if let ServiceOutcome::Failed(message) = events.run(None).await {
+            log::error!("{message}");
+        }
+    });
+    Ok((acceptor, server_config, task, guard))
+}
+
+pub(crate) struct AcmeEvents {
+    state: rustls_acme::AcmeState<std::io::Error, std::io::Error>,
+    environment: &'static str,
+}
+
+pub(crate) struct PreparedAcme {
+    pub(crate) acceptor: Arc<AcmeAcceptor>,
+    pub(crate) server_config: Arc<ServerConfig>,
+    pub(crate) guard: AcmeInitGuard,
+    pub(crate) events: AcmeEvents,
+}
+
+pub(crate) fn prepare(cfg: &AcmeConfig, data_dir: &Path) -> Result<PreparedAcme> {
     if !cfg.enabled {
         return Err(AppError::Tls(
             "build_acme_acceptor called with cfg.enabled = false; \
@@ -218,21 +255,13 @@ pub fn build_acme_acceptor(cfg: &AcmeConfig, data_dir: &Path) -> AcmeBuildResult
     )]
     let acme_acceptor = Arc::new(state.acceptor());
 
-    // The environment label is runtime-derived, so Arc<str> matches its
-    // lifetime more honestly than &'static str.
-    let env_label: Arc<str> = if cfg.staging { "staging" } else { "production" }.into();
-
-    // Use try_current() to convert a missing-runtime panic into a recoverable
-    // AppError.
-    let rt_handle = Handle::try_current().map_err(|_missing_runtime| {
-        AppError::Tls(
-            "build_acme_acceptor must be called from within an active Tokio runtime".into(),
-        )
-    })?;
-
-    let task_handle = rt_handle.spawn(run_acme_event_loop(state, env_label));
-
-    Ok((acme_acceptor, server_cfg, task_handle, acme_guard))
+    let environment = if cfg.staging { "staging" } else { "production" };
+    Ok(PreparedAcme {
+        acceptor: acme_acceptor,
+        server_config: server_cfg,
+        guard: acme_guard,
+        events: AcmeEvents { state, environment },
+    })
 }
 
 fn acquire_acme_init_guard() -> Result<AcmeInitGuard> {
@@ -256,63 +285,74 @@ fn acquire_acme_init_guard() -> Result<AcmeInitGuard> {
 // ---------------------------------------------------------------------------
 // ACME event loop
 // ---------------------------------------------------------------------------
-/// Drive the rustls-acme state machine to completion.
-///
-/// Informational events (new cert issued, renewal triggered) and non-fatal
-/// errors (transient network failures, brief rate-limit hits) are both
-/// handled without terminating the loop.
-///
-/// Consecutive errors trigger a linear back-off (1 s per error, capped at
-/// 60 s) to avoid busy-looping against a persistently unavailable ACME
-/// server or misconfigured DNS.
-///
-/// The loop exits only when the underlying stream closes, which normally
-/// only happens during a clean process shutdown.
-async fn run_acme_event_loop<EC, EA>(mut state: rustls_acme::AcmeState<EC, EA>, env_label: Arc<str>)
-where
-    EC: Debug + Send + 'static,
-    EA: Debug + Send + 'static,
-{
-    log::info!("TLS/ACME: event loop started ({env_label})");
-    let mut consecutive_errors: u32 = 0;
+impl AcmeEvents {
+    pub(crate) async fn run(mut self, runtime: Option<(SharedState, Shutdown)>) -> ServiceOutcome {
+        let env = self.environment;
+        log::info!("TLS/ACME: event loop started ({env})");
+        let (status_state, mut shutdown) =
+            runtime.map_or((None, None), |(state, signal)| (Some(state), Some(signal)));
+        let mut consecutive_errors = 0u32;
+        let outcome = loop {
+            let event = tokio::select! {
+                biased;
+                () = wait_for_shutdown(&mut shutdown) => break ServiceOutcome::Drained,
+                event = self.state.next() => event,
+            };
+            match event {
+                Some(Ok(event)) => {
+                    consecutive_errors = 0;
+                    log::info!("TLS/ACME [{env}]: {event:?}");
+                    if matches!(
+                        event,
+                        rustls_acme::EventOk::DeployedCachedCert
+                            | rustls_acme::EventOk::DeployedNewCert
+                    ) {
+                        publish(status_state.as_ref(), AcmeStatus::Available).await;
+                    }
+                }
+                Some(Err(
+                    err @ (rustls_acme::EventError::AccountCacheLoad(_)
+                    | rustls_acme::EventError::AccountCacheStore(_)
+                    | rustls_acme::EventError::CertCacheLoad(_)),
+                )) => {
+                    break ServiceOutcome::Failed(format!(
+                        "TLS/ACME: persistent identity unavailable: {err}"
+                    ));
+                }
+                Some(Err(err)) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let backoff = Duration::from_secs(u64::from(consecutive_errors).min(60));
+                    log::warn!("TLS/ACME [{env}] error ({consecutive_errors} consecutive): {err} — backing off for {backoff:?}");
+                    publish(status_state.as_ref(), AcmeStatus::Retrying(err.to_string())).await;
+                    tokio::select! {
+                        biased;
+                        () = wait_for_shutdown(&mut shutdown) => break ServiceOutcome::Drained,
+                        () = tokio::time::sleep(backoff) => {}
+                    }
+                }
+                None => break ServiceOutcome::Failed("TLS/ACME event stream ended".to_owned()),
+            }
+        };
+        let status = match &outcome {
+            ServiceOutcome::Failed(message) => AcmeStatus::Failed(message.clone()),
+            ServiceOutcome::Aborted | ServiceOutcome::Drained => AcmeStatus::Stopped,
+        };
+        publish(status_state.as_ref(), status).await;
+        outcome
+    }
+}
 
-    loop {
-        match state.next().await {
-            Some(Ok(event)) => {
-                consecutive_errors = 0;
-                log::info!("TLS/ACME [{env_label}]: {event:?}");
-            }
-            Some(Err(
-                err @ (rustls_acme::EventError::AccountCacheLoad(_)
-                | rustls_acme::EventError::AccountCacheStore(_)
-                | rustls_acme::EventError::CertCacheLoad(_)),
-            )) => {
-                log::error!(
-                    "TLS/ACME: persistent identity unavailable; stopping issuance: {err:?}"
-                );
-                break;
-            }
-            Some(Err(err)) => {
-                // Back off on consecutive errors instead of immediately
-                // looping, which would busy-spin and flood logs
-                // during persistent failures (bad DNS, rate limits, etc.).
-                // The rustls-acme state machine handles retries internally;
-                // the sleep here prevents us from hammering it faster than
-                // it can recover.
-                consecutive_errors = consecutive_errors.saturating_add(1);
-                let backoff = Duration::from_secs(u64::from(consecutive_errors).min(60));
-                log::warn!(
-                    "TLS/ACME [{env_label}] error ({consecutive_errors} consecutive): \
-                     {err:?} — backing off for {backoff:?}"
-                );
-                tokio::time::sleep(backoff).await;
-            }
-            None => {
-                // Stream closed — normal during a clean shutdown.
-                log::info!("TLS/ACME [{env_label}]: event loop terminated");
-                break;
-            }
-        }
+async fn publish(state: Option<&SharedState>, status: AcmeStatus) {
+    if let Some(state) = state {
+        state.write().await.acme = status;
+    }
+}
+
+async fn wait_for_shutdown(shutdown: &mut Option<Shutdown>) {
+    if let Some(shutdown) = shutdown {
+        shutdown.wait().await;
+    } else {
+        std::future::pending::<()>().await;
     }
 }
 

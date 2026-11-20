@@ -30,3 +30,5 @@ mod session;
 mod state_dirs;
 
 pub use session::{init, onion_address_from_pubkey};
+
+pub(crate) use session::{publish, serve};

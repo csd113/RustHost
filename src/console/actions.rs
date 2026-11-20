@@ -654,10 +654,7 @@ pub async fn handle(
         }
 
         KeyEvent::Open => {
-            let port = state.read().await.actual_port;
-            // Match the active bind address so IPv6-only listeners still open.
-            let url = crate::console::ui::local_http_url(config.server.bind, port);
-            crate::runtime::open_browser(&url);
+            crate::runtime::open_local_site(&state).await;
         }
         state_event => {
             // Apply the console-mode transition under a short write lock.

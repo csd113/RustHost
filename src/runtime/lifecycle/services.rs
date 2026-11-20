@@ -1,224 +1,314 @@
-//! # Lifecycle Support
+//! Startup acknowledgements and supervision of network services.
 
-use std::{path::Path, sync::Arc, time::Duration};
-
-use tokio::sync::{oneshot, watch};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use tokio::{
+    sync::{oneshot, watch},
+    task::{Id, JoinSet},
+};
 
 use crate::{
     config::Config,
     console, logging,
-    runtime::state::{CertStatus, SharedMetrics, SharedState},
-    server, tls, AppError, Result,
+    runtime::{
+        shutdown::{deadline, ServiceOutcome},
+        state::{AcmeStatus, ConsoleMode, ListenerRole, ListenerStatus, SharedState, TorStatus},
+    },
+    server::{
+        self,
+        listeners::{self, BindResult, ListenerContext},
+    },
+    tls, tor, AppError, Result,
 };
 
-use super::SharedConnectionBudget;
+#[derive(Clone, Copy)]
+enum Service {
+    Listener(ListenerRole),
+    Acme,
+    Tor,
+}
 
-pub(super) type ListenerReady = std::result::Result<u16, String>;
+impl Service {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Listener(role) => role.label(),
+            Self::Acme => "TLS/ACME",
+            Self::Tor => "Tor service",
+        }
+    }
+
+    const fn grace(self, config: &Config) -> Duration {
+        Duration::from_secs(match self {
+            Self::Listener(_) => config.server.shutdown_grace_secs,
+            Self::Acme => 5,
+            Self::Tor => config.tor.shutdown_grace_secs,
+        })
+    }
+}
 
 #[derive(Default)]
-pub(super) struct BackgroundTasks {
-    pub(super) https: Option<tokio::task::JoinHandle<()>>,
-    pub(super) redirect: Option<tokio::task::JoinHandle<()>>,
-    pub(super) tor_ingress: Option<tokio::task::JoinHandle<()>>,
-    pub(super) acme: Option<tokio::task::JoinHandle<()>>,
-    pub(super) acme_guard: Option<tls::acme::AcmeInitGuard>,
+pub(super) struct Services {
+    tasks: JoinSet<ServiceOutcome>,
+    task_roles: HashMap<Id, Service>,
+    acme_guard: Option<tls::acme::AcmeInitGuard>,
 }
 
-impl Drop for BackgroundTasks {
-    fn drop(&mut self) {
-        // Dropping a JoinHandle detaches its task. Cancel owned services if
-        // startup is cancelled or exits before the normal shutdown path.
-        for task in [&self.https, &self.redirect, &self.tor_ingress, &self.acme]
-            .into_iter()
-            .flatten()
-        {
-            task.abort();
+impl Services {
+    pub(super) async fn start(&mut self, context: &ListenerContext) -> Result<()> {
+        let config = &context.config;
+        if !config.tls.enabled || !config.tls.redirect_http {
+            self.start_listener(context, ListenerRole::Http, None)
+                .await?;
         }
-    }
-}
-
-struct HttpsTaskArgs<'a> {
-    config: &'a Arc<Config>,
-    state: &'a SharedState,
-    metrics: &'a SharedMetrics,
-    shutdown_rx: &'a watch::Receiver<bool>,
-    data_dir: &'a Path,
-    budget: &'a SharedConnectionBudget,
-    root_tx: &'a watch::Sender<Arc<server::SiteSnapshot>>,
-}
-
-pub(super) async fn wait_for_bind_port(
-    port_rx: oneshot::Receiver<ListenerReady>,
-    label: &str,
-) -> Result<u16> {
-    match tokio::time::timeout(Duration::from_secs(10), port_rx).await {
-        Ok(Ok(Ok(port))) => Ok(port),
-        Ok(Ok(Err(message))) => Err(AppError::ServerStartup(message)),
-        Ok(Err(_)) => {
-            log::error!("{label} port channel closed before sending — startup failed");
-            Err(AppError::ServerStartup(format!(
-                "{label} task exited before signalling its bound port"
-            )))
-        }
-        Err(_) => {
-            log::error!("Timed out waiting for {label} to bind");
-            Err(AppError::ServerStartup(format!(
-                "Timed out waiting for {label} to bind (10 s)"
-            )))
-        }
-    }
-}
-
-pub(super) async fn setup_tls(
-    config: &Arc<Config>,
-    state: &SharedState,
-    metrics: &SharedMetrics,
-    shutdown_rx: &watch::Receiver<bool>,
-    data_dir: &Path,
-    budget: &SharedConnectionBudget,
-    root_tx: &watch::Sender<Arc<server::SiteSnapshot>>,
-) -> Result<BackgroundTasks> {
-    let mut tasks = BackgroundTasks::default();
-
-    if !config.tls.enabled {
-        return Ok(tasks);
-    }
-
-    let tls_result = tls::build_acceptor(&config.tls, data_dir).await;
-
-    match tls_result {
-        Err(e) => {
-            log::error!("TLS init failed: {e}");
-            return Err(e);
-        }
-        Ok(None) => {}
-        Ok(Some(tls_setup)) => {
-            let crate::tls::TlsSetup {
-                acceptor,
-                acme_task,
-                acme_guard,
-            } = tls_setup;
-            tasks.acme = acme_task;
-            tasks.acme_guard = acme_guard;
-
-            set_tls_cert_status(config, state).await;
-            let tls_port_rx = spawn_https_task(
-                &mut tasks,
-                &HttpsTaskArgs {
-                    config,
-                    state,
-                    metrics,
-                    shutdown_rx,
-                    data_dir,
-                    budget,
-                    root_tx,
-                },
-                acceptor,
-            );
-            if let Err(err) = wait_for_bind_port(tls_port_rx, "HTTPS server").await {
-                abort_startup_tasks(&mut tasks).await;
-                return Err(err);
-            }
-
-            if config.tls.redirect_http {
-                let redir_port_rx =
-                    spawn_redirect_task(&mut tasks, config, state, shutdown_rx, budget);
-                if let Err(err) = wait_for_bind_port(redir_port_rx, "HTTP redirect server").await {
-                    abort_startup_tasks(&mut tasks).await;
-                    return Err(err);
+        if config.tls.enabled {
+            let role = ListenerRole::Https;
+            context
+                .state
+                .write()
+                .await
+                .set_listener(role, ListenerStatus::Starting);
+            let tls = tls::prepare(&config.tls, &context.data_dir).await;
+            match tls {
+                Ok(Some(tls)) => self.start_https(context, tls).await?,
+                Ok(None) => {}
+                Err(error) => {
+                    publish_failure(&context.state, Service::Listener(role), error.to_string())
+                        .await;
+                    return Err(error);
                 }
             }
         }
+        if config.tor.enabled {
+            let address = self
+                .start_listener(context, ListenerRole::TorIngress, None)
+                .await?;
+            self.spawn(
+                Service::Tor,
+                context,
+                tor::serve(
+                    context.data_dir.clone(),
+                    address,
+                    config.server.max_connections as usize,
+                    Arc::clone(&context.state),
+                    context.shutdown.clone(),
+                    Service::Tor.grace(config),
+                ),
+            );
+        }
+        Ok(())
     }
 
-    Ok(tasks)
+    async fn start_https(
+        &mut self,
+        context: &ListenerContext,
+        tls: tls::PreparedTls,
+    ) -> Result<()> {
+        context.state.write().await.tls_cert_status = tls.cert_status;
+        if let Some((events, guard)) = tls.acme {
+            context.state.write().await.acme = AcmeStatus::Starting;
+            self.acme_guard = Some(guard);
+            self.spawn(
+                Service::Acme,
+                context,
+                events.run(Some((Arc::clone(&context.state), context.shutdown.clone()))),
+            );
+        }
+        let https = self
+            .start_listener(context, ListenerRole::Https, Some(tls.acceptor))
+            .await?;
+        if context.config.tls.redirect_http {
+            self.start_redirect(context, https.port()).await?;
+        }
+        Ok(())
+    }
+
+    async fn start_listener(
+        &mut self,
+        context: &ListenerContext,
+        role: ListenerRole,
+        acceptor: Option<tls::Acceptor>,
+    ) -> Result<std::net::SocketAddr> {
+        let (tx, rx) = oneshot::channel();
+        self.spawn(
+            Service::Listener(role),
+            context,
+            listeners::serve(role, acceptor, context.clone(), |result| {
+                let _ = tx.send(result);
+            }),
+        );
+        wait_for_bind(rx, role).await
+    }
+
+    async fn start_redirect(&mut self, context: &ListenerContext, tls_port: u16) -> Result<()> {
+        let config = &context.config;
+        let role = ListenerRole::Redirect;
+        let (tx, rx) = oneshot::channel();
+        self.spawn(
+            Service::Listener(role),
+            context,
+            server::redirect::serve_redirect(
+                server::redirect::RedirectServerConfig {
+                    bind_addr: config.server.bind,
+                    plain_port: config.tls.http_port.get(),
+                    tls_port,
+                    allowed_hosts: redirect_allowed_hosts(config),
+                    max_per_ip: config.server.max_connections_per_ip,
+                    drain_timeout: Service::Listener(role).grace(config),
+                },
+                Arc::clone(&context.state),
+                context.shutdown.clone(),
+                context.budget.clone(),
+                |result| {
+                    let _ = tx.send(result);
+                },
+            ),
+        );
+        wait_for_bind(rx, role).await?;
+        Ok(())
+    }
+
+    fn spawn(
+        &mut self,
+        service: Service,
+        context: &ListenerContext,
+        future: impl Future<Output = ServiceOutcome> + Send + 'static,
+    ) {
+        let mut shutdown = context.shutdown.clone();
+        let grace = service.grace(&context.config);
+        let task = self.tasks.spawn(async move {
+            tokio::pin!(future);
+            let started = tokio::select! {
+                biased;
+                outcome = &mut future => return outcome,
+                started = shutdown.wait() => started,
+            };
+            tokio::select! {
+                biased;
+                outcome = &mut future => outcome,
+                () = tokio::time::sleep_until(deadline(started, grace)) => ServiceOutcome::Aborted,
+            }
+        });
+        self.task_roles.insert(task.id(), service);
+    }
+
+    async fn observe_exit(&mut self, state: &SharedState, stopping: bool) -> Option<Result<()>> {
+        let joined = self.tasks.join_next_with_id().await?;
+        let (id, outcome) = match joined {
+            Ok(result) => result,
+            Err(error) => (
+                error.id(),
+                ServiceOutcome::Failed(format!("task join failed: {error}")),
+            ),
+        };
+        let Some(service) = self.task_roles.remove(&id) else {
+            return Some(Err(AppError::ServerStartup(format!(
+                "untracked service task {id} exited"
+            ))));
+        };
+        let label = service.label();
+        let failure = match outcome {
+            ServiceOutcome::Drained if stopping => {
+                log::info!("{label} drained");
+                None
+            }
+            ServiceOutcome::Drained => Some(format!("{label} stopped unexpectedly")),
+            ServiceOutcome::Aborted => {
+                log::warn!("{label} aborted at its shutdown deadline");
+                publish_aborted(state, service).await;
+                None
+            }
+            ServiceOutcome::Failed(message) => Some(message),
+        };
+        if let Some(message) = failure {
+            log::error!("{label} failed: {message}");
+            publish_failure(state, service, message.clone()).await;
+            if matches!(service, Service::Listener(_)) {
+                return Some(Err(AppError::ServerStartup(message)));
+            }
+        }
+        Some(Ok(()))
+    }
+
+    pub(super) async fn wait_for_failure(&mut self, state: &SharedState) -> Result<()> {
+        while let Some(result) = self.observe_exit(state, false).await {
+            result?;
+        }
+        Err(AppError::ServerStartup(
+            "all service tasks exited".to_owned(),
+        ))
+    }
+
+    pub(super) async fn shutdown(
+        mut self,
+        context: &ListenerContext,
+        trigger: &watch::Sender<bool>,
+    ) {
+        let config = &context.config;
+        context.shutdown.begin(trigger);
+        {
+            let mut state = context.state.write().await;
+            state.runtime_ready = false;
+            state.console_mode = ConsoleMode::ShuttingDown;
+        }
+        log::info!("Shutdown requested — stopping web server and background services...");
+        if config.tor.enabled {
+            log::info!(
+                "Tor cleanup may take up to {} s while active streams close.",
+                config.tor.shutdown_grace_secs
+            );
+        }
+        console::show_shutdown_message(config.tor.enabled);
+        while self.observe_exit(&context.state, true).await.is_some() {}
+        drop(self.acme_guard.take());
+        logging::shutdown_access_log();
+        log::info!("RustHost shutdown complete.");
+        logging::flush();
+        console::cleanup();
+    }
 }
 
-async fn set_tls_cert_status(config: &Config, state: &SharedState) {
-    let mut s = state.write().await;
-    s.tls_cert_status = if config.tls.acme.enabled {
-        config.tls.acme.domains.first().map_or(
-            CertStatus::Acme {
-                domain: String::new(),
-            },
-            |d| CertStatus::Acme { domain: d.clone() },
-        )
-    } else if config.tls.manual_cert.is_some() {
-        CertStatus::Manual
-    } else {
-        CertStatus::SelfSigned
-    };
+async fn wait_for_bind(
+    rx: oneshot::Receiver<BindResult>,
+    role: ListenerRole,
+) -> Result<std::net::SocketAddr> {
+    let label = role.label();
+    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Ok(Ok(result)) => result.map_err(AppError::ServerStartup),
+        Ok(Err(_)) => Err(AppError::ServerStartup(format!(
+            "{label} exited before acknowledging its bind"
+        ))),
+        Err(_) => Err(AppError::ServerStartup(format!(
+            "Timed out waiting for {label} to bind (10 s)"
+        ))),
+    }
 }
 
-fn spawn_https_task(
-    tasks: &mut BackgroundTasks,
-    args: &HttpsTaskArgs<'_>,
-    acceptor: tls::Acceptor,
-) -> oneshot::Receiver<ListenerReady> {
-    let tls_config = Arc::clone(args.config);
-    let tls_state = Arc::clone(args.state);
-    let tls_metrics = Arc::clone(args.metrics);
-    let tls_shutdown = args.shutdown_rx.clone();
-    let tls_data_dir = args.data_dir.to_path_buf();
-    let tls_sem = std::sync::Arc::clone(&args.budget.semaphore);
-    let tls_ip_map = std::sync::Arc::clone(&args.budget.per_ip_map);
-    let tls_root_rx = args.root_tx.subscribe();
-    let (tls_port_tx, tls_port_rx) = oneshot::channel::<ListenerReady>();
-    tasks.https = Some(tokio::spawn(async move {
-        server::run_https(
-            tls_config,
-            tls_state,
-            tls_metrics,
-            tls_data_dir,
-            tls_shutdown,
-            acceptor,
-            tls_port_tx,
-            tls_sem,
-            tls_ip_map,
-            tls_root_rx,
-        )
-        .await;
-    }));
-    tls_port_rx
+async fn publish_failure(state: &SharedState, service: Service, message: String) {
+    match service {
+        Service::Listener(role) => {
+            let mut state = state.write().await;
+            state.runtime_ready = false;
+            state.set_listener(role, ListenerStatus::Failed(message));
+        }
+        Service::Acme => state.write().await.acme = AcmeStatus::Failed(message),
+        Service::Tor => tor::publish(state, TorStatus::Failed(message), None).await,
+    }
 }
 
-fn spawn_redirect_task(
-    tasks: &mut BackgroundTasks,
-    config: &Arc<Config>,
-    state: &SharedState,
-    shutdown_rx: &watch::Receiver<bool>,
-    budget: &SharedConnectionBudget,
-) -> oneshot::Receiver<ListenerReady> {
-    let bind_addr = config.server.bind;
-    let redir_plain_port = config.tls.http_port.get();
-    let redir_tls_port = config.tls.port.get();
-    let redir_allowed_hosts = redirect_allowed_hosts(config);
-    let redir_state = Arc::clone(state);
-    let redir_shutdown = shutdown_rx.clone();
-    let redir_sem = std::sync::Arc::clone(&budget.semaphore);
-    let redir_ip_map = std::sync::Arc::clone(&budget.per_ip_map);
-    let redir_max_per_ip = config.server.max_connections_per_ip;
-    let redir_drain_timeout = Duration::from_secs(config.server.shutdown_grace_secs);
-    let (redir_port_tx, redir_port_rx) = oneshot::channel::<ListenerReady>();
-    tasks.redirect = Some(tokio::spawn(async move {
-        server::redirect::run_redirect_server(
-            server::redirect::RedirectServerConfig {
-                bind_addr,
-                plain_port: redir_plain_port,
-                tls_port: redir_tls_port,
-                allowed_hosts: redir_allowed_hosts,
-                max_per_ip: redir_max_per_ip,
-                drain_timeout: redir_drain_timeout,
-            },
-            redir_state,
-            redir_shutdown,
-            redir_port_tx,
-            redir_sem,
-            redir_ip_map,
-        )
-        .await;
-    }));
-    redir_port_rx
+async fn publish_aborted(state: &SharedState, service: Service) {
+    match service {
+        Service::Listener(role) => state
+            .write()
+            .await
+            .set_listener(role, ListenerStatus::Stopped),
+        Service::Acme => state.write().await.acme = AcmeStatus::Stopped,
+        Service::Tor => tor::publish(state, TorStatus::Stopped, None).await,
+    }
+}
+
+pub(super) async fn maybe_open_browser(config: &Config, state: &SharedState) {
+    if config.server.open_browser_on_start {
+        super::super::open_local_site(state).await;
+    }
 }
 
 fn redirect_allowed_hosts(config: &Config) -> Vec<String> {
@@ -262,121 +352,5 @@ fn normalize_redirect_host(raw: &str) -> Option<String> {
         Some(host.to_ascii_lowercase())
     } else {
         None
-    }
-}
-
-async fn abort_startup_tasks(tasks: &mut BackgroundTasks) {
-    abort_task(tasks.redirect.take(), "HTTP redirect server startup task").await;
-    abort_task(tasks.https.take(), "HTTPS server startup task").await;
-    abort_task(tasks.acme.take(), "ACME startup task").await;
-    tasks.acme_guard.take();
-}
-
-async fn abort_task(task: Option<tokio::task::JoinHandle<()>>, label: &str) {
-    let Some(task) = task else {
-        return;
-    };
-    task.abort();
-    if let Err(e) = task.await {
-        if !e.is_cancelled() {
-            log::warn!("{label} ended with a join error during startup cleanup: {e}");
-        }
-    }
-}
-
-pub(super) async fn maybe_open_browser(config: &Config, state: &SharedState) {
-    if !config.server.open_browser_on_start {
-        return;
-    }
-    let port = state.read().await.actual_port;
-    let url = crate::console::ui::local_http_url(config.server.bind, port);
-    super::super::open_browser(&url);
-}
-
-pub(super) async fn graceful_shutdown(
-    config: &Config,
-    shutdown_tx: watch::Sender<bool>,
-    server_handle: Option<tokio::task::JoinHandle<()>>,
-    tor_handle: Option<tokio::task::JoinHandle<()>>,
-    mut background_tasks: BackgroundTasks,
-) {
-    log::info!("Shutdown requested — stopping web server and background services...");
-    if config.tor.enabled {
-        log::info!(
-            "Tor cleanup may take up to {} s while active streams close.",
-            config.tor.shutdown_grace_secs
-        );
-    }
-    console::show_shutdown_message(config.tor.enabled);
-    let _ = shutdown_tx.send(true);
-
-    let http_budget = Duration::from_secs(config.server.shutdown_grace_secs);
-
-    wait_for_background_task(server_handle, http_budget, "HTTP server").await;
-    wait_for_background_task(
-        tor_handle,
-        Duration::from_secs(config.tor.shutdown_grace_secs),
-        "Tor service",
-    )
-    .await;
-
-    wait_for_background_task(
-        background_tasks.redirect.take(),
-        Duration::from_secs(config.server.shutdown_grace_secs.saturating_add(2)),
-        "HTTP redirect server",
-    )
-    .await;
-    wait_for_background_task(
-        background_tasks.tor_ingress.take(),
-        Duration::from_secs(config.server.shutdown_grace_secs.saturating_add(2)),
-        "Tor ingress server",
-    )
-    .await;
-    wait_for_background_task(
-        background_tasks.https.take(),
-        Duration::from_secs(config.server.shutdown_grace_secs.saturating_add(2)),
-        "HTTPS server",
-    )
-    .await;
-    wait_for_background_task(
-        background_tasks.acme.take(),
-        Duration::from_secs(5),
-        "ACME event loop",
-    )
-    .await;
-    background_tasks.acme_guard.take();
-    logging::shutdown_access_log();
-
-    log::info!("RustHost shut down cleanly.");
-    logging::flush();
-    console::cleanup();
-}
-
-pub(super) async fn wait_for_background_task(
-    task: Option<tokio::task::JoinHandle<()>>,
-    timeout: Duration,
-    label: &str,
-) {
-    let Some(mut handle) = task else {
-        return;
-    };
-
-    match tokio::time::timeout(timeout, &mut handle).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            log::warn!("{label} task ended with a join error during shutdown: {e}");
-        }
-        Err(_) => {
-            log::warn!(
-                "{label} did not stop within {} s; aborting task",
-                timeout.as_secs()
-            );
-            handle.abort();
-            if let Err(e) = handle.await {
-                if !e.is_cancelled() {
-                    log::warn!("{label} failed while being aborted: {e}");
-                }
-            }
-        }
     }
 }

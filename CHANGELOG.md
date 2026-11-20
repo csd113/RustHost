@@ -7,6 +7,13 @@ RustHost uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- Report the bound HTTP, HTTPS, redirect and Tor ingress addresses and listener states. Report certificate issuance and renewal separately from HTTPS availability.
+- Close listeners at shutdown and let active HTTP responses finish within the configured grace period. Apply the configured Tor grace period to active onion streams and clear the onion address while reconnecting or stopping.
+
 ## [v1.2.0] — 2026-11-08
 
 ### Changed

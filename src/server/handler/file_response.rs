@@ -1,6 +1,6 @@
 //! Response bodies, headers, and file representation selection.
 
-use std::{borrow::Cow, path::Path, sync::Arc, time::UNIX_EPOCH};
+use std::{borrow::Cow, path::Path, time::UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::TryStreamExt as _;
@@ -10,13 +10,11 @@ use hyper::{body::Incoming, header, Method, Request, Response, StatusCode};
 use tokio::io::AsyncReadExt as _;
 use tokio_util::io::ReaderStream;
 
-use super::super::mime;
+use super::super::{mime, site_snapshot::CustomErrorPage};
 use super::encoding::{best_encoding, is_compressible_content_type, should_compress, Encoding};
-use super::routes::RequestContext;
 use crate::runtime::state::{SharedMetrics, SharedState};
 
 pub(super) type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
-const MAX_CUSTOM_ERROR_PAGE_BYTES: u64 = 64 * 1024;
 const IDENTITY_STREAM_CHUNK_BYTES: usize = 128 * 1024;
 
 fn full_body(data: impl Into<Bytes>) -> BoxBody {
@@ -45,12 +43,6 @@ where
     .boxed()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CustomErrorPage {
-    status: StatusCode,
-    body: Bytes,
-}
-
 impl CustomErrorPage {
     pub(super) fn response(&self, is_head: bool, csp: &str, url_path: &str) -> Response<BoxBody> {
         let mut builder = Response::builder()
@@ -68,66 +60,6 @@ impl CustomErrorPage {
             full_body(self.body.clone())
         };
         builder.body(body).unwrap_or_default()
-    }
-}
-
-pub fn load_custom_error_page(
-    canonical_root: &Path,
-    candidate: &Path,
-    label: &str,
-    status: StatusCode,
-) -> Option<Arc<CustomErrorPage>> {
-    let resolved = match candidate.canonicalize() {
-        Ok(resolved) if resolved.starts_with(canonical_root) => resolved,
-        Ok(resolved) => {
-            log::warn!(
-                "Ignoring [site] {label} path {} because it resolves outside the site root: {}",
-                candidate.display(),
-                resolved.display()
-            );
-            return None;
-        }
-        Err(e) => {
-            log::warn!(
-                "Ignoring [site] {label} path {} because it could not be resolved: {e}",
-                candidate.display()
-            );
-            return None;
-        }
-    };
-
-    let metadata = match std::fs::metadata(&resolved) {
-        Ok(metadata) => metadata,
-        Err(e) => {
-            log::warn!(
-                "Ignoring [site] {label} path {} because metadata could not be read: {e}",
-                resolved.display()
-            );
-            return None;
-        }
-    };
-
-    if !metadata.is_file() || metadata.len() > MAX_CUSTOM_ERROR_PAGE_BYTES {
-        log::warn!(
-            "Ignoring [site] {label} path {} because it exceeds the {} byte limit",
-            resolved.display(),
-            MAX_CUSTOM_ERROR_PAGE_BYTES
-        );
-        return None;
-    }
-
-    match crate::persistence::read_bounded(&resolved, MAX_CUSTOM_ERROR_PAGE_BYTES) {
-        Ok(body) => Some(Arc::new(CustomErrorPage {
-            status,
-            body: Bytes::from(body),
-        })),
-        Err(e) => {
-            log::warn!(
-                "Ignoring [site] {label} path {} because it could not be read: {e}",
-                resolved.display()
-            );
-            None
-        }
     }
 }
 
@@ -231,14 +163,19 @@ async fn open_regular_file(path: &Path) -> std::io::Result<(tokio::fs::File, std
     Ok((file, metadata))
 }
 
+pub(super) struct FileRequest<'a> {
+    pub(super) req: &'a Request<Incoming>,
+    pub(super) is_head: bool,
+    pub(super) metrics: &'a SharedMetrics,
+    pub(super) canonical_root: &'a Path,
+    pub(super) csp: &'a str,
+    pub(super) error_503_page: Option<&'a CustomErrorPage>,
+}
+
 /// Serve a file, honoring conditional requests, ranges, and compression.
-#[expect(
-    clippy::too_many_lines,
-    reason = "File serving intentionally centralizes validators and sidecar selection."
-)]
 pub(super) async fn serve_file(
     abs_path: &std::path::Path,
-    ctx: &RequestContext<'_>,
+    ctx: &FileRequest<'_>,
 ) -> std::result::Result<Response<BoxBody>, std::io::Error> {
     let (file, metadata) = match open_regular_file(abs_path).await {
         Ok(pair) => pair,
@@ -271,6 +208,8 @@ pub(super) async fn serve_file(
 
     let accepted_encoding = best_encoding(ctx.req);
 
+    // Sidecar I/O errors retain their existing propagation to Hyper. Base-file
+    // open errors are mapped to HTTP responses before representation selection.
     if let Some(sidecar) = open_precompressed_variant(
         abs_path,
         accepted_encoding,
@@ -279,30 +218,7 @@ pub(super) async fn serve_file(
     )
     .await?
     {
-        let etag = weak_variant_etag(&sidecar.metadata, sidecar.encoding_token);
-        let last_modified = last_modified_header(&sidecar.metadata);
-        if selected_representation_not_modified(ctx.req, &etag, &sidecar.metadata) {
-            ctx.metrics.add_request();
-            return Ok(not_modified_variant_response(
-                &etag,
-                last_modified.as_deref(),
-                content_type,
-                path_str,
-                sidecar.content_encoding,
-            ));
-        }
-        ctx.metrics.add_request();
-        return build_precompressed_response(
-            sidecar,
-            &FileResponseContext {
-                content_type,
-                path_str,
-                is_head: ctx.is_head,
-                csp: ctx.csp,
-                etag: &etag,
-                last_modified: last_modified.as_deref(),
-            },
-        );
+        return respond_with_sidecar(sidecar, ctx, &response_ctx);
     }
 
     let preferred_encoding = if should_compress(content_type, file_len) {
@@ -359,6 +275,33 @@ pub(super) async fn serve_file(
     // ── Full-file response ────────────────────────────────────────────────────
     ctx.metrics.add_request();
     build_full_response(preferred_encoding, file, file_len, &response_ctx)
+}
+
+fn respond_with_sidecar(
+    sidecar: PrecompressedVariant,
+    request: &FileRequest<'_>,
+    base: &FileResponseContext<'_>,
+) -> std::io::Result<Response<BoxBody>> {
+    let etag = weak_variant_etag(&sidecar.metadata, sidecar.encoding_token);
+    let last_modified = last_modified_header(&sidecar.metadata);
+    request.metrics.add_request();
+    if selected_representation_not_modified(request.req, &etag, &sidecar.metadata) {
+        return Ok(not_modified_variant_response(
+            &etag,
+            last_modified.as_deref(),
+            base.content_type,
+            base.path_str,
+            sidecar.content_encoding,
+        ));
+    }
+    build_precompressed_response(
+        sidecar,
+        &FileResponseContext {
+            etag: &etag,
+            last_modified: last_modified.as_deref(),
+            ..*base
+        },
+    )
 }
 
 struct PrecompressedVariant {

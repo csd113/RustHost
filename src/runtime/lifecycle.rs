@@ -18,10 +18,9 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
-use tokio::sync::{mpsc, oneshot, watch, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 
 use crate::{
     config::{self, Config},
@@ -29,15 +28,18 @@ use crate::{
     logging,
     path_display::display_path,
     runtime::{
-        runtime_root, site_reload,
+        runtime_root,
+        shutdown::Shutdown,
+        site_reload,
         state::{AppState, Metrics, SharedMetrics, SharedState, TorStatus},
     },
-    server, tor, Result,
+    server::{
+        self,
+        listeners::{ConnectionBudget, ListenerContext},
+    },
+    Result,
 };
-use services::{
-    graceful_shutdown, maybe_open_browser, setup_tls, wait_for_background_task, wait_for_bind_port,
-    ListenerReady,
-};
+use services::{maybe_open_browser, Services};
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -71,18 +73,6 @@ pub fn resolve_config_paths(args: &CliArgs) -> (PathBuf, PathBuf) {
         .clone()
         .unwrap_or_else(|| data_dir.join("settings.toml"));
     (data_dir, settings_path)
-}
-
-// ─── Shared connection budget ─────────────────────────────────────────────────
-
-/// Shared connection-budget state passed to both HTTP and HTTPS listeners so
-/// they enforce a single combined connection limit.
-#[derive(Clone)]
-struct SharedConnectionBudget {
-    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
-    per_ip_map: std::sync::Arc<
-        dashmap::DashMap<std::net::IpAddr, std::sync::Arc<std::sync::atomic::AtomicU32>>,
-    >,
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -343,220 +333,96 @@ const fn apply_managed_runtime_mode(config: &mut Config, mode: ManagedRunnerMode
 /// Core server startup given an already-built `Config`.
 ///
 /// Shared by the standard settings.toml path and the `--serve` one-shot mode.
-#[expect(
-    clippy::too_many_lines,
-    reason = "Startup wiring intentionally centralizes subsystem initialization."
-)]
 async fn normal_run_with_config(
     data_dir: PathBuf,
     settings_path: Option<PathBuf>,
     config: Arc<Config>,
 ) -> Result<()> {
     ensure_data_directories(&data_dir)?;
-
-    // 2. Initialise logging.
     logging::init(&config.logging, &data_dir)?;
-    if let Err(e) = logging::init_access_log(&config.logging, &data_dir) {
-        log::warn!("Could not initialise access log: {e}");
+    if let Err(error) = logging::init_access_log(&config.logging, &data_dir) {
+        log::warn!("Could not initialise access log: {error}");
     }
     log::info!("RustHost starting — version {}", env!("CARGO_PKG_VERSION"));
-
-    // config.server.bind is typed as IpAddr, so use is_unspecified() instead
-    // of string comparison.
     if config.server.bind.is_unspecified() {
-        log::warn!("[server] bind = \"0.0.0.0\" — server is reachable on all interfaces.");
+        log::warn!(
+            "[server] bind = \"{}\" — server is reachable on all interfaces.",
+            config.server.bind
+        );
     }
 
-    // 3. Build shared state and metrics.
-    let state: SharedState = Arc::new(RwLock::new(AppState::new()));
-    let metrics: SharedMetrics = Arc::new(Metrics::new());
+    let (trigger, signal) = watch::channel(false);
+    let (context, root_tx) =
+        prepare_runtime(config, data_dir, Shutdown::from_receiver(signal)).await?;
+    let mut services = Services::default();
+    let outcome = run_services(&context, settings_path, root_tx, &mut services).await;
+    services.shutdown(&context, &trigger).await;
+    outcome
+}
 
-    // 4. Set Disabled status early if tor is off, so the UI is correct
-    //    before the server even binds.
-    if !config.tor.enabled {
-        state.write().await.tor_status = TorStatus::Disabled;
-    }
-
-    // 5. Shutdown channels.
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-    let budget = SharedConnectionBudget {
-        semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            config.server.max_connections as usize,
-        )),
-        per_ip_map: std::sync::Arc::new(dashmap::DashMap::new()),
-    };
+async fn prepare_runtime(
+    config: Arc<Config>,
+    data_dir: PathBuf,
+    shutdown: Shutdown,
+) -> Result<(ListenerContext, watch::Sender<Arc<server::SiteSnapshot>>)> {
     let snapshot_config = Arc::clone(&config);
     let snapshot_dir = data_dir.clone();
-    let (root_tx, root_rx) =
-        tokio::task::spawn_blocking(move || make_root_watch(&snapshot_config, &snapshot_dir))
-            .await
-            .map_err(|e| {
-                crate::AppError::ConfigLoad(format!("site preparation task failed: {e}"))
-            })??;
-    let redirect_public_http = uses_redirect_public_http(&config);
-    let server_handle = if redirect_public_http {
-        None
-    } else {
-        // 6. Start HTTP server task.
-        let (port_tx, port_rx) = oneshot::channel::<ListenerReady>();
-        let server_handle = spawn_server(
-            &config,
-            &state,
-            &metrics,
-            &shutdown_rx,
-            port_tx,
-            data_dir.clone(),
-            root_rx,
-            budget.clone(),
-        );
-
-        // Wait for the server to signal its bound port via the oneshot channel.
-        match wait_for_bind_port(port_rx, "HTTP server").await {
-            Ok(port) => port,
-            Err(err) => {
-                let _ = shutdown_tx.send(true);
-                wait_for_background_task(
-                    Some(server_handle),
-                    Duration::from_secs(5),
-                    "HTTP server startup task",
-                )
-                .await;
-                return Err(err);
-            }
-        };
-        Some(server_handle)
-    };
-
-    // 6b. TLS / HTTPS — optional. If TLS is disabled this is a no-op; if it is
-    // enabled but initialisation or binding fails, the failure is fatal and the
-    // already-started HTTP listener is torn down by the shutdown path below.
-    let background_tasks = setup_tls(
-        &config,
-        &state,
-        &metrics,
-        &shutdown_rx,
-        &data_dir,
-        &budget,
-        &root_tx,
-    )
-    .await;
-    let mut background_tasks = match background_tasks {
-        Ok(tasks) => tasks,
-        Err(err) => {
-            graceful_shutdown(
-                &config,
-                shutdown_tx,
-                server_handle,
-                None,
-                services::BackgroundTasks::default(),
-            )
-            .await;
-            return Err(err);
-        }
-    };
-
-    // 7. Start Tor (if enabled).
-    //    tor::init() spawns a Tokio task and returns its JoinHandle.
-    //    Pass shutdown_rx so Tor's stream loop exits on clean shutdown.
-    let tor_handle = if config.tor.enabled {
-        let tor_bind_addr = server::tor_loopback_addr(config.server.bind);
-        let (tor_ingress_port_tx, tor_ingress_port_rx) = oneshot::channel::<ListenerReady>();
-        let tor_ingress_config = Arc::clone(&config);
-        let tor_ingress_state = Arc::clone(&state);
-        let tor_ingress_metrics = Arc::clone(&metrics);
-        let tor_ingress_shutdown = shutdown_rx.clone();
-        let tor_ingress_data_dir = data_dir.clone();
-        let tor_ingress_sem = std::sync::Arc::clone(&budget.semaphore);
-        let tor_ingress_root_rx = root_tx.subscribe();
-        background_tasks.tor_ingress = Some(tokio::spawn(async move {
-            server::run_tor_ingress(
-                tor_ingress_config,
-                tor_ingress_state,
-                tor_ingress_metrics,
-                tor_ingress_data_dir,
-                tor_ingress_shutdown,
-                tor_ingress_port_tx,
-                tor_ingress_sem,
-                tor_ingress_root_rx,
-            )
-            .await;
-        }));
-        let tor_ingress_port =
-            match wait_for_bind_port(tor_ingress_port_rx, "Tor ingress server").await {
-                Ok(port) => port,
-                Err(err) => {
-                    graceful_shutdown(&config, shutdown_tx, server_handle, None, background_tasks)
-                        .await;
-                    return Err(err);
-                }
-            };
-        let max_tor = config.server.max_connections as usize;
-        Some(tor::init(
-            data_dir.clone(),
-            tor_ingress_port,
-            tor_bind_addr,
-            max_tor,
-            Arc::clone(&state),
-            shutdown_rx.clone(),
-        ))
-    } else {
-        None
-    };
-
-    {
-        let mut state = state.write().await;
-        state.site_file_count = root_tx.borrow().file_count;
-        state.site_total_bytes = root_tx.borrow().total_bytes;
+    let site = tokio::task::spawn_blocking(move || {
+        server::SiteSnapshot::prepare(&snapshot_config, &snapshot_dir)
+    })
+    .await
+    .map_err(|error| {
+        crate::AppError::ConfigLoad(format!("site preparation task failed: {error}"))
+    })??;
+    let mut state = AppState::new();
+    if !config.tor.enabled {
+        state.tor_status = TorStatus::Disabled;
     }
-
-    // 8. Start console UI.
-    let console_session =
-        match start_console(&config, &state, &metrics, shutdown_rx.clone(), &data_dir).await {
-            Ok(session) => session,
-            Err(err) => {
-                graceful_shutdown(
-                    &config,
-                    shutdown_tx,
-                    server_handle,
-                    tor_handle,
-                    background_tasks,
-                )
-                .await;
-                return Err(err);
-            }
-        };
-
-    // 9. Open browser (if configured).
-    maybe_open_browser(&config, &state).await;
-
-    state.write().await.runtime_ready = true;
-
-    // 10. Event dispatch loop.  Always continue into the single shutdown path
-    // so listener/background cleanup runs even if event handling fails.
-    let event_result = event_loop(
-        console_session,
-        &config,
-        &state,
-        &metrics,
-        data_dir,
-        settings_path,
+    state.site_file_count = site.file_count;
+    state.site_total_bytes = site.total_bytes;
+    let (root_tx, site_watch) = watch::channel(site);
+    let budget = ConnectionBudget {
+        semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.server.max_connections as usize,
+        )),
+        per_ip_map: Arc::new(dashmap::DashMap::new()),
+    };
+    Ok((
+        ListenerContext {
+            config,
+            state: Arc::new(RwLock::new(state)),
+            metrics: Arc::new(Metrics::new()),
+            data_dir,
+            shutdown,
+            site_watch,
+            budget,
+        },
         root_tx,
-    )
-    .await;
+    ))
+}
 
-    state.write().await.runtime_ready = false;
-
-    // 11. Graceful shutdown.
-    graceful_shutdown(
-        &config,
-        shutdown_tx,
-        server_handle,
-        tor_handle,
-        background_tasks,
+async fn run_services(
+    context: &ListenerContext,
+    settings_path: Option<PathBuf>,
+    root_tx: watch::Sender<Arc<server::SiteSnapshot>>,
+    services: &mut Services,
+) -> Result<()> {
+    services.start(context).await?;
+    let session = start_console(
+        &context.config,
+        &context.state,
+        &context.metrics,
+        context.shutdown.receiver(),
+        &context.data_dir,
     )
-    .await;
-    event_result
+    .await?;
+    context.state.write().await.runtime_ready = true;
+    maybe_open_browser(&context.config, &context.state).await;
+    tokio::select! {
+        result = services.wait_for_failure(&context.state) => result,
+        result = event_loop(session, context, settings_path, root_tx) => result,
+        () = shutdown_requested() => Ok(()),
+    }
 }
 
 fn ensure_data_directories(data_dir: &Path) -> Result<()> {
@@ -565,60 +431,6 @@ fn ensure_data_directories(data_dir: &Path) -> Result<()> {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/// Spawn the HTTP server task and return its `JoinHandle` so the shutdown
-/// sequence can await the connection drain.
-///
-/// Returns the `JoinHandle` and the `watch::Sender` used to push a new
-/// `canonical_root` to the accept loop when the operator presses `[R]`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Background server task needs the shared startup context explicitly."
-)]
-fn spawn_server(
-    config: &Arc<Config>,
-    state: &SharedState,
-    metrics: &SharedMetrics,
-    shutdown: &watch::Receiver<bool>,
-    port_tx: oneshot::Sender<ListenerReady>,
-    data_dir: PathBuf,
-    root_rx: watch::Receiver<Arc<server::SiteSnapshot>>,
-    budget: SharedConnectionBudget,
-) -> tokio::task::JoinHandle<()> {
-    let server_config = Arc::clone(config);
-    let server_state = Arc::clone(state);
-    let server_metrics = Arc::clone(metrics);
-    let server_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        server::run(
-            server_config,
-            server_state,
-            server_metrics,
-            data_dir,
-            server_shutdown,
-            port_tx,
-            root_rx,
-            budget.semaphore,
-            budget.per_ip_map,
-        )
-        .await;
-    })
-}
-
-type SiteWatch = (
-    watch::Sender<Arc<server::SiteSnapshot>>,
-    watch::Receiver<Arc<server::SiteSnapshot>>,
-);
-
-fn make_root_watch(config: &Config, data_dir: &Path) -> Result<SiteWatch> {
-    Ok(watch::channel(server::SiteSnapshot::prepare(
-        config, data_dir,
-    )?))
-}
-
-const fn uses_redirect_public_http(config: &Config) -> bool {
-    config.tls.enabled && config.tls.redirect_http
-}
 
 async fn start_console(
     config: &Arc<Config>,
@@ -738,12 +550,21 @@ async fn next_sigterm() {
     std::future::pending::<()>().await;
 }
 
+async fn shutdown_requested() {
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                log::warn!("Ctrl-C signal error: {error}");
+                next_sigterm().await;
+            }
+        }
+        () = next_sigterm() => log::info!("SIGTERM received — shutting down gracefully."),
+    }
+}
+
 async fn event_loop(
     session: Option<(mpsc::Receiver<actions::KeyEvent>, Arc<tokio::sync::Notify>)>,
-    config: &Arc<Config>,
-    state: &SharedState,
-    metrics: &SharedMetrics,
-    data_dir: PathBuf,
+    context: &ListenerContext,
     settings_path: Option<PathBuf>,
     root_tx: watch::Sender<Arc<server::SiteSnapshot>>,
 ) -> Result<()> {
@@ -753,32 +574,7 @@ async fn event_loop(
         None => (None, None),
     };
 
-    // Pin ctrl_c so it can be polled repeatedly inside select! without moving.
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-    #[cfg(unix)]
     let mut sighup = make_sighup_signal();
-    #[cfg(not(unix))]
-    let sighup = make_sighup_signal();
-
-    // SIGTERM handling — cross-platform design note
-    // ─────────────────────────────────────────────
-    // `tokio::select!` is a declarative macro that expands its arms textually;
-    // it does not honour `#[cfg(...)]` attributes placed on individual arms.
-    // Putting `#[cfg(unix)] _ = sigterm.recv() => { … }` inside the macro
-    // causes a parse error ("no rules expected `}`") on every platform.
-    //
-    // Solution: a platform-unified helper function `next_sigterm()` with
-    // identical call-site syntax on all targets:
-    //   • Unix     — awaits the next SIGTERM delivery from the OS.
-    //   • non-Unix — awaits `std::future::pending()` (never resolves).
-    // Both branches return `()` so `select!` sees one unconditional arm.
-    //
-    // The future is pinned here, outside the loop, so the Unix `Signal` handle
-    // (and its internal OS registration) is created exactly once and reused
-    // across every `select!` iteration — same pattern as `ctrl_c` above.
-    let sigterm = next_sigterm();
-    tokio::pin!(sigterm);
 
     loop {
         // Build a future that yields the next key, or pends forever once the
@@ -811,10 +607,10 @@ async fn event_loop(
                 if let Some(key) = maybe_key {
                     let quit = actions::handle(
                         key,
-                        config,
-                        Arc::clone(state),
-                        Arc::clone(metrics),
-                        data_dir.clone(),
+                        &context.config,
+                        Arc::clone(&context.state),
+                        Arc::clone(&context.metrics),
+                        context.data_dir.clone(),
                         settings_path.clone(),
                         &root_tx,
                     ).await?;
@@ -832,26 +628,10 @@ async fn event_loop(
                     key_rx = None;
                 }
             }
-            result = &mut ctrl_c => {
-                if let Err(e) = result {
-                    log::warn!("Ctrl-C signal error: {e}");
-                }
-                break;
-            }
-            // Graceful shutdown on SIGTERM.
-            // On Unix this arm fires when the OS delivers SIGTERM, covering
-            // `systemctl stop`, `docker stop`, launchd unload, and any process
-            // supervisor that sends SIGTERM before SIGKILL.
-            // On non-Unix platforms `next_sigterm()` pends forever, so this
-            // arm is syntactically present but never selected.
-            () = &mut sigterm => {
-                log::info!("SIGTERM received — shutting down gracefully.");
-                break;
-            }
             maybe_hup = sighup_fut => {
                 if maybe_hup.is_some() {
                     log::info!("SIGHUP received — reloading site state.");
-                    site_reload::reload_site(config, Arc::clone(state), data_dir.clone(), &root_tx).await?;
+                    site_reload::reload_site(&context.config, Arc::clone(&context.state), context.data_dir.clone(), &root_tx).await?;
                 }
             }
         }
