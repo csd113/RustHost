@@ -12,7 +12,7 @@ cd RustHost
 cargo build --locked --release
 ```
 
-The binary is `target/release/rusthost-cli` (`rusthost-cli.exe` on Windows). The checkout's `rust-toolchain.toml` selects Rust **1.99.1**, also the minimum compiler in `Cargo.toml`. CI checks both that pin and current stable. No global rustup default change is needed.
+The binary is `target/release/rusthost-cli` (`rusthost-cli.exe` on Windows). The checkout's `rust-toolchain.toml` selects Rust **1.100.0**, also the minimum compiler in `Cargo.toml`. CI checks both that pin and current stable. No global rustup default change is needed.
 
 For a local development run with the retained sample site:
 
@@ -43,7 +43,7 @@ Audit the lockfile, not `.cargo/audit.toml`: the latter is policy configuration.
 
 Project-owned unit and integration harnesses were retired in 1.2.0. Validate behavior changes against an isolated data directory using the built binary. Cover the affected paths and, for releases, version/help, Doctor, GET/HEAD, health/readiness, TLS, ranges, caching, compression, path rejection, persisted certificate reuse, and graceful shutdown. Do not use an operator's live data for smoke checks.
 
-CI runs Linux/Windows formatting and lint jobs and Linux ARM64, macOS Apple Silicon, macOS Intel, and Windows build jobs. The Intel target cross-compiles on the ARM64 `macos-15` runner with Rust 1.99.1 and the macOS SDK; `file`, `lipo`, and `otool` inspect the resulting x86_64 Mach-O. This is build validation, not native Intel runtime validation. The required status named `Tests` is a legacy name for a production Cargo check; it does not run the retired tests. `Quality` aggregates the lint matrix. Docker CI separately builds both architectures and checks container readiness and persistent-volume setup. A build or local smoke check does not establish live Tor, ACME renewal, power-loss recovery, or production-load behavior.
+CI runs Linux/Windows formatting and lint jobs and Linux ARM64, macOS Apple Silicon, macOS Intel, and Windows build jobs. The Intel target cross-compiles on the ARM64 `macos-15` runner with Rust 1.100.0 and the macOS SDK; `file`, `lipo`, and `otool` inspect the resulting x86_64 Mach-O. This is build validation, not native Intel runtime validation. The required status named `Tests` is a legacy name for a production Cargo check; it does not run the retired tests. `Quality` aggregates the lint matrix. Docker CI separately builds both architectures and checks container readiness and persistent-volume setup. A build or local smoke check does not establish live Tor, ACME renewal, power-loss recovery, or production-load behavior.
 
 ## Code and dependency policy
 
@@ -57,7 +57,7 @@ The manifest denies Clippy's `all`, `pedantic`, `nursery`, and `cargo` groups pl
 
 [clippy.toml](clippy.toml) lists known duplicate crate names required by incompatible Arti/Tor, TLS/ACME, crypto, and derive-macro dependency lines. Unexpected duplicate names still fail the lint. [deny.toml](deny.toml) records the dependency-policy subset. Remove exceptions as upstream versions converge; do not force incompatible libraries onto one version merely to silence a warning.
 
-The existing advisory exceptions cover RSA used by Arti for signature verification (not RSA decryption) and the upstream unmaintained `paste` dependency. Their exact IDs and reasons are in `deny.toml` and [.cargo/audit.toml](.cargo/audit.toml). Re-evaluate these when upgrading dependencies. Bundled rusqlite stays on 0.40.2 because Arti 0.48 requires `<0.41`.
+The existing advisory exceptions cover RSA used by Arti for signature verification (not RSA decryption) and the upstream unmaintained `paste` dependency. Both advisory tools ignore the RSA entry. Cargo-deny skips the `paste` entry, and cargo-audit reports it as an unmaintained warning. Re-evaluate these when upgrading dependencies. Bundled rusqlite stays on 0.40.2 because Arti 0.48 requires `<0.41`. Clippy inventories the lockfile's optional Jiff versions through `serde_with`. Cargo-deny's active graph excludes them.
 
 ## Find the code
 

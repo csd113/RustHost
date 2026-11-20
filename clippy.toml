@@ -21,6 +21,13 @@ allowed-duplicate-crates = [
     "hmac",
     "indexmap",
     "inout",
+    # serde_with 3.25.0 locks both optional Jiff lines; neither is active
+    # on the supported platforms, so cargo-deny does not skip these names.
+    "jiff",
+    "jiff-core",
+    "jiff-static",
+    "jiff-tzdb",
+    "jiff-tzdb-platform",
     "pem",
     "pem-rfc7468",
     "pkcs8",

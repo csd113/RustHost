@@ -2,8 +2,8 @@
 name = "rusthost"
 version = "1.2.0"
 edition = "2021"
-# Requires Rust 1.99.1+.
-rust-version = "1.99.1"
+# Requires Rust 1.100.0+.
+rust-version = "1.100.0"
 description = "Single-binary, zero-setup static site hosting appliance with Tor support"
 license = "MIT"
 repository = "https://github.com/csd113/RustHost"
@@ -50,7 +50,7 @@ tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring
 tokio-util   = { version = "0.7.20",  features = ["compat", "io"] }  # futures-io ↔ tokio-io compatibility bridge
 rustls       = { version = "0.23.46", features = ["ring"] }    # rustls TLS implementation
 rustls-acme  = { version = "0.15.4", default-features = false, features = ["tokio", "ring"] } # ACME / Let's Encrypt automation
-webpki-roots = "1.0.11"                                         # Mozilla root store for ACME client TLS
+webpki-roots = "1.0.12"                                         # Mozilla root store for ACME client TLS
 rcgen        = "0.14.10"                                      # self-signed dev cert generation
 
 tokio = { version = "1.54.1", features = [
@@ -77,7 +77,7 @@ tor-rtcompat  = { version = "0.48.0", default-features = false, features = ["tok
 futures       = "0.3.34"
 
 # Terminal auto-launcher: TTY detection uses std::io::IsTerminal
-# (stable since Rust 1.70; this project's MSRV is 1.99.1) — no additional crate
+# (stable since Rust 1.70; this project's MSRV is 1.100.0) — no additional crate
 # required. The previously used `atty` crate has been removed: it carried a
 # memory-safety vulnerability on Windows (RUSTSEC-2021-0145) and was
 # unmaintained. `anyhow` is retained for use in other modules.
@@ -121,7 +121,7 @@ percent-encoding = "2.3.2"
 hyper      = { version = "1.12.0",   features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 http-body-util = "0.1.5"
-bytes          = "1.12.1"
+bytes          = "1.12.2"
 httpdate       = "1.0.3"
 
 # async-compression provides Brotli and Gzip stream encoders. Brotli gives
