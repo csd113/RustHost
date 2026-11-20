@@ -108,9 +108,6 @@ fn tor_label(config: &Config, state: &AppState) -> String {
         TorStatus::Disabled => "disabled".to_owned(),
         TorStatus::Starting => "starting".to_owned(),
         TorStatus::Ready => "forwarding locally".to_owned(),
-        TorStatus::Reconnecting => "reconnecting".to_owned(),
-        TorStatus::Draining => "draining".to_owned(),
-        TorStatus::Stopped => "stopped".to_owned(),
         TorStatus::Failed(reason) => format!("enabled (failed: {})", single_line(reason)),
     }
 }

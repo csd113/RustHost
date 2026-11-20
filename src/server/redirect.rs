@@ -28,8 +28,9 @@ use tokio::{
 };
 
 use crate::runtime::{
+    service_status::{ListenerRole, ListenerStatus, RuntimeState},
     shutdown::{deadline, ServiceOutcome, Shutdown},
-    state::{ListenerRole, ListenerStatus, SharedState},
+    state::SharedState,
 };
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -84,7 +85,7 @@ pub async fn run_redirect_server(
 ) {
     let outcome = serve_redirect(
         config,
-        state,
+        RuntimeState::new(state),
         Shutdown::from_receiver(shutdown),
         ConnectionBudget {
             semaphore,
@@ -102,16 +103,13 @@ pub async fn run_redirect_server(
 
 pub(crate) async fn serve_redirect(
     config: RedirectServerConfig,
-    state: SharedState,
+    state: RuntimeState,
     mut shutdown: Shutdown,
     budget: ConnectionBudget,
     ready: impl FnOnce(BindResult),
 ) -> ServiceOutcome {
     let role = ListenerRole::Redirect;
-    state
-        .write()
-        .await
-        .set_listener(role, ListenerStatus::Starting);
+    state.set_listener(role, ListenerStatus::Starting).await;
     let socket = SocketAddr::new(config.bind_addr, config.plain_port);
     let bound = match TcpListener::bind(socket).await {
         Ok(listener) => listener.local_addr().map(|address| (listener, address)),
@@ -130,9 +128,8 @@ pub(crate) async fn serve_redirect(
         }
     };
     state
-        .write()
-        .await
-        .set_listener(role, ListenerStatus::Listening(address));
+        .set_listener(role, ListenerStatus::Listening(address))
+        .await;
     ready(Ok(address));
     log::info!(
         "HTTP redirect listener listening on {address} → HTTPS port {}",
@@ -177,9 +174,8 @@ pub(crate) async fn serve_redirect(
         Err(error) => {
             let message = format!("HTTP redirect accept failed: {error}");
             state
-                .write()
-                .await
-                .set_listener(role, ListenerStatus::Failed(message.clone()));
+                .set_listener(role, ListenerStatus::Failed(message.clone()))
+                .await;
             ServiceOutcome::Failed(message)
         }
     }

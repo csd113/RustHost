@@ -7,8 +7,8 @@ use crate::{
     config::Config,
     console::menu::MenuOpenTarget,
     console::menu::{self, tor::TorAction, DoctorContext, DoctorLiveState, Page},
-    runtime::site_reload::reload_site,
     runtime::state::{AppState, ConsoleMode, SharedMetrics, SharedState, StatusMessage},
+    runtime::{service_status::RuntimeState, site_reload::reload_site},
     Result,
 };
 
@@ -611,6 +611,18 @@ pub async fn handle(
     settings_path: Option<PathBuf>,
     root_tx: &tokio::sync::watch::Sender<std::sync::Arc<crate::server::SiteSnapshot>>,
 ) -> Result<bool> {
+    handle_with_runtime(event, config, state, None, data_dir, settings_path, root_tx).await
+}
+
+pub(crate) async fn handle_with_runtime(
+    event: KeyEvent,
+    config: &Config,
+    state: SharedState,
+    runtime: Option<&RuntimeState>,
+    data_dir: PathBuf,
+    settings_path: Option<PathBuf>,
+    root_tx: &tokio::sync::watch::Sender<Arc<crate::server::SiteSnapshot>>,
+) -> Result<bool> {
     if let Some(quit) = handle_diagnostics_page_event(
         event,
         config,
@@ -654,7 +666,13 @@ pub async fn handle(
         }
 
         KeyEvent::Open => {
-            crate::runtime::open_local_site(&state).await;
+            if let Some(runtime) = runtime {
+                crate::runtime::open_local_site(runtime).await;
+            } else {
+                let port = state.read().await.actual_port;
+                let url = super::ui::local_http_url(config.server.bind, port);
+                crate::runtime::open_browser(&url);
+            }
         }
         state_event => {
             // Apply the console-mode transition under a short write lock.

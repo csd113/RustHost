@@ -8,6 +8,7 @@
 
 pub mod events;
 pub mod lifecycle;
+pub(crate) mod service_status;
 pub(crate) mod shutdown;
 pub(crate) mod site_reload;
 pub mod state;
@@ -51,9 +52,9 @@ pub fn open_browser(url: &str) {
     }
 }
 
-pub(crate) async fn open_local_site(state: &state::SharedState) {
+pub(crate) async fn open_local_site(state: &service_status::RuntimeState) {
     let url = {
-        let state = state.read().await;
+        let state = state.status().await;
         state.public_http.bound_addr().map_or_else(
             || {
                 state.https.bound_addr().map(|address| {

@@ -29,9 +29,10 @@ use crate::{
     path_display::display_path,
     runtime::{
         runtime_root,
+        service_status::{RuntimeState, TorPhase},
         shutdown::Shutdown,
         site_reload,
-        state::{AppState, Metrics, SharedMetrics, SharedState, TorStatus},
+        state::{AppState, Metrics, SharedMetrics},
     },
     server::{
         self,
@@ -375,11 +376,12 @@ async fn prepare_runtime(
         crate::AppError::ConfigLoad(format!("site preparation task failed: {error}"))
     })??;
     let mut state = AppState::new();
-    if !config.tor.enabled {
-        state.tor_status = TorStatus::Disabled;
-    }
     state.site_file_count = site.file_count;
     state.site_total_bytes = site.total_bytes;
+    let state = RuntimeState::new(Arc::new(RwLock::new(state)));
+    if !config.tor.enabled {
+        state.set_tor(TorPhase::Disabled, None).await;
+    }
     let (root_tx, site_watch) = watch::channel(site);
     let budget = ConnectionBudget {
         semaphore: Arc::new(tokio::sync::Semaphore::new(
@@ -390,7 +392,7 @@ async fn prepare_runtime(
     Ok((
         ListenerContext {
             config,
-            state: Arc::new(RwLock::new(state)),
+            state,
             metrics: Arc::new(Metrics::new()),
             data_dir,
             shutdown,
@@ -416,12 +418,7 @@ async fn run_services(
         &context.data_dir,
     )
     .await?;
-    {
-        let mut state = context.state.write().await;
-        state.runtime_ready = state.public_http.bound_addr().is_some()
-            && (!context.config.tls.enabled || state.https.bound_addr().is_some())
-            && (!context.config.tor.enabled || state.tor_ingress.bound_addr().is_some());
-    }
+    context.state.refresh_readiness(&context.config).await;
     maybe_open_browser(&context.config, &context.state).await;
     tokio::select! {
         result = services.wait_for_failure(&context.state) => result,
@@ -439,15 +436,15 @@ fn ensure_data_directories(data_dir: &Path) -> Result<()> {
 
 async fn start_console(
     config: &Arc<Config>,
-    state: &SharedState,
+    state: &RuntimeState,
     metrics: &SharedMetrics,
     shutdown: watch::Receiver<bool>,
     data_dir: &Path,
 ) -> Result<Option<(mpsc::Receiver<actions::KeyEvent>, Arc<tokio::sync::Notify>)>> {
     if config.console.interactive {
-        let session = console::start(
+        let session = console::start_managed(
             Arc::clone(config),
-            Arc::clone(state),
+            state.clone(),
             Arc::clone(metrics),
             shutdown,
             data_dir.to_path_buf(),
@@ -455,7 +452,7 @@ async fn start_console(
         Ok(Some(session))
     } else {
         let (role, http, https, tor_ingress) = {
-            let snapshot = state.read().await;
+            let snapshot = state.status().await;
             (
                 snapshot.public_http_role,
                 snapshot.public_http.bound_addr(),
@@ -620,11 +617,11 @@ async fn event_loop(
         tokio::select! {
             maybe_key = key_fut => {
                 if let Some(key) = maybe_key {
-                    let quit = actions::handle(
+                    let quit = actions::handle_with_runtime(
                         key,
                         &context.config,
-                        Arc::clone(&context.state),
-                        Arc::clone(&context.metrics),
+                        Arc::clone(&context.state.app),
+                        Some(&context.state),
                         context.data_dir.clone(),
                         settings_path.clone(),
                         &root_tx,
@@ -646,7 +643,7 @@ async fn event_loop(
             maybe_hup = sighup_fut => {
                 if maybe_hup.is_some() {
                     log::info!("SIGHUP received — reloading site state.");
-                    site_reload::reload_site(&context.config, Arc::clone(&context.state), context.data_dir.clone(), &root_tx).await?;
+                    site_reload::reload_site(&context.config, Arc::clone(&context.state.app), context.data_dir.clone(), &root_tx).await?;
                 }
             }
         }

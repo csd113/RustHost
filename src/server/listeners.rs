@@ -21,8 +21,9 @@ use super::{
 use crate::{
     config::Config,
     runtime::{
+        service_status::{ListenerRole, ListenerStatus, RuntimeState},
         shutdown::{deadline, drain_tasks, ServiceOutcome, Shutdown},
-        state::{ListenerRole, ListenerStatus, SharedMetrics, SharedState},
+        state::{SharedMetrics, SharedState},
     },
     tls::Acceptor,
     AppError, Result,
@@ -37,7 +38,7 @@ pub struct ConnectionBudget {
 #[derive(Clone)]
 pub struct ListenerContext {
     pub config: Arc<Config>,
-    pub state: SharedState,
+    pub state: RuntimeState,
     pub metrics: SharedMetrics,
     pub data_dir: PathBuf,
     pub shutdown: Shutdown,
@@ -55,18 +56,16 @@ pub async fn serve(
 ) -> ServiceOutcome {
     context
         .state
-        .write()
-        .await
-        .set_listener(role, ListenerStatus::Starting);
+        .set_listener(role, ListenerStatus::Starting)
+        .await;
     let (listener, address) = match bind(role, &context.config).await {
         Ok(bound) => bound,
         Err(error) => return bind_failed(role, &context.state, ready, error.to_string()).await,
     };
     context
         .state
-        .write()
-        .await
-        .set_listener(role, ListenerStatus::Listening(address));
+        .set_listener(role, ListenerStatus::Listening(address))
+        .await;
     ready(Ok(address));
     log::info!("{} listener listening on {address}", role.label());
 
@@ -100,9 +99,8 @@ pub async fn serve(
             let message = format!("{} accept failed: {error}", role.label());
             context
                 .state
-                .write()
-                .await
-                .set_listener(role, ListenerStatus::Failed(message.clone()));
+                .set_listener(role, ListenerStatus::Failed(message.clone()))
+                .await;
             return ServiceOutcome::Failed(message);
         }
     };
@@ -140,7 +138,7 @@ fn handler_settings(
             spa_routing: config.site.spa_routing,
             keep_alive: role != ListenerRole::TorIngress,
         },
-        state: Arc::clone(&context.state),
+        state: Arc::clone(&context.state.app),
         readiness: handler::ReadinessConfig {
             data_dir: Arc::from(context.data_dir.as_path()),
             log_dir: Arc::from(log_dir),
@@ -254,14 +252,13 @@ async fn bind(role: ListenerRole, config: &Config) -> Result<(TcpListener, Socke
 
 pub(super) async fn bind_failed(
     role: ListenerRole,
-    state: &SharedState,
+    state: &RuntimeState,
     ready: impl FnOnce(BindResult),
     message: String,
 ) -> ServiceOutcome {
     state
-        .write()
-        .await
-        .set_listener(role, ListenerStatus::Failed(message.clone()));
+        .set_listener(role, ListenerStatus::Failed(message.clone()))
+        .await;
     ready(Err(message.clone()));
     ServiceOutcome::Failed(message)
 }
@@ -315,21 +312,18 @@ pub(super) async fn accept_connections(
 
 pub(super) async fn finish_listener(
     role: ListenerRole,
-    state: &SharedState,
+    state: &RuntimeState,
     tasks: &mut JoinSet<()>,
     deadline: Instant,
 ) -> ServiceOutcome {
-    state
-        .write()
-        .await
-        .set_listener(role, ListenerStatus::Draining);
+    state.set_listener(role, ListenerStatus::Draining).await;
     log::info!("{} listener draining", role.label());
     let outcome = drain_tasks(tasks, deadline, role.label()).await;
     let status = match &outcome {
         ServiceOutcome::Drained | ServiceOutcome::Aborted => ListenerStatus::Stopped,
         ServiceOutcome::Failed(message) => ListenerStatus::Failed(message.clone()),
     };
-    state.write().await.set_listener(role, status);
+    state.set_listener(role, status).await;
     outcome
 }
 /// Serve the Http listener using the legacy port acknowledgement.
@@ -353,7 +347,7 @@ pub async fn run(
 ) {
     let context = ListenerContext {
         config,
-        state,
+        state: RuntimeState::new(state),
         metrics,
         data_dir,
         shutdown: Shutdown::from_receiver(shutdown),
@@ -394,7 +388,7 @@ pub async fn run_https(
 ) {
     let context = ListenerContext {
         config,
-        state,
+        state: RuntimeState::new(state),
         metrics,
         data_dir,
         shutdown: Shutdown::from_receiver(shutdown),
@@ -438,7 +432,7 @@ pub async fn run_tor_ingress(
 ) {
     let context = ListenerContext {
         config,
-        state,
+        state: RuntimeState::new(state),
         metrics,
         data_dir,
         shutdown: Shutdown::from_receiver(shutdown),

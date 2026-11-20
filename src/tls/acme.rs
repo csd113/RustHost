@@ -2,8 +2,8 @@
 use crate::{config::AcmeConfig, error::AppError};
 use crate::{
     runtime::{
+        service_status::{AcmeStatus, RuntimeState},
         shutdown::{ServiceOutcome, Shutdown},
-        state::{AcmeStatus, SharedState},
     },
     Result,
 };
@@ -286,7 +286,7 @@ fn acquire_acme_init_guard() -> Result<AcmeInitGuard> {
 // ACME event loop
 // ---------------------------------------------------------------------------
 impl AcmeEvents {
-    pub(crate) async fn run(mut self, runtime: Option<(SharedState, Shutdown)>) -> ServiceOutcome {
+    pub(crate) async fn run(mut self, runtime: Option<(RuntimeState, Shutdown)>) -> ServiceOutcome {
         let env = self.environment;
         log::info!("TLS/ACME: event loop started ({env})");
         let (status_state, mut shutdown) =
@@ -342,9 +342,9 @@ impl AcmeEvents {
     }
 }
 
-async fn publish(state: Option<&SharedState>, status: AcmeStatus) {
+async fn publish(state: Option<&RuntimeState>, status: AcmeStatus) {
     if let Some(state) = state {
-        state.write().await.acme = status;
+        state.set_acme(status).await;
     }
 }
 

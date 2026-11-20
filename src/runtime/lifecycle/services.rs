@@ -1,6 +1,6 @@
 //! Startup acknowledgements and supervision of network services.
 
-use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, time::Duration};
 use tokio::{
     sync::{oneshot, watch},
     task::{Id, JoinSet},
@@ -10,8 +10,9 @@ use crate::{
     config::Config,
     console, logging,
     runtime::{
+        service_status::{AcmeStatus, ListenerRole, ListenerStatus, RuntimeState, TorPhase},
         shutdown::{deadline, ServiceOutcome, ShutdownClass},
-        state::{AcmeStatus, ConsoleMode, ListenerRole, ListenerStatus, SharedState, TorStatus},
+        state::ConsoleMode,
     },
     server::{
         self,
@@ -64,9 +65,8 @@ impl Services {
             let role = ListenerRole::Https;
             context
                 .state
-                .write()
-                .await
-                .set_listener(role, ListenerStatus::Starting);
+                .set_listener(role, ListenerStatus::Starting)
+                .await;
             let tls = tls::prepare(&config.tls, &context.data_dir).await;
             match tls {
                 Ok(Some(tls)) => self.start_https(context, tls).await?,
@@ -89,7 +89,7 @@ impl Services {
                     context.data_dir.clone(),
                     address,
                     config.server.max_connections as usize,
-                    Arc::clone(&context.state),
+                    context.state.clone(),
                     context.shutdown.clone(),
                     Service::Tor.grace(config),
                 ),
@@ -103,14 +103,14 @@ impl Services {
         context: &ListenerContext,
         tls: tls::PreparedTls,
     ) -> Result<()> {
-        context.state.write().await.tls_cert_status = tls.cert_status;
+        context.state.app.write().await.tls_cert_status = tls.cert_status;
         if let Some((events, guard)) = tls.acme {
-            context.state.write().await.acme = AcmeStatus::Starting;
+            context.state.set_acme(AcmeStatus::Starting).await;
             self.acme_guard = Some(guard);
             self.spawn(
                 Service::Acme,
                 context,
-                events.run(Some((Arc::clone(&context.state), context.shutdown.clone()))),
+                events.run(Some((context.state.clone(), context.shutdown.clone()))),
             );
         }
         let https = self
@@ -155,7 +155,7 @@ impl Services {
                     max_per_ip: config.server.max_connections_per_ip,
                     drain_timeout: Service::Listener(role).grace(config),
                 },
-                Arc::clone(&context.state),
+                context.state.clone(),
                 context.shutdown.clone(),
                 context.budget.clone(),
                 |result| {
@@ -191,7 +191,7 @@ impl Services {
         self.task_roles.insert(task.id(), service);
     }
 
-    async fn observe_exit(&mut self, state: &SharedState, stopping: bool) -> Option<Result<()>> {
+    async fn observe_exit(&mut self, state: &RuntimeState, stopping: bool) -> Option<Result<()>> {
         let joined = self.tasks.join_next_with_id().await?;
         let (id, outcome) = match joined {
             Ok(result) => result,
@@ -229,7 +229,7 @@ impl Services {
         Some(Ok(()))
     }
 
-    pub(super) async fn wait_for_failure(&mut self, state: &SharedState) -> Result<()> {
+    pub(super) async fn wait_for_failure(&mut self, state: &RuntimeState) -> Result<()> {
         while let Some(result) = self.observe_exit(state, false).await {
             result?;
         }
@@ -246,7 +246,7 @@ impl Services {
         let config = &context.config;
         context.shutdown.begin(trigger);
         {
-            let mut state = context.state.write().await;
+            let mut state = context.state.app.write().await;
             state.runtime_ready = false;
             state.console_mode = ConsoleMode::ShuttingDown;
         }
@@ -283,29 +283,27 @@ async fn wait_for_bind(
     }
 }
 
-async fn publish_failure(state: &SharedState, service: Service, message: String) {
+async fn publish_failure(state: &RuntimeState, service: Service, message: String) {
     match service {
-        Service::Listener(role) => state
-            .write()
-            .await
-            .set_listener(role, ListenerStatus::Failed(message)),
-        Service::Acme => state.write().await.acme = AcmeStatus::Failed(message),
-        Service::Tor => tor::publish(state, TorStatus::Failed(message), None).await,
+        Service::Listener(role) => {
+            state
+                .set_listener(role, ListenerStatus::Failed(message))
+                .await;
+        }
+        Service::Acme => state.set_acme(AcmeStatus::Failed(message)).await,
+        Service::Tor => state.set_tor(TorPhase::Failed(message), None).await,
     }
 }
 
-async fn publish_aborted(state: &SharedState, service: Service) {
+async fn publish_aborted(state: &RuntimeState, service: Service) {
     match service {
-        Service::Listener(role) => state
-            .write()
-            .await
-            .set_listener(role, ListenerStatus::Stopped),
-        Service::Acme => state.write().await.acme = AcmeStatus::Stopped,
-        Service::Tor => tor::publish(state, TorStatus::Stopped, None).await,
+        Service::Listener(role) => state.set_listener(role, ListenerStatus::Stopped).await,
+        Service::Acme => state.set_acme(AcmeStatus::Stopped).await,
+        Service::Tor => state.set_tor(TorPhase::Stopped, None).await,
     }
 }
 
-pub(super) async fn maybe_open_browser(config: &Config, state: &SharedState) {
+pub(super) async fn maybe_open_browser(config: &Config, state: &RuntimeState) {
     if config.server.open_browser_on_start {
         super::super::open_local_site(state).await;
     }

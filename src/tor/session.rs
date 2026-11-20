@@ -18,8 +18,9 @@ use super::{
     state_dirs::ensure_private_dir,
 };
 use crate::runtime::{
+    service_status::{RuntimeState, TorPhase},
     shutdown::{deadline, ServiceOutcome, Shutdown},
-    state::{SharedState, TorStatus},
+    state::SharedState,
 };
 
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -61,7 +62,7 @@ pub fn init(
             data_dir,
             local_addr,
             max_connections,
-            state,
+            RuntimeState::new(state),
             Shutdown::from_receiver(shutdown),
             Duration::from_secs(10),
         )
@@ -73,7 +74,7 @@ pub async fn serve(
     data_dir: PathBuf,
     local_addr: SocketAddr,
     max_connections: usize,
-    state: SharedState,
+    state: RuntimeState,
     mut shutdown: Shutdown,
     grace: Duration,
 ) -> ServiceOutcome {
@@ -119,7 +120,7 @@ pub async fn serve(
         tokio::select! {
             biased;
             _ = shutdown.wait() => {
-                publish(&state, TorStatus::Stopped, None).await;
+                state.set_tor(TorPhase::Stopped, None).await;
                 return ServiceOutcome::Drained;
             }
             () = tokio::time::sleep(delay) => {}
@@ -127,9 +128,9 @@ pub async fn serve(
     }
 }
 
-async fn failed(state: &SharedState, message: String) -> ServiceOutcome {
+async fn failed(state: &RuntimeState, message: String) -> ServiceOutcome {
     log::warn!("{message}");
-    publish(state, TorStatus::Failed(message.clone()), None).await;
+    state.set_tor(TorPhase::Failed(message.clone()), None).await;
     ServiceOutcome::Failed(message)
 }
 
@@ -232,11 +233,11 @@ async fn run_session(
     data_dir: &std::path::Path,
     local_addr: SocketAddr,
     max_connections: usize,
-    state: &SharedState,
+    state: &RuntimeState,
     mut shutdown: Shutdown,
     grace: Duration,
 ) -> SessionEnd {
-    publish(state, TorStatus::Starting, None).await;
+    state.set_tor(TorPhase::Starting, None).await;
     let TorSession {
         tor_client: _client,
         onion_service_guard: _service,
@@ -245,13 +246,13 @@ async fn run_session(
     } = match bootstrap_and_launch(data_dir, shutdown.clone()).await {
         Ok(Some(session)) => session,
         Ok(None) => {
-            publish(state, TorStatus::Stopped, None).await;
+            state.set_tor(TorPhase::Stopped, None).await;
             return SessionEnd::Stopped(ServiceOutcome::Drained);
         }
         Err(error) => return SessionEnd::Failed(error),
     };
     log_onion_banner(&onion_name);
-    publish(state, TorStatus::Ready, Some(onion_name)).await;
+    state.set_tor(TorPhase::Ready, Some(onion_name)).await;
 
     forward_session(
         &mut Relay::new(max_connections),
@@ -268,7 +269,7 @@ async fn forward_session(
     relay: &mut Relay,
     mut requests: impl futures::Stream<Item = StreamRequest> + Unpin,
     local_addr: SocketAddr,
-    state: &SharedState,
+    state: &RuntimeState,
     shutdown: &mut Shutdown,
     grace: Duration,
 ) -> SessionEnd {
@@ -283,14 +284,14 @@ async fn forward_session(
 async fn finish_forwarding(
     relay: &mut Relay,
     end: RelayEnd,
-    state: &SharedState,
+    state: &RuntimeState,
     shutdown: &mut Shutdown,
     grace: Duration,
 ) -> SessionEnd {
     let started = match end {
         RelayEnd::Shutdown(started) => started,
         RelayEnd::StreamEnded => {
-            publish(state, TorStatus::Reconnecting, None).await;
+            state.set_tor(TorPhase::Reconnecting, None).await;
             let reconnect_deadline = deadline(tokio::time::Instant::now(), RECONNECT_DRAIN);
             tokio::select! {
                 biased;
@@ -306,12 +307,12 @@ async fn finish_forwarding(
 
 async fn stop_forwarding(
     relay: &mut Relay,
-    state: &SharedState,
+    state: &RuntimeState,
     deadline: tokio::time::Instant,
 ) -> SessionEnd {
-    publish(state, TorStatus::Draining, None).await;
+    state.set_tor(TorPhase::Draining, None).await;
     let outcome = relay.drain(deadline, "Tor service").await;
-    publish(state, TorStatus::Stopped, None).await;
+    state.set_tor(TorPhase::Stopped, None).await;
     SessionEnd::Stopped(outcome)
 }
 
@@ -377,10 +378,4 @@ fn backoff_delay(attempt: u32, base_secs: u64, max_secs: u64) -> Duration {
     let multiplier = 1u64 << exp.min(63); // exp ≤ 63, shift is always valid
     let secs = base_secs.saturating_mul(multiplier);
     Duration::from_secs(secs.min(max_secs))
-}
-
-pub async fn publish(state: &SharedState, status: TorStatus, address: Option<String>) {
-    let mut state = state.write().await;
-    state.tor_status = status;
-    state.onion_address = address;
 }

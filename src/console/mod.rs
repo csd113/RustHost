@@ -34,7 +34,10 @@ use tokio::sync::watch;
 
 use crate::{
     config::Config,
-    runtime::state::{ConsoleMode, SharedMetrics, SharedState},
+    runtime::{
+        service_status::RuntimeState,
+        state::{ConsoleMode, SharedMetrics, SharedState},
+    },
     AppError, Result,
 };
 
@@ -62,6 +65,40 @@ static RAW_MODE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 pub fn start(
     config: Arc<Config>,
     state: SharedState,
+    metrics: SharedMetrics,
+    shutdown: watch::Receiver<bool>,
+    data_dir: PathBuf,
+) -> Result<(
+    tokio::sync::mpsc::Receiver<KeyEvent>,
+    Arc<tokio::sync::Notify>,
+)> {
+    start_with_runtime(config, state, None, metrics, shutdown, data_dir)
+}
+
+pub(crate) fn start_managed(
+    config: Arc<Config>,
+    runtime: RuntimeState,
+    metrics: SharedMetrics,
+    shutdown: watch::Receiver<bool>,
+    data_dir: PathBuf,
+) -> Result<(
+    tokio::sync::mpsc::Receiver<KeyEvent>,
+    Arc<tokio::sync::Notify>,
+)> {
+    start_with_runtime(
+        config,
+        Arc::clone(&runtime.app),
+        Some(runtime),
+        metrics,
+        shutdown,
+        data_dir,
+    )
+}
+
+fn start_with_runtime(
+    config: Arc<Config>,
+    state: SharedState,
+    runtime: Option<RuntimeState>,
     metrics: SharedMetrics,
     mut shutdown: watch::Receiver<bool>,
     data_dir: PathBuf,
@@ -123,6 +160,7 @@ pub fn start(
             if let Err(e) = render(
                 &config,
                 &state,
+                runtime.as_ref(),
                 &metrics,
                 &data_dir,
                 &mut last_rendered,
@@ -143,6 +181,7 @@ pub fn start(
 async fn render(
     config: &Config,
     state: &SharedState,
+    runtime: Option<&RuntimeState>,
     metrics: &SharedMetrics,
     data_dir: &std::path::Path,
     last_rendered: &mut String,
@@ -157,7 +196,14 @@ async fn render(
         match &snapshot.console_mode {
             ConsoleMode::Dashboard => {
                 let metrics = metrics.snapshot();
-                dashboard::render_dashboard(&snapshot, metrics, config, data_dir)
+                if let Some(runtime) = runtime {
+                    let status = runtime.status().await;
+                    dashboard::render_dashboard_with_status(
+                        &snapshot, &status, metrics, config, data_dir,
+                    )
+                } else {
+                    dashboard::render_dashboard(&snapshot, metrics, config, data_dir)
+                }
             }
             ConsoleMode::Menu => menu::render(&snapshot.menu, config, &snapshot, data_dir),
             ConsoleMode::LogView => dashboard::render_log_view(config.console.show_timestamps),

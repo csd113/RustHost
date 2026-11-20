@@ -4,9 +4,9 @@ use crate::{
     console::ui,
     logging,
     path_display::display_path,
-    runtime::state::{
-        format_bytes, format_uptime, AcmeStatus, AppState, CertStatus, ListenerStatus,
-        MetricsSnapshot, TorStatus,
+    runtime::{
+        service_status::{AcmeStatus, ListenerStatus, RuntimeStatus, TorPhase},
+        state::{format_bytes, format_uptime, AppState, CertStatus, MetricsSnapshot},
     },
 };
 use std::fmt::Write as _;
@@ -20,20 +20,31 @@ pub fn render_dashboard(
     config: &Config,
     data_dir: &Path,
 ) -> String {
+    let status = RuntimeStatus::from_legacy(state, config);
+    render_dashboard_with_status(state, &status, metrics, config, data_dir)
+}
+
+pub(super) fn render_dashboard_with_status(
+    state: &AppState,
+    status: &RuntimeStatus,
+    metrics: MetricsSnapshot,
+    config: &Config,
+    data_dir: &Path,
+) -> String {
     let mut out = String::with_capacity(1_024);
     ui::push_header(&mut out, &config.identity.instance_name);
     out.push_str("\r\n");
     // ── Status ───────────────────────────────────────────────────────────────
     let _ = writeln!(out, "{}\r", ui::bold("Status"));
-    render_listener_status(&mut out, state);
-    let tor_str = match &state.tor_status {
-        TorStatus::Disabled => ui::dim("DISABLED"),
-        TorStatus::Starting => ui::yellow("STARTING — bootstrapping Tor network…"),
-        TorStatus::Ready => ui::green("READY — forwarding locally"),
-        TorStatus::Reconnecting => ui::yellow("RECONNECTING"),
-        TorStatus::Draining => ui::yellow("DRAINING"),
-        TorStatus::Stopped => ui::dim("STOPPED"),
-        TorStatus::Failed(reason) => ui::red(&format!("FAILED ({reason}) — see log for details")),
+    render_listener_status(&mut out, state, status);
+    let tor_str = match &status.tor {
+        TorPhase::Disabled => ui::dim("DISABLED"),
+        TorPhase::Starting => ui::yellow("STARTING — bootstrapping Tor network…"),
+        TorPhase::Ready => ui::green("READY — forwarding locally"),
+        TorPhase::Reconnecting => ui::yellow("RECONNECTING"),
+        TorPhase::Draining => ui::yellow("DRAINING"),
+        TorPhase::Stopped => ui::dim("STOPPED"),
+        TorPhase::Failed(reason) => ui::red(&format!("FAILED ({reason}) — see log for details")),
     };
     let _ = writeln!(out, " Tor : {tor_str}\r");
     if let Some(message) = state.visible_status_message() {
@@ -42,30 +53,21 @@ pub fn render_dashboard(
     out.push_str("\r\n");
     // ── Endpoints ────────────────────────────────────────────────────────────
     let _ = writeln!(out, "{}\r", ui::bold("Endpoints"));
-    if let Some(address) = state.public_http.bound_addr() {
+    if let Some(address) = status.public_http.bound_addr() {
         let url = ui::local_http_url(address.ip(), address.port());
-        let _ = writeln!(out, " {} : {url}\r", state.public_http_role.label());
+        let _ = writeln!(out, " {} : {url}\r", status.public_http_role.label());
     }
-    if let Some(address) = state.https.bound_addr() {
+    if let Some(address) = status.https.bound_addr() {
         let url = ui::local_https_url(address.ip(), address.port());
         let _ = writeln!(out, " HTTPS : {}\r", ui::green(&url));
     }
     let onion_str = state.onion_address.as_deref().map_or_else(
-        || match &state.tor_status {
-            TorStatus::Disabled => ui::dim("(disabled)"),
-            TorStatus::Starting => ui::dim("(bootstrapping…)"),
-            // This branch is unreachable in practice because set_onion() sets
-            // Ready and Some(addr) atomically. If it fires an invariant has been
-            // violated; the honest label is "unavailable".
-            TorStatus::Ready => {
-                debug_assert!(
-                    false,
-                    "TorStatus::Ready with no onion_address — invariant violated"
-                );
-                ui::dim("(address unavailable)")
-            }
-            TorStatus::Reconnecting => ui::dim("(reconnecting…)"),
-            TorStatus::Draining | TorStatus::Stopped | TorStatus::Failed(_) => {
+        || match &status.tor {
+            TorPhase::Disabled => ui::dim("(disabled)"),
+            TorPhase::Starting => ui::dim("(bootstrapping…)"),
+            TorPhase::Ready => ui::dim("(address unavailable)"),
+            TorPhase::Reconnecting => ui::dim("(reconnecting…)"),
+            TorPhase::Draining | TorPhase::Stopped | TorPhase::Failed(_) => {
                 ui::dim("(unavailable)")
             }
         },
@@ -103,14 +105,14 @@ pub fn render_dashboard(
     out
 }
 
-fn render_listener_status(out: &mut String, state: &AppState) {
+fn render_listener_status(out: &mut String, state: &AppState, status: &RuntimeStatus) {
     let _ = writeln!(
         out,
         " {} : {}\r",
-        state.public_http_role.label(),
-        listener_status(&state.public_http)
+        status.public_http_role.label(),
+        listener_status(&status.public_http)
     );
-    let https = listener_status(&state.https);
+    let https = listener_status(&status.https);
     let cert = match &state.tls_cert_status {
         CertStatus::Unknown => String::new(),
         CertStatus::SelfSigned => " · self-signed".into(),
@@ -119,14 +121,14 @@ fn render_listener_status(out: &mut String, state: &AppState) {
         CertStatus::Manual => " · manual cert".into(),
     };
     let _ = writeln!(out, " HTTPS : {https}{cert}\r");
-    if state.tor_ingress != ListenerStatus::Inactive {
+    if status.tor_ingress != ListenerStatus::Inactive {
         let _ = writeln!(
             out,
             " Tor ingress : {}\r",
-            listener_status(&state.tor_ingress)
+            listener_status(&status.tor_ingress)
         );
     }
-    let acme = match &state.acme {
+    let acme = match &status.acme {
         AcmeStatus::Inactive => return,
         AcmeStatus::Starting => ui::yellow("STARTING"),
         AcmeStatus::Available => ui::green("CERTIFICATE AVAILABLE"),
