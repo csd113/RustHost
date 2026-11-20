@@ -284,11 +284,10 @@ async fn wait_for_bind(
 
 async fn publish_failure(state: &SharedState, service: Service, message: String) {
     match service {
-        Service::Listener(role) => {
-            let mut state = state.write().await;
-            state.runtime_ready = false;
-            state.set_listener(role, ListenerStatus::Failed(message));
-        }
+        Service::Listener(role) => state
+            .write()
+            .await
+            .set_listener(role, ListenerStatus::Failed(message)),
         Service::Acme => state.write().await.acme = AcmeStatus::Failed(message),
         Service::Tor => tor::publish(state, TorStatus::Failed(message), None).await,
     }

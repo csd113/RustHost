@@ -224,6 +224,9 @@ impl AppState {
 
     pub(crate) fn set_listener(&mut self, role: ListenerRole, status: ListenerStatus) {
         let address = status.bound_addr();
+        if matches!(status, ListenerStatus::Failed(_)) {
+            self.runtime_ready = false;
+        }
         match role {
             ListenerRole::Http | ListenerRole::Redirect => {
                 self.public_http_role = role;

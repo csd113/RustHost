@@ -416,7 +416,12 @@ async fn run_services(
         &context.data_dir,
     )
     .await?;
-    context.state.write().await.runtime_ready = true;
+    {
+        let mut state = context.state.write().await;
+        state.runtime_ready = state.public_http.bound_addr().is_some()
+            && (!context.config.tls.enabled || state.https.bound_addr().is_some())
+            && (!context.config.tor.enabled || state.tor_ingress.bound_addr().is_some());
+    }
     maybe_open_browser(&context.config, &context.state).await;
     tokio::select! {
         result = services.wait_for_failure(&context.state) => result,
@@ -449,18 +454,25 @@ async fn start_console(
         )?;
         Ok(Some(session))
     } else {
-        let snapshot = state.read().await.clone();
+        let (role, http, https, tor_ingress) = {
+            let snapshot = state.read().await;
+            (
+                snapshot.public_http_role,
+                snapshot.public_http.bound_addr(),
+                snapshot.https.bound_addr(),
+                snapshot.tor_ingress.bound_addr(),
+            )
+        };
         let mut stdout = std::io::stdout();
         let _ = writeln!(stdout, "RustHost running");
-        let _ = writeln!(
-            stdout,
-            " HTTP : http://{}:{}",
-            config.server.bind, snapshot.actual_port
-        );
-        if snapshot.tls_running {
-            if let Some(tls_port) = snapshot.tls_port {
-                let _ = writeln!(stdout, " HTTPS: https://{}:{tls_port}", config.server.bind);
-            }
+        if let Some(address) = http {
+            let _ = writeln!(stdout, " {} : http://{address}", role.label());
+        }
+        if let Some(address) = https {
+            let _ = writeln!(stdout, " HTTPS: https://{address}");
+        }
+        if let Some(address) = tor_ingress {
+            let _ = writeln!(stdout, " Tor ingress : http://{address}");
         }
         let _ = writeln!(
             stdout,
@@ -574,7 +586,10 @@ async fn event_loop(
         None => (None, None),
     };
 
+    #[cfg(unix)]
     let mut sighup = make_sighup_signal();
+    #[cfg(not(unix))]
+    let sighup = make_sighup_signal();
 
     loop {
         // Build a future that yields the next key, or pends forever once the
