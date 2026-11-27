@@ -2,8 +2,8 @@
 name = "rusthost"
 version = "1.2.0"
 edition = "2021"
-# Requires Rust 1.100.0+.
-rust-version = "1.100.0"
+# Requires Rust 1.100.1+.
+rust-version = "1.100.1"
 description = "Single-binary, zero-setup static site hosting appliance with Tor support"
 license = "MIT"
 repository = "https://github.com/csd113/RustHost"
@@ -42,7 +42,7 @@ unnecessary_rest_pattern = "deny"
 
 [dependencies]
 
-x509-cert      = "0.3.0"      # cert expiry parsing — used in self_signed.rs
+x509-cert      = "0.3.1"      # cert expiry parsing — used in self_signed.rs
 time           = "0.3.55"      # OffsetDateTime for rcgen cert params
 
 # TLS / HTTPS support.
@@ -77,11 +77,11 @@ tor-rtcompat  = { version = "0.48.0", default-features = false, features = ["tok
 futures       = "0.3.34"
 
 # Terminal auto-launcher: TTY detection uses std::io::IsTerminal
-# (stable since Rust 1.70; this project's MSRV is 1.100.0) — no additional crate
+# (stable since Rust 1.70; this project's MSRV is 1.100.1) — no additional crate
 # required. The previously used `atty` crate has been removed: it carried a
 # memory-safety vulnerability on Windows (RUSTSEC-2021-0145) and was
 # unmaintained. `anyhow` is retained for use in other modules.
-anyhow  = "1.0.104"
+anyhow  = "1.0.105"
 
 sha3          = "0.12.0"
 data-encoding = "2.11.1"
@@ -118,7 +118,7 @@ percent-encoding = "2.3.2"
 # hyper provides a correct HTTP/1.1 connection loop with keep-alive; replacing
 # the hand-rolled single-shot parser eliminates the 30-45 s Tor page-load
 # penalty caused by Connection: close on every response.
-hyper      = { version = "1.12.0",   features = ["http1", "server"] }
+hyper      = { version = "1.13.0",   features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 http-body-util = "0.1.5"
 bytes          = "1.12.2"
@@ -127,7 +127,7 @@ httpdate       = "1.0.3"
 # async-compression provides Brotli and Gzip stream encoders. Brotli gives
 # significantly better compression ratios than Gzip, which matters a lot for
 # Tor users who pay per-byte in latency.
-async-compression = { version = "0.4.52", features = ["tokio", "brotli", "gzip"] }
+async-compression = { version = "0.4.54", features = ["tokio", "brotli", "gzip"] }
 
 [profile.dev.package."*"]
 opt-level = 1  # dependency builds: faster compile, smaller debug symbols

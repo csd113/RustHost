@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.100.0", "stable"]
+        rust: ["1.100.1", "stable"]
         os: [ubuntu-24.04, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
@@ -87,7 +87,7 @@ jobs:
           - name: macos-apple-silicon
             os: macos-15
             target: aarch64-apple-darwin
-          # Rust 1.100.0 runs on ARM64; cross-compile Intel using the macOS SDK.
+          # Rust 1.100.1 runs on ARM64; cross-compile Intel using the macOS SDK.
           - name: macos-intel
             os: macos-15
             target: x86_64-apple-darwin
@@ -100,8 +100,9 @@ jobs:
         uses: actions/checkout@v6.0.1
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.100.0
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
         with:
+          toolchain: "1.100.1"
           targets: ${{ matrix.target }}
 
       - name: Cache Rust artifacts
@@ -126,10 +127,12 @@ jobs:
   msrv:
     name: Tests
     env:
-      RUSTUP_TOOLCHAIN: "1.100.0"
+      RUSTUP_TOOLCHAIN: "1.100.1"
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6.0.1
-      - uses: dtolnay/rust-toolchain@1.100.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: "1.100.1"
       - name: Check minimum supported Rust
         run: cargo check --locked --workspace --all-features

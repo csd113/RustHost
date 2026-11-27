@@ -12,7 +12,7 @@ cd RustHost
 cargo build --locked --release
 ```
 
-The binary is `target/release/rusthost-cli` (`rusthost-cli.exe` on Windows). The checkout's `rust-toolchain.toml` selects Rust **1.100.0**, also the minimum compiler in `Cargo.toml`. CI checks both that pin and current stable. No global rustup default change is needed.
+The binary is `target/release/rusthost-cli` (`rusthost-cli.exe` on Windows). The checkout's `rust-toolchain.toml` selects Rust **1.100.1**, also the minimum compiler in `Cargo.toml`. CI checks both that pin and current stable. No global rustup default change is needed.
 
 For a local development run with the retained sample site:
 
@@ -43,7 +43,7 @@ Audit the lockfile, not `.cargo/audit.toml`: the latter is policy configuration.
 
 Project-owned unit and integration harnesses were retired in 1.2.0. Validate behavior changes against an isolated data directory using the built binary. Cover the affected paths and, for releases, version/help, Doctor, GET/HEAD, health/readiness, TLS, ranges, caching, compression, path rejection, persisted certificate reuse, and graceful shutdown. Do not use an operator's live data for smoke checks.
 
-CI runs Linux/Windows formatting and lint jobs and Linux ARM64, macOS Apple Silicon, macOS Intel, and Windows build jobs. The Intel target cross-compiles on the ARM64 `macos-15` runner with Rust 1.100.0 and the macOS SDK; `file`, `lipo`, and `otool` inspect the resulting x86_64 Mach-O. This is build validation, not native Intel runtime validation. The required status named `Tests` is a legacy name for a production Cargo check; it does not run the retired tests. `Quality` aggregates the lint matrix. Docker CI separately builds both architectures and checks container readiness and persistent-volume setup. A build or local smoke check does not establish live Tor, ACME renewal, power-loss recovery, or production-load behavior.
+CI runs Linux/Windows formatting and lint jobs and Linux ARM64, macOS Apple Silicon, macOS Intel, and Windows build jobs. The Intel target cross-compiles on the ARM64 `macos-15` runner with Rust 1.100.1 and the macOS SDK; `file`, `lipo`, and `otool` inspect the resulting x86_64 Mach-O. This is build validation, not native Intel runtime validation. The required status named `Tests` is a legacy name for a production Cargo check; it does not run the retired tests. `Quality` aggregates the lint matrix. Docker CI separately builds both architectures and checks container readiness and persistent-volume setup. A build or local smoke check does not establish live Tor, ACME renewal, power-loss recovery, or production-load behavior.
 
 ## Code and dependency policy
 
